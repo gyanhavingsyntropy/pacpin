@@ -1,0 +1,17 @@
+[package]
+name = "pacpin"
+version = "3.1.0"
+edition = "2021"
+authors = ["Gyan <330976822+gyanhavingsyntropy@users.noreply.github.com>"]
+description = "Declarative Package Resolver & Upgrade Engine for Arch Linux / CachyOS"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+alpm = "5.0.2"
+ureq = { version = "2.10", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+colored = "2.1"
+glob = "0.3"
