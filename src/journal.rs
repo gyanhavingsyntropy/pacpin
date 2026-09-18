@@ -91,19 +91,26 @@ impl TransactionJournal {
         }
         let cache_dirs = Self::get_cache_dirs();
 
+        let versions_to_check = if ver_no_epoch != version && Self::is_safe_version(version) {
+            vec![version, ver_no_epoch]
+        } else {
+            vec![ver_no_epoch]
+        };
+
         for c_dir in &cache_dirs {
             if !c_dir.exists() {
                 continue;
             }
             let c_dir_canon = c_dir.canonicalize().unwrap_or_else(|_| c_dir.clone());
-            for ext in &["zst", "xz", "gz"] {
-                let pattern_str = format!(
-                    "{}/{}-{}-*.pkg.tar.{}",
-                    c_dir.display(),
-                    pkg_name,
-                    ver_no_epoch,
-                    ext
-                );
+            for v in &versions_to_check {
+                for ext in &["zst", "xz", "gz"] {
+                    let pattern_str = format!(
+                        "{}/{}-{}-*.pkg.tar.{}",
+                        c_dir.display(),
+                        pkg_name,
+                        v,
+                        ext
+                    );
                 if let Ok(paths) = glob(&pattern_str) {
                     for entry in paths.flatten() {
                         let name_str = entry.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -120,7 +127,8 @@ impl TransactionJournal {
                 }
             }
         }
-        None
+    }
+    None
     }
 
     pub fn record_transaction(
