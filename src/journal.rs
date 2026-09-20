@@ -36,13 +36,13 @@ pub struct TransactionRecord {
 pub struct TransactionJournal;
 
 impl TransactionJournal {
-    pub fn state_dir() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        Path::new(&home).join(".local").join("state").join("pacpin")
+    pub fn state_dir() -> Result<PathBuf, String> {
+        let home = std::env::var("HOME").map_err(|_| "Environment variable HOME is not set".to_string())?;
+        Ok(Path::new(&home).join(".local").join("state").join("pacpin"))
     }
 
-    pub fn history_file() -> PathBuf {
-        Self::state_dir().join("history.jsonl")
+    pub fn history_file() -> Result<PathBuf, String> {
+        Ok(Self::state_dir()?.join("history.jsonl"))
     }
 
     pub fn get_cache_dirs() -> Vec<PathBuf> {
@@ -119,28 +119,43 @@ impl TransactionJournal {
     None
     }
 
+    pub fn get_last_transaction_id(path: &Path) -> Option<usize> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len == 0 {
+            return None;
+        }
+        let read_size = std::cmp::min(len, 8192);
+        file.seek(SeekFrom::End(-(read_size as i64))).ok()?;
+        let mut buf = vec![0u8; read_size as usize];
+        file.read_exact(&mut buf).ok()?;
+        let s = String::from_utf8_lossy(&buf);
+        for line in s.lines().rev() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                if let Ok(record) = serde_json::from_str::<TransactionRecord>(trimmed) {
+                    return Some(record.id);
+                }
+            }
+        }
+        None
+    }
+
     pub fn record_transaction(
         action: &str,
         packages: Vec<serde_json::Value>,
         command: &str,
     ) -> Result<usize, std::io::Error> {
-        let state_dir = Self::state_dir();
+        let state_dir = Self::state_dir().map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
         fs::create_dir_all(&state_dir)?;
-        let history_file = Self::history_file();
+        let history_file = Self::history_file().map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
 
-        let mut next_id = 1;
-        if history_file.exists() {
-            if let Ok(file) = fs::File::open(&history_file) {
-                let reader = BufReader::new(file);
-                for line in reader.lines().flatten() {
-                    if let Ok(record) = serde_json::from_str::<TransactionRecord>(&line) {
-                        if record.id >= next_id {
-                            next_id = record.id + 1;
-                        }
-                    }
-                }
-            }
-        }
+        let next_id = if history_file.exists() {
+            Self::get_last_transaction_id(&history_file).map(|id| id + 1).unwrap_or(1)
+        } else {
+            1
+        };
 
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let record = TransactionRecord {
@@ -163,7 +178,10 @@ impl TransactionJournal {
     }
 
     pub fn list_transactions(limit: usize) -> Vec<TransactionRecord> {
-        let history_file = Self::history_file();
+        let history_file = match Self::history_file() {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
         if !history_file.exists() {
             return Vec::new();
         }
@@ -186,7 +204,10 @@ impl TransactionJournal {
     }
 
     pub fn get_transaction(tx_id: usize) -> Option<TransactionRecord> {
-        let history_file = Self::history_file();
+        let history_file = match Self::history_file() {
+            Ok(f) => f,
+            Err(_) => return None,
+        };
         if !history_file.exists() {
             return None;
         }
@@ -377,5 +398,15 @@ mod tests {
         assert!(!TransactionJournal::is_safe_version("../../foo"));
         assert!(!TransactionJournal::is_safe_version("1.0/2"));
         assert!(!TransactionJournal::is_safe_version("1.0;rm -rf"));
+    }
+
+    #[test]
+    fn test_get_last_transaction_id() {
+        let tmp = std::env::temp_dir().join("test_tx_history.jsonl");
+        let sample = "{\"id\":1,\"timestamp\":\"2026-09-20 12:00:00\",\"action\":\"install\",\"command\":\"pacpin -S foo\",\"total_packages\":1,\"packages\":[]}\n{\"id\":42,\"timestamp\":\"2026-09-20 12:10:00\",\"action\":\"upgrade\",\"command\":\"pacpin upgrade\",\"total_packages\":1,\"packages\":[]}\n";
+        std::fs::write(&tmp, sample).unwrap();
+
+        assert_eq!(TransactionJournal::get_last_transaction_id(&tmp), Some(42));
+        let _ = std::fs::remove_file(&tmp);
     }
 }

@@ -789,11 +789,14 @@ pub fn render_transaction_view(
 
     let mut flatpak_count = 0;
     let mut nix_count = 0;
+    let mut pipx_count = 0;
     for ext in external_updates {
         if ext.runner == "Flatpak" {
             flatpak_count += 1;
         } else if ext.runner == "Nix" {
             nix_count += 1;
+        } else if ext.runner == "Pipx" {
+            pipx_count += 1;
         }
     }
 
@@ -821,9 +824,17 @@ pub fn render_transaction_view(
     if sticky_count > 0 {
         breakdown.push(format!("{} sticky", sticky_count));
     }
-    let normal_defaults = default_count + external_updates.len();
-    if normal_defaults > 0 || breakdown.is_empty() {
-        breakdown.push(format!("{} default", normal_defaults));
+    if default_count > 0 || (breakdown.is_empty() && external_updates.is_empty()) {
+        breakdown.push(format!("{} default", default_count));
+    }
+    if flatpak_count > 0 {
+        breakdown.push(format!("{} flatpak", flatpak_count));
+    }
+    if nix_count > 0 {
+        breakdown.push(format!("{} nix", nix_count));
+    }
+    if pipx_count > 0 {
+        breakdown.push(format!("{} pipx", pipx_count));
     }
     let pkg_summary = format!("{} ({})", total_all, breakdown.join(", "));
     print_card_line(
@@ -871,6 +882,15 @@ pub fn render_transaction_view(
             "  • Nix                : ",
             &s,
             s.magenta().to_string(),
+        );
+    }
+
+    if pipx_count > 0 {
+        let s = format!("{} updates", pipx_count);
+        print_card_line(
+            "  • Pipx               : ",
+            &s,
+            s.green().to_string(),
         );
     }
 
@@ -929,7 +949,7 @@ mod tests {
             let label_w = str_width(label);
             let val_w = str_width(val);
             let used = label_w + val_w;
-            let pad = card_inner_w - used - 2;
+            let pad = card_inner_w.saturating_sub(used + 2);
             let line = format!("  │ {}{}{} │", label, " ".repeat(pad), val);
             assert_eq!(
                 str_width(&line),
@@ -940,6 +960,13 @@ mod tests {
                 expected_width
             );
         }
+
+        // Verify that very long lines never cause integer underflow / panic
+        let long_label = "📦 Very long line that exceeds standard width: ";
+        let long_val = "12345678901234567890";
+        let used = str_width(long_label) + str_width(long_val);
+        let pad = card_inner_w.saturating_sub(used + 2);
+        assert_eq!(pad, 0);
     }
 
     #[test]

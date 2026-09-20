@@ -24,16 +24,38 @@ use std::path::{Path, PathBuf};
 pub struct AliasManager;
 
 impl AliasManager {
-    pub fn marker_path() -> PathBuf {
-        TransactionJournal::state_dir().join("alias_notified")
+    pub fn marker_path() -> Option<PathBuf> {
+        TransactionJournal::state_dir().ok().map(|d| d.join("alias_notified"))
     }
 
+    #[allow(dead_code)]
     pub fn is_notified() -> bool {
-        Self::marker_path().exists()
+        Self::marker_path().map(|p| p.exists()).unwrap_or(false)
+    }
+
+    pub fn try_acquire_first_notification() -> bool {
+        let path = match Self::marker_path() {
+            Some(p) => p,
+            None => return false,
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                let now = chrono::Local::now().to_rfc3339();
+                let _ = writeln!(file, "{}", now);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     pub fn mark_notified() {
-        let path = Self::marker_path();
+        let path = match Self::marker_path() {
+            Some(p) => p,
+            None => return,
+        };
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -131,12 +153,11 @@ impl AliasManager {
     }
 
     pub fn check_and_notify_once() {
-        if Self::is_notified() {
+        if !Self::try_acquire_first_notification() {
             return;
         }
 
         let modified_files = Self::setup_aliases();
-        Self::mark_notified();
 
         let invoked_as = env::args()
             .next()
@@ -176,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_marker_path() {
-        let path = AliasManager::marker_path();
+        let path = AliasManager::marker_path().expect("marker_path should resolve when HOME is set");
         assert!(path.to_string_lossy().contains("alias_notified"));
     }
 }

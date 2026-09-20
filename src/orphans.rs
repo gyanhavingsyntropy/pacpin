@@ -38,12 +38,12 @@ pub struct OrphanPackage {
 pub struct OrphanManager;
 
 impl OrphanManager {
-    pub fn state_file() -> PathBuf {
-        TransactionJournal::state_dir().join("known_orphans.json")
+    pub fn state_file() -> Option<PathBuf> {
+        TransactionJournal::state_dir().ok().map(|d| d.join("known_orphans.json"))
     }
 
     pub fn load_known() -> Option<HashSet<String>> {
-        let path = Self::state_file();
+        let path = Self::state_file()?;
         if !path.exists() {
             return None;
         }
@@ -53,13 +53,18 @@ impl OrphanManager {
     }
 
     pub fn save_known(orphans: &[String]) {
-        let dir = TransactionJournal::state_dir();
-        let _ = fs::create_dir_all(&dir);
+        let path = match Self::state_file() {
+            Some(p) => p,
+            None => return,
+        };
+        if let Some(dir) = path.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
         let mut sorted = orphans.to_vec();
         sorted.sort();
         sorted.dedup();
         if let Ok(json) = serde_json::to_string_pretty(&sorted) {
-            let _ = fs::write(Self::state_file(), json);
+            let _ = fs::write(path, json);
         }
     }
 

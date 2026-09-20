@@ -73,7 +73,7 @@ impl RestartInspector {
                 .filter(|e| e.path().is_dir())
                 .filter_map(|e| e.file_name().into_string().ok())
                 .collect();
-            installed_versions.sort();
+            installed_versions.sort_by(|a, b| alpm::vercmp(a.as_str(), b.as_str()));
 
             // If running modules are missing, or a kernel was upgraded
             if running_modules_missing || kernel_pkg_updated.is_some() {
@@ -307,5 +307,23 @@ mod tests {
         let s3 = ServiceType::SystemdUser("pipewire.service".to_string());
         assert_eq!(s1, s2);
         assert_ne!(s1, s3);
+    }
+
+    #[test]
+    fn test_kernel_version_sort_semver() {
+        let mut versions = vec![
+            "6.9.10-arch1-1".to_string(),
+            "6.9.9-arch1-1".to_string(),
+            "6.10.0-arch1-1".to_string(),
+            "6.9.2-arch1-1".to_string(),
+        ];
+        versions.sort_by(|a, b| alpm::vercmp(a.as_str(), b.as_str()));
+
+        assert_eq!(versions, vec![
+            "6.9.2-arch1-1",
+            "6.9.9-arch1-1",
+            "6.9.10-arch1-1",
+            "6.10.0-arch1-1",
+        ]);
     }
 }

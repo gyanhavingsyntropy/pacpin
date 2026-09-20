@@ -47,34 +47,51 @@ pub fn query_aur(pkg_names: &[String]) -> HashMap<String, AurItem> {
         let query = params.join("&");
         let url = format!("https://aur.archlinux.org/rpc/v5/info?{}", query);
 
-        match ureq::get(&url)
-            .set("User-Agent", "pacpin/3.1 (GPLv3)")
-            .timeout(std::time::Duration::from_secs(6))
-            .call()
-        {
-            Ok(resp) => match resp.into_json::<AurResponse>() {
-                Ok(data) => {
-                    for item in data.results {
-                        results.insert(item.name.clone(), item);
+        let mut attempts = 0;
+        let max_attempts = 3;
+        let mut success = false;
+
+        while attempts < max_attempts && !success {
+            attempts += 1;
+            if attempts > 1 {
+                std::thread::sleep(std::time::Duration::from_millis(400 * attempts as u64));
+            }
+
+            match ureq::get(&url)
+                .set("User-Agent", "pacpin/3.1 (GPLv3)")
+                .timeout(std::time::Duration::from_secs(6))
+                .call()
+            {
+                Ok(resp) => match resp.into_json::<AurResponse>() {
+                    Ok(data) => {
+                        for item in data.results {
+                            results.insert(item.name.clone(), item);
+                        }
+                        success = true;
+                    }
+                    Err(e) => {
+                        if attempts == max_attempts {
+                            eprintln!(
+                                "{}",
+                                format!(":: Warning: Failed to parse AUR RPC response after {} attempts: {}", attempts, e).yellow()
+                            );
+                        }
+                    }
+                },
+                Err(e) => {
+                    if attempts == max_attempts {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                ":: Warning: AUR RPC query failed for {} package(s) after {} attempts: {}",
+                                chunk.len(),
+                                attempts,
+                                e
+                            )
+                            .yellow()
+                        );
                     }
                 }
-                Err(e) => {
-                    eprintln!(
-                        "{}",
-                        format!(":: Warning: Failed to parse AUR RPC response: {}", e).yellow()
-                    );
-                }
-            },
-            Err(e) => {
-                eprintln!(
-                    "{}",
-                    format!(
-                        ":: Warning: AUR RPC query failed for {} package(s): {}",
-                        chunk.len(),
-                        e
-                    )
-                    .yellow()
-                );
             }
         }
     }
