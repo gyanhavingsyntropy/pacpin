@@ -23,6 +23,8 @@ mod journal;
 mod orphans;
 mod repo_menu;
 mod resolver;
+mod restart;
+mod sandbox;
 mod tui_select;
 mod ui;
 mod wizard;
@@ -368,6 +370,9 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
             .filter(|name| !selected_orphans.contains(name))
             .collect();
         OrphanManager::save_known(&remaining_orphans);
+
+        // Inspect kernel and running services for post-upgrade restart advisory (zero noise if none)
+        restart::RestartInspector::print_restart_advisory(&updates);
     } else {
         match exit_status {
             Ok(s) => exit(s.code().unwrap_or(1)),
@@ -1341,36 +1346,45 @@ fn cmd_reset(force: bool) {
 
 fn print_help() {
     print_banner();
-    println!("\nUsage:");
-    println!("  pacpin check                 Check pending updates & verify custom pin protections");
-    println!("  pacpin upgrade [flags]       Execute safe upgrade with True Resolver");
+    println!("\nUsage: pacpin <command> [options]");
+    println!();
+    println!("{}", "Core Package Operations:".bold());
+    println!("  check, -Qu                   Check pending updates & verify pin protections");
+    println!("  upgrade, -Syu [flags]        Execute safe upgrade with True Resolver");
     println!("    Flags:");
     println!("      -n, --dry-run            Show transaction summary without executing");
     println!("      -y, --refresh            Refresh sync databases (sudo pacman -Sy) first");
     println!("      -c, --clean              Prompt to clean all orphans during upgrade");
     println!("      --noconfirm              Bypass interactive confirmation prompt");
-    println!("  pacpin -S [flags] [repo/]pkg Install packages (auto-pins repo/pkg with companion cascade)");
-    println!("  pacpin remove <pkg...>       Remove package(s) and unneeded dependencies (-Rns + smart unpin)");
-    println!("  pacpin search <query...>     Search official repositories and AUR simultaneously");
-    println!("  pacpin info <pkg...>         Show detailed package information (-Si / AUR)");
-    println!("  pacpin clean                 Clean pacman and AUR build cache (-Sc)");
-    println!("  pacpin orphans [-c]          Inspect or remove orphaned dependencies (-c to clean)");
-    println!("  pacpin autoremove            Alias for 'pacpin orphans -c'");
-    println!("  pacpin keep <pkg...>         Mark package(s) as explicitly installed (silences orphan warnings)");
-    println!("  pacpin repos                 Interactive BIOS-style repository search priority menu");
-    println!("  pacpin pin <repo> <pkg...>   Lock package(s) or wildcards to a designated repository");
-    println!("  pacpin pin <repo> -f <file>  Batch pin packages from a text file (one package per line)");
-    println!("  pacpin unpin <pkg>           Remove a pin rule");
-    println!("  pacpin delay <pkg> <days>    Set a stability delay buffer on a package");
-    println!("  pacpin undelay <pkg>         Remove a package stability delay rule");
-    println!("  pacpin history [id]          View transaction history timeline or inspect a transaction");
-    println!("  pacpin rollback [id] [-n]    Restore previous package versions from cache");
-    println!("  pacpin list                  List active pins, exclusions, delays, and repo priority");
-    println!("  pacpin reset [-f]            Reset all configurations, pins, and delays to default (-f force)");
-    println!("  pacpin init [--reset]        Interactive onboarding wizard (use --reset for clean slate)");
-    println!("  pacpin --version             Show version and GPLv3 license notice");
+    println!("  -S [flags] [repo/]pkg        Install packages (auto-pins repo/pkg with companion cascade)");
+    println!("  remove, rm <pkg...>          Remove package(s) and unneeded dependencies (-Rns + smart unpin)");
+    println!("  search, -Ss <query...>       Search official repositories and AUR simultaneously");
+    println!("  info, -Si <pkg...>           Show detailed package information (-Si / AUR)");
+    println!("  clean, -Sc                   Clean pacman and AUR build cache");
     println!();
-    println!("Pacman & AUR Drop-in Aliases:");
+    println!("{}", "Declarative Rules & Configuration:".bold());
+    println!("  repos                        Interactive BIOS-style repository search priority menu");
+    println!("  pin <repo> <pkg...>          Lock package(s) or wildcards to a designated repository");
+    println!("  pin <repo> -f <file>         Batch pin packages from a text file (one package per line)");
+    println!("  unpin <pkg>                  Remove a repository pin rule");
+    println!("  delay <pkg> <days>           Set a stability delay buffer on a package");
+    println!("  undelay <pkg>                Remove a package stability delay rule");
+    println!("  list                         List active pins, exclusions, delays, and repo priority");
+    println!("  reset [-f]                   Reset all configurations, pins, and delays to default (-f force)");
+    println!("  init [--reset]               Interactive onboarding wizard (use --reset for clean slate)");
+    println!();
+    println!("{}", "System Maintenance & Hygiene:".bold());
+    println!("  orphans [-c]                 Inspect or remove orphaned dependencies (-c to clean)");
+    println!("  autoremove                   Alias for 'pacpin orphans -c'");
+    println!("  keep, adopt <pkg...>         Mark package(s) as explicitly installed (silences orphan warnings)");
+    println!("  needrestart                  Inspect processes holding outdated libraries or kernel in RAM");
+    println!();
+    println!("{}", "Power Tools & Sandboxing:".bold());
+    println!("  try, run <pkg> [args...]     Run a package in an isolated ephemeral sandbox without installing");
+    println!("  history [id]                 View transaction history timeline or inspect a transaction");
+    println!("  rollback [id] [-n]           Restore previous package versions from cache");
+    println!();
+    println!("{}", "Pacman & AUR Drop-in Aliases:".bold());
     println!("  pacpin -Syu                  Alias for 'pacpin upgrade -y'");
     println!("  pacpin -Qu                   Alias for 'pacpin check'");
     println!("  pacpin -Ss <query...>        Search repositories and AUR");
@@ -1597,6 +1611,28 @@ fn main() {
             }
         }
         TransactionJournal::rollback(tx_id, dry_run);
+    } else if cmd == "try" || cmd == "run" {
+        if args.len() < 2 {
+            eprintln!("{}", "Error: 'pacpin try' requires a package name.".red().bold());
+            eprintln!("Usage: pacpin try <package> [arguments...]");
+            eprintln!("Example: pacpin try btop");
+            eprintln!("         pacpin try tree -- -L 2");
+            exit(1);
+        }
+        let pkg = &args[1];
+        let sub_args = if args.len() > 2 {
+            if args[2] == "--" {
+                args[3..].to_vec()
+            } else {
+                args[2..].to_vec()
+            }
+        } else {
+            Vec::new()
+        };
+        sandbox::cmd_try(pkg, &sub_args);
+    } else if cmd == "needrestart" || cmd == "restart-check" {
+        restart::RestartInspector::print_restart_advisory(&[]);
+        exit(0);
     } else if cmd == "delay" {
         if args.len() < 3 || args[2].parse::<u32>().is_err() {
             eprintln!("{}", "Error: 'pacpin delay' requires <pkg> and <days>.".red());

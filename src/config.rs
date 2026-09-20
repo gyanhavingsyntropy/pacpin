@@ -50,6 +50,8 @@ pub struct Features {
     pub smart_orphans: bool,
     #[serde(default = "default_false")]
     pub integrations: bool,
+    #[serde(default = "default_false")]
+    pub vendor_stickiness: bool,
 }
 
 fn default_true() -> bool {
@@ -67,6 +69,7 @@ impl Default for Features {
             stability_delays: false,
             smart_orphans: true,
             integrations: false,
+            vendor_stickiness: false,
         }
     }
 }
@@ -224,5 +227,18 @@ mod tests {
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.repo_order, vec!["core", "cachyos", "extra"]);
+    }
+
+    #[test]
+    fn test_vendor_stickiness_config() {
+        let toml_str = r#"
+        [features]
+        vendor_stickiness = true
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.features.vendor_stickiness);
+
+        let default_config = Config::default();
+        assert!(!default_config.features.vendor_stickiness);
     }
 }

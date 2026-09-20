@@ -98,7 +98,7 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
 
     println!("{}", ":: Welcome to pacpin! Let's tailor your package management preferences.\n".cyan().bold());
 
-    let (mut pins, mut exclude, mut delays, mut repo_order) = if let Some(ref cfg) = existing_cfg {
+    let (mut pins, mut exclude, mut delays, mut repo_order, vendor_stickiness) = if let Some(ref cfg) = existing_cfg {
         if !cfg.pins.is_empty() || !cfg.delay.is_empty() || !cfg.repo_order.is_empty() {
             println!(
                 "  {}",
@@ -111,9 +111,9 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
                 .cyan()
             );
         }
-        (cfg.pins.clone(), cfg.exclude.clone(), cfg.delay.clone(), cfg.repo_order.clone())
+        (cfg.pins.clone(), cfg.exclude.clone(), cfg.delay.clone(), cfg.repo_order.clone(), cfg.features.vendor_stickiness)
     } else {
-        (BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), Vec::new())
+        (BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), Vec::new(), false)
     };
 
     // 1. Repository Pinning & Shielding
@@ -275,6 +275,7 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
             stability_delays: enable_delays,
             smart_orphans: enable_orphans,
             integrations: enable_integrations,
+            vendor_stickiness,
         },
         options: Options { helper },
         repo_order,

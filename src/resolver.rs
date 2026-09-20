@@ -133,6 +133,41 @@ impl<'a> ResolverEngine<'a> {
         false
     }
 
+    pub fn load_installed_dbs() -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        let local_dir = std::path::Path::new("/var/lib/pacman/local");
+        if let Ok(entries) = std::fs::read_dir(local_dir) {
+            for entry in entries.flatten() {
+                let desc_path = entry.path().join("desc");
+                if desc_path.is_file() {
+                    if let Ok(content) = std::fs::read_to_string(&desc_path) {
+                        let mut name = None;
+                        let mut db = None;
+                        let mut lines = content.lines();
+                        while let Some(line) = lines.next() {
+                            if line == "%NAME%" {
+                                if let Some(val) = lines.next() {
+                                    name = Some(val.trim().to_string());
+                                }
+                            } else if line == "%INSTALLED_DB%" {
+                                if let Some(val) = lines.next() {
+                                    db = Some(val.trim().to_string());
+                                }
+                            }
+                            if name.is_some() && db.is_some() {
+                                break;
+                            }
+                        }
+                        if let (Some(n), Some(d)) = (name, db) {
+                            map.insert(n, d);
+                        }
+                    }
+                }
+            }
+        }
+        map
+    }
+
     pub fn resolve_all(&self, config: &Config) -> ResolveResult {
         let pins = if config.features.pinning {
             config.pins.clone()
@@ -175,6 +210,7 @@ impl<'a> ResolverEngine<'a> {
         let installed_count = local_pkgs.len();
 
         let aur_data = aur_handle.join().unwrap_or_default();
+        let installed_dbs = Self::load_installed_dbs();
 
         let mut resolved: HashMap<String, ResolvedPackage> = HashMap::new();
         let mut unresolved_pins: Vec<(String, String)> = Vec::new();
@@ -183,6 +219,29 @@ impl<'a> ResolverEngine<'a> {
             let pkg_name = inst_pkg.name();
             let inst_ver = inst_pkg.version();
             let inst_size = inst_pkg.isize();
+
+            // Determine originating repository
+            let mut installed_db = installed_dbs.get(pkg_name).cloned().unwrap_or_default();
+            if installed_db.is_empty() {
+                let mut fallback_repo = None;
+                for r in repos {
+                    if let Some(db) = alpm.syncdbs().into_iter().find(|d| d.name() == r) {
+                        if let Ok(p) = db.pkg(pkg_name) {
+                            if vercmp(p.version().as_str(), inst_ver) == Ordering::Equal {
+                                installed_db = r.clone();
+                                break;
+                            } else if fallback_repo.is_none() {
+                                fallback_repo = Some(r.clone());
+                            }
+                        }
+                    }
+                }
+                if installed_db.is_empty() {
+                    if let Some(r) = fallback_repo {
+                        installed_db = r;
+                    }
+                }
+            }
 
             let pinned_repo = if config.features.pinning {
                 Self::is_pinned(pkg_name, &config.pins)
@@ -247,16 +306,32 @@ impl<'a> ResolverEngine<'a> {
                     unresolved_pins.push((pkg_name.to_string(), target_repo.clone()));
                 }
             } else {
-                for r in repos {
-                    if config.features.pinning && Self::is_excluded(pkg_name, r, &config.exclude) {
-                        continue;
-                    }
-                    if let Some(db) = alpm.syncdbs().into_iter().find(|d| d.name() == r) {
+                // Opt-in vendor stickiness: if enabled, stick to the originating repository
+                if config.features.vendor_stickiness
+                    && !installed_db.is_empty()
+                    && !(config.features.pinning && Self::is_excluded(pkg_name, &installed_db, &config.exclude))
+                {
+                    if installed_db.eq_ignore_ascii_case("aur") {
+                        if let Some(aur_pkg) = aur_data.get(pkg_name) {
+                            candidate = Some(CandidatePackage {
+                                name: aur_pkg.name.clone(),
+                                version: aur_pkg.version.clone(),
+                                repo: "aur".to_string(),
+                                base: aur_pkg.name.clone(),
+                                csize: 0,
+                                isize: 0,
+                                desc: aur_pkg.description.clone().unwrap_or_default(),
+                                builddate: 0,
+                                is_aur: true,
+                                depends: Vec::new(),
+                            });
+                        }
+                    } else if let Some(db) = alpm.syncdbs().into_iter().find(|d| d.name() == installed_db) {
                         if let Ok(p) = db.pkg(pkg_name) {
                             candidate = Some(CandidatePackage {
                                 name: p.name().to_string(),
                                 version: p.version().to_string(),
-                                repo: r.clone(),
+                                repo: installed_db.clone(),
                                 base: p.base().unwrap_or(p.name()).to_string(),
                                 csize: p.size(),
                                 isize: p.isize(),
@@ -265,47 +340,51 @@ impl<'a> ResolverEngine<'a> {
                                 is_aur: false,
                                 depends: p.depends().iter().map(|d| d.name().to_string()).collect(),
                             });
-                            break;
                         }
                     }
                 }
 
+                // If not resolved by vendor stickiness, search repos in priority order
                 if candidate.is_none() {
-                    if let Some(aur_pkg) = aur_data.get(pkg_name) {
-                        candidate = Some(CandidatePackage {
-                            name: aur_pkg.name.clone(),
-                            version: aur_pkg.version.clone(),
-                            repo: "aur".to_string(),
-                            base: aur_pkg.name.clone(),
-                            csize: 0,
-                            isize: 0,
-                            desc: aur_pkg.description.clone().unwrap_or_default(),
-                            builddate: 0,
-                            is_aur: true,
-                            depends: Vec::new(),
-                        });
-                    }
-                }
-            }
-
-
-            let mut installed_db = String::new();
-            let mut fallback_repo = None;
-            for r in repos {
-                if let Some(db) = alpm.syncdbs().into_iter().find(|d| d.name() == r) {
-                    if let Ok(p) = db.pkg(pkg_name) {
-                        if vercmp(p.version().as_str(), inst_ver) == Ordering::Equal {
-                            installed_db = r.clone();
-                            break;
-                        } else if fallback_repo.is_none() {
-                            fallback_repo = Some(r.clone());
+                    for r in repos {
+                        if config.features.pinning && Self::is_excluded(pkg_name, r, &config.exclude) {
+                            continue;
+                        }
+                        if let Some(db) = alpm.syncdbs().into_iter().find(|d| d.name() == r) {
+                            if let Ok(p) = db.pkg(pkg_name) {
+                                candidate = Some(CandidatePackage {
+                                    name: p.name().to_string(),
+                                    version: p.version().to_string(),
+                                    repo: r.clone(),
+                                    base: p.base().unwrap_or(p.name()).to_string(),
+                                    csize: p.size(),
+                                    isize: p.isize(),
+                                    desc: p.desc().unwrap_or("").to_string(),
+                                    builddate: p.build_date(),
+                                    is_aur: false,
+                                    depends: p.depends().iter().map(|d| d.name().to_string()).collect(),
+                                });
+                                break;
+                            }
                         }
                     }
-                }
-            }
-            if installed_db.is_empty() {
-                if let Some(r) = fallback_repo {
-                    installed_db = r;
+
+                    if candidate.is_none() {
+                        if let Some(aur_pkg) = aur_data.get(pkg_name) {
+                            candidate = Some(CandidatePackage {
+                                name: aur_pkg.name.clone(),
+                                version: aur_pkg.version.clone(),
+                                repo: "aur".to_string(),
+                                base: aur_pkg.name.clone(),
+                                csize: 0,
+                                isize: 0,
+                                desc: aur_pkg.description.clone().unwrap_or_default(),
+                                builddate: 0,
+                                is_aur: true,
+                                depends: Vec::new(),
+                            });
+                        }
+                    }
                 }
             }
 
@@ -430,6 +509,41 @@ impl<'a> ResolverEngine<'a> {
             updates,
             held_packages,
             unresolved_pins,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_pinned_exact_and_glob() {
+        let mut pins = BTreeMap::new();
+        pins.insert("mesa".to_string(), "core".to_string());
+        pins.insert("linux-firmware*".to_string(), "cachyos".to_string());
+
+        assert_eq!(ResolverEngine::is_pinned("mesa", &pins), Some("core".to_string()));
+        assert_eq!(ResolverEngine::is_pinned("linux-firmware-whence", &pins), Some("cachyos".to_string()));
+        assert_eq!(ResolverEngine::is_pinned("git", &pins), None);
+    }
+
+    #[test]
+    fn test_is_excluded() {
+        let mut excludes = BTreeMap::new();
+        excludes.insert("cachyos".to_string(), vec!["linux-firmware*".to_string(), "systemd".to_string()]);
+
+        assert!(ResolverEngine::is_excluded("linux-firmware-intel", "cachyos", &excludes));
+        assert!(ResolverEngine::is_excluded("systemd", "cachyos", &excludes));
+        assert!(!ResolverEngine::is_excluded("linux", "cachyos", &excludes));
+        assert!(!ResolverEngine::is_excluded("systemd", "core", &excludes));
+    }
+
+    #[test]
+    fn test_load_installed_dbs_executes() {
+        let dbs = ResolverEngine::load_installed_dbs();
+        if std::path::Path::new("/var/lib/pacman/local").exists() {
+            assert!(!dbs.is_empty());
         }
     }
 }
