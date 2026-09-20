@@ -65,23 +65,11 @@ impl TransactionJournal {
     }
 
     pub fn is_safe_pkg_name(name: &str) -> bool {
-        !name.is_empty()
-            && !name.contains('/')
-            && !name.contains('\\')
-            && !name.contains("..")
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '+' || c == '-' || c == '@')
+        crate::utils::is_safe_pkg_name(name)
     }
 
     pub fn is_safe_version(ver: &str) -> bool {
-        !ver.is_empty()
-            && !ver.contains('/')
-            && !ver.contains('\\')
-            && !ver.contains("..")
-            && ver
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '+' || c == '-' || c == ':' || c == '~')
+        crate::utils::is_safe_version(ver)
     }
 
     pub fn find_cached_package(pkg_name: &str, version: &str) -> Option<PathBuf> {

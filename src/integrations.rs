@@ -18,6 +18,7 @@ use crate::config::Config;
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::sync::Arc;
 use std::thread;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,19 +240,40 @@ impl IntegrationProvider for PipxProvider {
             if out.status.success() {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
                     if let Some(venvs) = v.get("venvs").and_then(|v| v.as_object()) {
+                        let agent = ureq::AgentBuilder::new()
+                            .timeout(std::time::Duration::from_secs(2))
+                            .build();
+
                         for (app_name, info) in venvs {
-                            let ver = info.get("metadata")
+                            let installed_ver = info.get("metadata")
                                 .and_then(|m| m.get("main_package"))
                                 .and_then(|p| p.get("package_version"))
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("installed");
-                            results.push(ExternalUpdate {
-                                runner: "Pipx".to_string(),
-                                id: app_name.clone(),
-                                name: app_name.clone(),
-                                repo: "pypi".to_string(),
-                                version: ver.to_string(),
-                            });
+                                .unwrap_or("");
+
+                            if installed_ver.is_empty() {
+                                continue;
+                            }
+
+                            // Query PyPI JSON API for latest release
+                            let pypi_url = format!("https://pypi.org/pypi/{}/json", app_name);
+                            if let Ok(resp) = agent.get(&pypi_url).call() {
+                                if resp.status() == 200 {
+                                    if let Ok(json) = resp.into_json::<serde_json::Value>() {
+                                        if let Some(latest_ver) = json.get("info").and_then(|i| i.get("version")).and_then(|v| v.as_str()) {
+                                            if alpm::vercmp(latest_ver, installed_ver) == std::cmp::Ordering::Greater {
+                                                results.push(ExternalUpdate {
+                                                    runner: "Pipx".to_string(),
+                                                    id: app_name.clone(),
+                                                    name: app_name.clone(),
+                                                    repo: "pypi".to_string(),
+                                                    version: latest_ver.to_string(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -281,38 +303,38 @@ impl IntegrationProvider for PipxProvider {
 pub struct IntegrationsManager;
 
 impl IntegrationsManager {
-    pub fn get_active_providers(config: &Config) -> Vec<Box<dyn IntegrationProvider>> {
+    pub fn get_active_providers(config: &Config) -> Vec<Arc<dyn IntegrationProvider>> {
         if !config.features.integrations {
             return Vec::new();
         }
 
-        let mut providers: Vec<Box<dyn IntegrationProvider>> = Vec::new();
+        let mut providers: Vec<Arc<dyn IntegrationProvider>> = Vec::new();
 
         if config.integrations.flatpak {
             let fp = FlatpakProvider;
             if fp.is_available() {
-                providers.push(Box::new(fp));
+                providers.push(Arc::new(fp));
             }
         }
 
         if config.integrations.nix {
             let nix = NixProvider;
             if nix.is_available() {
-                providers.push(Box::new(nix));
+                providers.push(Arc::new(nix));
             }
         }
 
         if config.integrations.pipx {
             let pipx = PipxProvider;
             if pipx.is_available() {
-                providers.push(Box::new(pipx));
+                providers.push(Arc::new(pipx));
             }
         }
 
         providers
     }
 
-    pub fn refresh_all_parallel(providers: &[Box<dyn IntegrationProvider>]) {
+    pub fn refresh_all_parallel(providers: &[Arc<dyn IntegrationProvider>]) {
         if providers.is_empty() {
             return;
         }
@@ -324,14 +346,8 @@ impl IntegrationsManager {
         let mut handles = Vec::new();
 
         for p in providers {
-            let name = p.name();
-            if name == "Flatpak" {
-                handles.push(thread::spawn(|| FlatpakProvider.refresh_metadata()));
-            } else if name == "Nix" {
-                handles.push(thread::spawn(|| NixProvider.refresh_metadata()));
-            } else if name == "Pipx" {
-                handles.push(thread::spawn(|| PipxProvider.refresh_metadata()));
-            }
+            let provider = Arc::clone(p);
+            handles.push(thread::spawn(move || provider.refresh_metadata()));
         }
 
         for h in handles {
@@ -339,7 +355,7 @@ impl IntegrationsManager {
         }
     }
 
-    pub fn check_updates_parallel(providers: &[Box<dyn IntegrationProvider>]) -> Vec<ExternalUpdate> {
+    pub fn check_updates_parallel(providers: &[Arc<dyn IntegrationProvider>]) -> Vec<ExternalUpdate> {
         if providers.is_empty() {
             return Vec::new();
         }
@@ -347,20 +363,14 @@ impl IntegrationsManager {
         let mut handles = Vec::new();
 
         for p in providers {
-            let name = p.name();
-            if name == "Flatpak" {
-                handles.push(thread::spawn(|| FlatpakProvider.check_updates()));
-            } else if name == "Nix" {
-                handles.push(thread::spawn(|| NixProvider.check_updates()));
-            } else if name == "Pipx" {
-                handles.push(thread::spawn(|| PipxProvider.check_updates()));
-            }
+            let provider = Arc::clone(p);
+            handles.push(thread::spawn(move || provider.check_updates()));
         }
 
         let mut all_updates = Vec::new();
         for h in handles {
-            if let Ok(mut updates) = h.join() {
-                all_updates.append(&mut updates);
+            if let Ok(updates) = h.join() {
+                all_updates.extend(updates);
             }
         }
 
@@ -368,7 +378,7 @@ impl IntegrationsManager {
     }
 
     pub fn execute_upgrades(
-        providers: &[Box<dyn IntegrationProvider>],
+        providers: &[Arc<dyn IntegrationProvider>],
         external_updates: &[ExternalUpdate],
     ) {
         for p in providers {
@@ -403,7 +413,7 @@ impl IntegrationsManager {
         }
     }
 
-    pub fn execute_cleanups(providers: &[Box<dyn IntegrationProvider>]) {
+    pub fn execute_cleanups(providers: &[Arc<dyn IntegrationProvider>]) {
         for p in providers {
             println!(
                 "\n{} Cleaning {} unused packages ({})...",

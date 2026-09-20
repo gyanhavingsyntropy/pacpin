@@ -20,6 +20,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use std::process::Command;
 
+#[derive(Debug, Clone)]
+pub struct DownloadTarget {
+    pub name: String,
+    pub url: String,
+    pub sha256: Option<String>,
+}
+
 pub struct AlpmManager {
     handle: Alpm,
     repos: Vec<String>,
@@ -113,14 +120,17 @@ impl AlpmManager {
         &self,
         repo: Option<&str>,
         pkg_name: &str,
-    ) -> Result<Vec<(String, String)>, String> {
+    ) -> Result<Vec<DownloadTarget>, String> {
+        let syncdbs_list: Vec<&alpm::Db> = self.handle.syncdbs().into_iter().collect();
+        let syncdb_map: HashMap<&str, &alpm::Db> = syncdbs_list
+            .iter()
+            .map(|d| (d.name(), *d))
+            .collect();
+
         // Find target package
         let (target_db_name, target_pkg) = if let Some(r) = repo {
-            let db = self
-                .handle
-                .syncdbs()
-                .into_iter()
-                .find(|d| d.name() == r)
+            let db = syncdb_map
+                .get(r)
                 .ok_or_else(|| format!("Repository '{}' not found", r))?;
             let p = db
                 .pkg(pkg_name)
@@ -129,7 +139,7 @@ impl AlpmManager {
         } else {
             let mut found = None;
             for r in &self.repos {
-                if let Some(db) = self.handle.syncdbs().into_iter().find(|d| d.name() == r) {
+                if let Some(db) = syncdb_map.get(r.as_str()) {
                     if let Ok(p) = db.pkg(pkg_name) {
                         found = Some((r.clone(), p));
                         break;
@@ -154,33 +164,36 @@ impl AlpmManager {
         };
 
         let local_db = self.handle.localdb();
-        let mut visited = HashSet::new();
-        let mut ordered_urls = Vec::new();
+        let mut visited_deps = HashSet::new();
+        let mut visited_pkgs = HashSet::new();
+        let mut ordered_targets = Vec::new();
 
         fn resolve_deps(
             pkg: &alpm::Package,
             manager: &AlpmManager,
+            syncdb_map: &HashMap<&str, &alpm::Db>,
             local_db: &alpm::Db,
-            visited: &mut HashSet<String>,
-            ordered_urls: &mut Vec<(String, String)>,
+            visited_deps: &mut HashSet<String>,
+            visited_pkgs: &mut HashSet<String>,
+            ordered_targets: &mut Vec<DownloadTarget>,
             get_server: &mut dyn FnMut(&str) -> Result<String, String>,
         ) -> Result<(), String> {
             for dep in pkg.depends() {
                 let dep_name = dep.name();
-                // Check if already satisfied locally
-                if local_db.pkgs().find_satisfier(dep_name).is_some() {
+                if visited_deps.contains(dep_name) {
                     continue;
                 }
+                visited_deps.insert(dep_name.to_string());
 
-                // Check if already visited in this resolution chain
-                if visited.contains(dep_name) {
+                // Check if already satisfied locally
+                if local_db.pkgs().find_satisfier(dep_name).is_some() {
                     continue;
                 }
 
                 // Search syncdbs in priority order
                 let mut found = None;
                 for r in &manager.repos {
-                    if let Some(db) = manager.handle.syncdbs().into_iter().find(|d| d.name() == r) {
+                    if let Some(db) = syncdb_map.get(r.as_str()) {
                         if let Some(p) = db.pkgs().find_satisfier(dep_name) {
                             found = Some((r.clone(), p));
                             break;
@@ -190,29 +203,36 @@ impl AlpmManager {
 
                 if let Some((sdb_name, dep_pkg)) = found {
                     let real_name = dep_pkg.name().to_string();
-                    if visited.insert(real_name.clone()) {
+                    if visited_pkgs.insert(real_name.clone()) {
                         // Recurse first so dependencies precede this package
-                        resolve_deps(&dep_pkg, manager, local_db, visited, ordered_urls, get_server)?;
+                        resolve_deps(&dep_pkg, manager, syncdb_map, local_db, visited_deps, visited_pkgs, ordered_targets, get_server)?;
 
                         let filename = dep_pkg
                             .filename()
                             .ok_or_else(|| format!("No filename found for package '{}'", real_name))?;
                         let server = get_server(&sdb_name)?;
                         let url = format!("{}/{}", server.trim_end_matches('/'), filename);
-                        ordered_urls.push((real_name, url));
+                        let sha256 = dep_pkg.sha256sum().map(|s| s.to_string());
+                        ordered_targets.push(DownloadTarget {
+                            name: real_name,
+                            url,
+                            sha256,
+                        });
                     }
                 }
             }
             Ok(())
         }
 
-        visited.insert(target_pkg.name().to_string());
+        visited_pkgs.insert(target_pkg.name().to_string());
         resolve_deps(
             &target_pkg,
             self,
+            &syncdb_map,
             &local_db,
-            &mut visited,
-            &mut ordered_urls,
+            &mut visited_deps,
+            &mut visited_pkgs,
+            &mut ordered_targets,
             &mut get_server,
         )?;
 
@@ -221,9 +241,14 @@ impl AlpmManager {
             .ok_or_else(|| format!("No filename found for package '{}'", target_pkg.name()))?;
         let target_server = get_server(&target_db_name)?;
         let target_url = format!("{}/{}", target_server.trim_end_matches('/'), target_filename);
-        ordered_urls.push((target_pkg.name().to_string(), target_url));
+        let target_sha256 = target_pkg.sha256sum().map(|s| s.to_string());
+        ordered_targets.push(DownloadTarget {
+            name: target_pkg.name().to_string(),
+            url: target_url,
+            sha256: target_sha256,
+        });
 
-        Ok(ordered_urls)
+        Ok(ordered_targets)
     }
 
     pub fn handle(&self) -> &Alpm {
@@ -372,6 +397,8 @@ mod tests {
         assert!(target_pkg.is_some());
         let (db_name, pkg) = target_pkg.unwrap();
         println!("Found nix in {}: filename = {:?}", db_name, pkg.filename());
+        println!("sha256: {:?}", pkg.sha256sum());
+        println!("md5: {:?}", pkg.md5sum());
         for dep in pkg.depends() {
             let sat_local = local_db.pkgs().find_satisfier(dep.name()).is_some();
             println!("  dep {}: satisfied locally = {}", dep.name(), sat_local);
@@ -386,12 +413,13 @@ mod tests {
         let list = urls.unwrap();
         assert!(!list.is_empty());
         // nix should be the last item
-        let (last_name, last_url) = list.last().unwrap();
-        assert_eq!(last_name, "nix");
-        assert!(last_url.contains("nix-"));
+        let last = list.last().unwrap();
+        assert_eq!(last.name, "nix");
+        assert!(last.url.contains("nix-"));
+        assert!(last.sha256.is_some());
         println!("Resolved {} packages for nix:", list.len());
-        for (name, url) in &list {
-            println!("  {} -> {}", name, url);
+        for target in &list {
+            println!("  {} -> {} (sha256: {:?})", target.name, target.url, target.sha256);
         }
     }
 }

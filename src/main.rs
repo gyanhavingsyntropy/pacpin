@@ -27,6 +27,7 @@ mod restart;
 mod sandbox;
 mod tui_select;
 mod ui;
+mod utils;
 mod wizard;
 
 use colored::Colorize;
@@ -196,6 +197,12 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
         if (autoremove || orphan_list_changed) && !dry_run && !orphans.is_empty() {
             let selected_orphans = if !noconfirm {
                 ui::prompt_orphan_selection(&orphans, false)
+            } else if autoremove {
+                orphans
+                    .iter()
+                    .filter(|o| o.optional_for.is_empty())
+                    .map(|o| o.name.clone())
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -304,6 +311,12 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
         if (autoremove || orphan_list_changed) && !orphans.is_empty() {
             selected_orphans = ui::prompt_orphan_selection(&orphans, true);
         }
+    } else if autoremove && !orphans.is_empty() {
+        selected_orphans = orphans
+            .iter()
+            .filter(|o| o.optional_for.is_empty())
+            .map(|o| o.name.clone())
+            .collect();
     }
 
     let mut exit_status = Ok(std::process::ExitStatus::default());
@@ -1064,7 +1077,7 @@ fn cmd_history(tx_id: Option<usize>) {
     println!();
 }
 
-fn cmd_orphans(clean: bool) {
+fn cmd_orphans(clean: bool, noconfirm: bool) {
 
     print_banner();
     let manager = match AlpmManager::new() {
@@ -1084,7 +1097,15 @@ fn cmd_orphans(clean: bool) {
     ui::render_orphans_summary(&orphans);
 
     if clean {
-        let selected = ui::prompt_orphan_selection(&orphans, false);
+        let selected = if !noconfirm {
+            ui::prompt_orphan_selection(&orphans, false)
+        } else {
+            orphans
+                .iter()
+                .filter(|o| o.optional_for.is_empty())
+                .map(|o| o.name.clone())
+                .collect()
+        };
         if !selected.is_empty() {
             check_pacman_lock();
             OrphanManager::execute_removal(&selected);
@@ -1420,8 +1441,8 @@ fn cmd_print_uris(config: &Config, targets: &[String]) {
         let (repo, pkg) = sandbox::parse_target(target);
         match manager.resolve_download_urls(repo, pkg) {
             Ok(urls) => {
-                for (_p_name, url) in urls {
-                    if writeln!(stdout, "{}", url).is_err() {
+                for target_pkg in urls {
+                    if writeln!(stdout, "{}", target_pkg.url).is_err() {
                         return;
                     }
                 }
@@ -1577,7 +1598,7 @@ fn print_help() {
 }
 
 fn print_version() {
-    println!("pacpin 3.1.0");
+    println!("pacpin {}", env!("CARGO_PKG_VERSION"));
     println!("Copyright (C) 2026 Gyan <330976822+gyanhavingsyntropy@users.noreply.github.com>");
     println!("License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>");
     println!("This is free software: you are free to change and redistribute it.");
@@ -1586,6 +1607,12 @@ fn print_version() {
 
 
 fn main() {
+    if std::env::var_os("NO_COLOR").is_some()
+        || (!io::stdout().is_terminal() && std::env::var_os("CLICOLOR_FORCE").is_none())
+    {
+        colored::control::set_override(false);
+    }
+
     let args: Vec<String> = env::args().skip(1).collect();
 
     if args.first().map(|s| s == "-v" || s == "-V" || s == "--version").unwrap_or(false) {
@@ -1866,7 +1893,8 @@ fn main() {
         cmd_list(&config);
     } else if cmd == "orphans" || cmd == "autoremove" {
         let clean = args.iter().any(|a| a == "-c" || a == "--clean") || cmd == "autoremove";
-        cmd_orphans(clean);
+        let noconfirm = args.iter().any(|a| a == "--noconfirm");
+        cmd_orphans(clean, noconfirm);
     } else if cmd == "keep" || cmd == "adopt" {
         if args.len() < 2 {
             eprintln!("{}", "Error: 'pacpin keep' requires at least one package name.".red());
@@ -2063,5 +2091,38 @@ mod tests {
         assert_eq!(patterns, vec!["pkgA", "pkgB", "pkgC"]);
 
         let _ = std::fs::remove_file(&tmp_file);
+    }
+
+    #[test]
+    fn test_pure_orphan_filtering() {
+        use crate::db::OrphanPackage;
+        let orphans = vec![
+            OrphanPackage {
+                name: "pure-orphan".to_string(),
+                version: "1.0".to_string(),
+                desc: "test".to_string(),
+                isize: 100,
+                optional_for: Vec::new(),
+                dropped_by: Vec::new(),
+                is_projected: false,
+            },
+            OrphanPackage {
+                name: "opt-plugin".to_string(),
+                version: "1.0".to_string(),
+                desc: "test plugin".to_string(),
+                isize: 200,
+                optional_for: vec!["ffmpeg".to_string()],
+                dropped_by: Vec::new(),
+                is_projected: false,
+            },
+        ];
+
+        let pure: Vec<String> = orphans
+            .iter()
+            .filter(|o| o.optional_for.is_empty())
+            .map(|o| o.name.clone())
+            .collect();
+
+        assert_eq!(pure, vec!["pure-orphan"]);
     }
 }

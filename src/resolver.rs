@@ -98,7 +98,10 @@ impl<'a> ResolverEngine<'a> {
         if let Some(repo) = pins.get(pkg_name) {
             return Some(repo.clone());
         }
-        let mut sorted_pins: Vec<(&String, &String)> = pins.iter().collect();
+        let mut sorted_pins: Vec<(&String, &String)> = pins
+            .iter()
+            .filter(|(pat, _)| pat.contains('*') || pat.contains('?') || pat.contains('['))
+            .collect();
         sorted_pins.sort_by_key(|(pat, _)| std::cmp::Reverse(pat.len()));
 
         for (pat, repo) in sorted_pins {
@@ -212,6 +215,21 @@ impl<'a> ResolverEngine<'a> {
         let aur_data = aur_handle.join().unwrap_or_default();
         let installed_dbs = Self::load_installed_dbs();
 
+        let syncdbs_list: Vec<&alpm::Db> = alpm.syncdbs().into_iter().collect();
+        let syncdb_map: HashMap<&str, &alpm::Db> = syncdbs_list.iter().map(|d| (d.name(), *d)).collect();
+
+        let mut glob_pins: Vec<(&str, Pattern, &str)> = Vec::new();
+        if config.features.pinning {
+            for (pat, repo) in &config.pins {
+                if pat.contains('*') || pat.contains('?') || pat.contains('[') {
+                    if let Ok(p) = Pattern::new(pat) {
+                        glob_pins.push((pat.as_str(), p, repo.as_str()));
+                    }
+                }
+            }
+            glob_pins.sort_by_key(|(pat, _, _)| std::cmp::Reverse(pat.len()));
+        }
+
         let mut resolved: HashMap<String, ResolvedPackage> = HashMap::new();
         let mut unresolved_pins: Vec<(String, String)> = Vec::new();
 
@@ -225,7 +243,7 @@ impl<'a> ResolverEngine<'a> {
             if installed_db.is_empty() {
                 let mut fallback_repo = None;
                 for r in repos {
-                    if let Some(db) = alpm.syncdbs().into_iter().find(|d| d.name() == r) {
+                    if let Some(&db) = syncdb_map.get(r.as_str()) {
                         if let Ok(p) = db.pkg(pkg_name) {
                             if vercmp(p.version().as_str(), inst_ver) == Ordering::Equal {
                                 installed_db = r.clone();
@@ -244,7 +262,14 @@ impl<'a> ResolverEngine<'a> {
             }
 
             let pinned_repo = if config.features.pinning {
-                Self::is_pinned(pkg_name, &config.pins)
+                if let Some(repo) = config.pins.get(pkg_name) {
+                    Some(repo.clone())
+                } else {
+                    glob_pins
+                        .iter()
+                        .find(|(_, pattern, _)| pattern.matches(pkg_name))
+                        .map(|(_, _, repo)| (*repo).to_string())
+                }
             } else {
                 None
             };
@@ -256,7 +281,7 @@ impl<'a> ResolverEngine<'a> {
 
             let mut natural_top_repo = None;
             for r in repos {
-                if let Some(db) = alpm.syncdbs().into_iter().find(|d| d.name() == r) {
+                if let Some(&db) = syncdb_map.get(r.as_str()) {
                     if db.pkg(pkg_name).is_ok() {
                         natural_top_repo = Some(r.clone());
                         break;
@@ -286,7 +311,7 @@ impl<'a> ResolverEngine<'a> {
                     } else {
                         unresolved_pins.push((pkg_name.to_string(), target_repo.clone()));
                     }
-                } else if let Some(db) = alpm.syncdbs().into_iter().find(|d| d.name() == target_repo) {
+                } else if let Some(&db) = syncdb_map.get(target_repo.as_str()) {
                     if let Ok(p) = db.pkg(pkg_name) {
                         candidate = Some(CandidatePackage {
                             name: p.name().to_string(),
@@ -328,7 +353,7 @@ impl<'a> ResolverEngine<'a> {
                             });
                             is_sticky = true;
                         }
-                    } else if let Some(db) = alpm.syncdbs().into_iter().find(|d| d.name() == installed_db) {
+                    } else if let Some(&db) = syncdb_map.get(installed_db.as_str()) {
                         if let Ok(p) = db.pkg(pkg_name) {
                             candidate = Some(CandidatePackage {
                                 name: p.name().to_string(),
@@ -353,7 +378,7 @@ impl<'a> ResolverEngine<'a> {
                         if config.features.pinning && Self::is_excluded(pkg_name, r, &config.exclude) {
                             continue;
                         }
-                        if let Some(db) = alpm.syncdbs().into_iter().find(|d| d.name() == r) {
+                        if let Some(&db) = syncdb_map.get(r.as_str()) {
                             if let Ok(p) = db.pkg(pkg_name) {
                                 candidate = Some(CandidatePackage {
                                     name: p.name().to_string(),

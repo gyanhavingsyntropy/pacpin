@@ -211,11 +211,9 @@ fn try_nix(pkg: &str, args: &[String]) {
                 "::".yellow(),
                 s.code().unwrap_or(1)
             );
-            let mut shell_cmd = pkg.to_string();
-            if !args.is_empty() {
-                shell_cmd.push(' ');
-                shell_cmd.push_str(&args.join(" "));
-            }
+            let mut cmd_parts = vec![crate::utils::shell_quote(pkg)];
+            cmd_parts.extend(args.iter().map(|s| crate::utils::shell_quote(s)));
+            let shell_cmd = cmd_parts.join(" ");
             let shell_status = Command::new("nix-shell")
                 .args(["-p", pkg, "--run", &shell_cmd])
                 .status();
@@ -321,8 +319,8 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String]) {
     }
 
     // 1. Download & Extract all resolved packages (dependencies first, then target)
-    for (p_name, url) in &resolved {
-        let tarball_path = match get_or_download_package(p_name, url, &mut guard) {
+    for target in &resolved {
+        let tarball_path = match get_or_download_package(&target.name, &target.url, target.sha256.as_deref(), &mut guard) {
             Ok(path) => path,
             Err(err) => {
                 eprintln!("{}", format!("Error: {}", err).red().bold());
@@ -337,11 +335,11 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String]) {
         match extract_status {
             Ok(s) if s.success() => {}
             Ok(s) => {
-                eprintln!("{}", format!("Extraction of '{}' failed with exit code {}.", p_name, s.code().unwrap_or(1)).red());
+                eprintln!("{}", format!("Extraction of '{}' failed with exit code {}.", target.name, s.code().unwrap_or(1)).red());
                 exit(s.code().unwrap_or(1));
             }
             Err(e) => {
-                eprintln!("{}", format!("Failed to execute tar on '{}': {}", p_name, e).red());
+                eprintln!("{}", format!("Failed to execute tar on '{}': {}", target.name, e).red());
                 exit(1);
             }
         }
@@ -407,6 +405,7 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String]) {
 fn get_or_download_package(
     pkg: &str,
     url: &str,
+    expected_sha: Option<&str>,
     guard: &mut SandboxGuard,
 ) -> Result<PathBuf, String> {
     // 1. Check local pacman cache first (/var/cache/pacman/pkg/)
@@ -440,11 +439,15 @@ fn get_or_download_package(
         "pkg.tar.zst"
     };
 
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
     let temp_download = env::temp_dir().join(format!(
         "pacpin-download-{}-{}-{}.{}",
         pkg,
         std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros(),
+        micros,
         ext
     ));
     guard.downloaded_tarballs.push(temp_download.clone());
@@ -457,6 +460,23 @@ fn get_or_download_package(
 
     if !curl_status.success() {
         return Err(format!("curl download failed with exit code {:?}", curl_status.code()));
+    }
+
+    // 3. Verify SHA256 integrity against ALPM database metadata
+    if let Some(expected) = expected_sha {
+        if let Ok(out) = Command::new("sha256sum").arg(&temp_download).output() {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let computed = stdout.split_whitespace().next().unwrap_or("");
+                if !computed.eq_ignore_ascii_case(expected) {
+                    let _ = fs::remove_file(&temp_download);
+                    return Err(format!(
+                        "SHA256 checksum verification failed for '{}'!\n  Expected: {}\n  Computed: {}\nDownloaded package was discarded for security.",
+                        pkg, expected, computed
+                    ));
+                }
+            }
+        }
     }
 
     Ok(temp_download)

@@ -22,6 +22,30 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub const SAFE_AUR_HELPERS: &[&str] = &["paru", "yay", "pikaur", "aurman", "pakku", "trizen"];
+
+pub fn validate_helper(helper: &str) -> Result<String, String> {
+    let trimmed = helper.trim();
+    if trimmed.is_empty() {
+        return Err("AUR helper name cannot be empty.".to_string());
+    }
+    let forbidden = [';', '&', '|', '`', '$', ' ', '\t', '\n', '\r', '(', ')', '{', '}', '<', '>', '~'];
+    if trimmed.chars().any(|c| forbidden.contains(&c)) {
+        return Err(format!("AUR helper '{}' contains illegal shell characters.", trimmed));
+    }
+    if SAFE_AUR_HELPERS.contains(&trimmed) {
+        return Ok(trimmed.to_string());
+    }
+    let p = Path::new(trimmed);
+    if p.is_absolute() && p.is_file() {
+        return Ok(trimmed.to_string());
+    }
+    Err(format!(
+        "Untrusted AUR helper '{}'. Expected one of {:?} or an absolute path to an executable file.",
+        trimmed, SAFE_AUR_HELPERS
+    ))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
     #[serde(default = "default_helper")]
@@ -129,8 +153,18 @@ where
 }
 
 pub fn get_config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Path::new(&home).join(".config").join("pacpin").join("config.toml")
+    let home = std::env::var("HOME").ok().filter(|h| !h.trim().is_empty());
+    if let Some(h) = home {
+        Path::new(&h).join(".config").join("pacpin").join("config.toml")
+    } else {
+        eprintln!(
+            "{}",
+            "Error: $HOME environment variable is not set. Cannot securely locate configuration directory."
+                .red()
+                .bold()
+        );
+        std::process::exit(1);
+    }
 }
 
 pub fn config_exists() -> bool {
@@ -142,7 +176,7 @@ pub fn load_config() -> Config {
     if !path.exists() {
         return Config::default();
     }
-    match fs::read_to_string(&path) {
+    let mut config: Config = match fs::read_to_string(&path) {
         Ok(contents) => match toml::from_str(&contents) {
             Ok(cfg) => cfg,
             Err(e) => {
@@ -162,7 +196,14 @@ pub fn load_config() -> Config {
             );
             std::process::exit(1);
         }
+    };
+
+    if let Err(e) = validate_helper(&config.options.helper) {
+        eprintln!("{} Warning: {} Falling back to 'paru'.", "::".yellow(), e);
+        config.options.helper = default_helper();
     }
+
+    config
 }
 
 pub fn save_config(config: &Config) -> Result<(), std::io::Error> {
@@ -242,5 +283,22 @@ mod tests {
 
         let default_config = Config::default();
         assert!(!default_config.features.vendor_stickiness);
+    }
+
+    #[test]
+    fn test_validate_helper() {
+        assert_eq!(validate_helper("paru").unwrap(), "paru");
+        assert_eq!(validate_helper("yay").unwrap(), "yay");
+        assert_eq!(validate_helper("pikaur").unwrap(), "pikaur");
+
+        assert!(validate_helper("").is_err());
+        assert!(validate_helper("rm -rf /").is_err());
+        assert!(validate_helper("paru; whoami").is_err());
+        assert!(validate_helper("untrusted_helper_xyz").is_err());
+
+        let sh_path = "/bin/sh";
+        if std::path::Path::new(sh_path).exists() {
+            assert_eq!(validate_helper(sh_path).unwrap(), sh_path);
+        }
     }
 }

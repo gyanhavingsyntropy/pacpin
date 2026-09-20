@@ -15,6 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use crate::config::{get_config_path, save_config, Config, Features, Options};
+use crate::integrations::{FlatpakProvider, IntegrationProvider, NixProvider, PipxProvider};
 use crate::ui::print_banner;
 use colored::Colorize;
 use std::collections::BTreeMap;
@@ -59,7 +60,7 @@ fn prompt_input(prompt_text: &str, default_val: &str) -> String {
 }
 
 fn detect_aur_helper() -> Option<String> {
-    for helper in &["paru", "yay", "pikaur", "trizen"] {
+    for helper in crate::config::SAFE_AUR_HELPERS {
         if Command::new("which").arg(helper).output().map(|o| o.status.success()).unwrap_or(false) {
             return Some(helper.to_string());
         }
@@ -221,9 +222,9 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
     // 5. External Package Manager Integrations
     println!("{}", "[5/5] External Package Manager Integrations:".bold());
     println!("      Automatically check and unify updates for additional package managers.");
-    let has_flatpak = Command::new("flatpak").arg("--version").output().is_ok();
-    let has_nix = Command::new("nix").arg("--version").output().is_ok();
-    let has_pipx = Command::new("pipx").arg("--version").output().is_ok();
+    let has_flatpak = FlatpakProvider.is_available();
+    let has_nix = NixProvider.is_available();
+    let has_pipx = PipxProvider.is_available();
 
     let mut enable_flatpak = false;
     let mut enable_nix = false;
