@@ -17,7 +17,7 @@
 use crate::resolver::{ResolveResult, ResolvedPackage};
 use colored::Colorize;
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use terminal_size::{terminal_size, Width};
 
 pub fn get_terminal_width() -> usize {
@@ -245,6 +245,28 @@ pub fn prompt_multiselect(title: &str, repo: &str, items: &[String]) -> Vec<Stri
         return Vec::new();
     }
 
+    if io::stdin().is_terminal() {
+        let subtitle = format!("Select companion packages from [{}] to avoid version mismatches", repo);
+        let checkbox_items: Vec<crate::tui_select::CheckboxItem> = items
+            .iter()
+            .map(|name| {
+                crate::tui_select::CheckboxItem::new(
+                    name.clone(),
+                    name.clone(),
+                    format!("from [{}]", repo),
+                    true,
+                    true,
+                )
+            })
+            .collect();
+
+        if let Some(selected) = crate::tui_select::run_checkbox_menu(title, &subtitle, &checkbox_items) {
+            return selected;
+        } else {
+            return Vec::new();
+        }
+    }
+
     println!("\n{} {}:", "::".cyan(), title.bold());
     println!("{} Repository {}", "::".cyan(), repo.green());
 
@@ -373,6 +395,43 @@ pub fn prompt_orphan_selection(
 ) -> Vec<String> {
     if orphans.is_empty() {
         return Vec::new();
+    }
+
+    if io::stdin().is_terminal() {
+        let title = if is_after_upgrade {
+            "CLEAN ORPHANED PACKAGES AFTER UPGRADE"
+        } else {
+            "SELECT ORPHANED PACKAGES TO REMOVE"
+        };
+        let subtitle = "Pure orphans are pre-selected ([x]). Optional plugins are unchecked ([ ]).";
+
+        let checkbox_items: Vec<crate::tui_select::CheckboxItem> = orphans
+            .iter()
+            .map(|o| {
+                let is_pure = o.optional_for.is_empty();
+                let size_str = format_size(o.isize);
+                let desc = if !is_pure {
+                    format!("{} (opt for: {})", size_str, o.optional_for.join(", "))
+                } else if !o.desc.is_empty() {
+                    format!("{} — {}", size_str, o.desc)
+                } else {
+                    format!("{} [Pure Orphan]", size_str)
+                };
+                crate::tui_select::CheckboxItem::new(
+                    o.name.clone(),
+                    o.name.clone(),
+                    desc,
+                    is_pure,
+                    is_pure,
+                )
+            })
+            .collect();
+
+        if let Some(selected) = crate::tui_select::run_checkbox_menu(title, subtitle, &checkbox_items) {
+            return selected;
+        } else {
+            return Vec::new();
+        }
     }
 
     let pure_names: Vec<String> = orphans

@@ -18,7 +18,7 @@ use crate::config::{get_config_path, save_config, Config, Features, Options};
 use crate::ui::print_banner;
 use colored::Colorize;
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::Command;
 
 fn prompt_yn(prompt_text: &str, default_yes: bool) -> bool {
@@ -216,11 +216,51 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
     let mut enable_nix = false;
 
     if has_flatpak || has_nix {
-        if has_flatpak {
-            enable_flatpak = prompt_yn("  • Enable Flatpak integration (flathub updates & cleanup)?", false);
+        if io::stdin().is_terminal() {
+            let mut items = Vec::new();
+            if has_flatpak {
+                items.push(crate::tui_select::CheckboxItem::new(
+                    "flatpak",
+                    "Flatpak",
+                    "Flathub updates & automatic unused runtime cleanup",
+                    true,
+                    false,
+                ));
+            }
+            if has_nix {
+                items.push(crate::tui_select::CheckboxItem::new(
+                    "nix",
+                    "Nix",
+                    "Nix profile updates & garbage collection",
+                    true,
+                    false,
+                ));
+            }
+            if let Some(selected) = crate::tui_select::run_checkbox_menu(
+                "EXTERNAL PACKAGE MANAGERS",
+                "Select integrations to enable ([Space] to toggle, [Enter] to confirm)",
+                &items,
+            ) {
+                enable_flatpak = selected.contains(&"flatpak".to_string());
+                enable_nix = selected.contains(&"nix".to_string());
+            }
+        } else {
+            if has_flatpak {
+                enable_flatpak = prompt_yn("  • Enable Flatpak integration (flathub updates & cleanup)?", false);
+            }
+            if has_nix {
+                enable_nix = prompt_yn("  • Enable Nix integration (profile updates & garbage collection)?", false);
+            }
         }
-        if has_nix {
-            enable_nix = prompt_yn("  • Enable Nix integration (profile updates & garbage collection)?", false);
+
+        if enable_flatpak {
+            println!("  ✔ Enabled Flatpak integration.");
+        }
+        if enable_nix {
+            println!("  ✔ Enabled Nix integration.");
+        }
+        if !enable_flatpak && !enable_nix {
+            println!("  ℹ External integrations disabled.");
         }
     } else {
         println!("      No external package managers detected (Flatpak/Nix).");

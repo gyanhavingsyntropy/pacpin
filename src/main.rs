@@ -23,6 +23,7 @@ mod journal;
 mod orphans;
 mod repo_menu;
 mod resolver;
+mod tui_select;
 mod ui;
 mod wizard;
 
