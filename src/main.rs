@@ -99,6 +99,13 @@ fn cmd_check(config: &Config) {
         }
     }
 
+    if config.features.vendor_stickiness {
+        println!(
+            "\n{}",
+            "ℹ Vendor Stickiness: ACTIVE (packages stay bound to originating repository unless pinned)".blue()
+        );
+    }
+
     let res = resolver.resolve_all(config);
     let ext_providers = IntegrationsManager::get_active_providers(config);
     let external_updates = IntegrationsManager::check_updates_parallel(&ext_providers);
@@ -611,6 +618,45 @@ fn cmd_list(config: &Config) {
     };
     let resolver = ResolverEngine::new(&manager);
 
+    println!("\n{}", "Active Engine Features:".bold());
+    println!(
+        "  • Repository Pinning:      {}",
+        if config.features.pinning { "Enabled".green() } else { "Disabled".dimmed() }
+    );
+    println!(
+        "  • Vendor Stickiness:       {}",
+        if config.features.vendor_stickiness {
+            "Enabled (packages bound to originating repository)".blue()
+        } else {
+            "Disabled".dimmed()
+        }
+    );
+    println!(
+        "  • Smart Orphan Lifecycle:  {}",
+        if config.features.smart_orphans { "Enabled".green() } else { "Disabled".dimmed() }
+    );
+    println!(
+        "  • Stability Delay Buffers: {}",
+        if config.features.stability_delays { "Enabled".green() } else { "Disabled".dimmed() }
+    );
+    let ext_status = if config.features.integrations {
+        let mut enabled_exts = Vec::new();
+        if config.integrations.flatpak {
+            enabled_exts.push("Flatpak");
+        }
+        if config.integrations.nix {
+            enabled_exts.push("Nix");
+        }
+        if enabled_exts.is_empty() {
+            "Enabled (none active)".yellow().to_string()
+        } else {
+            format!("Enabled ({})", enabled_exts.join(", ")).green().to_string()
+        }
+    } else {
+        "Disabled".dimmed().to_string()
+    };
+    println!("  • External Integrations:   {}", ext_status);
+
     println!("\n{}", "Configured Repository Rules:".bold());
 
     if !config.repo_order.is_empty() {
@@ -673,7 +719,7 @@ fn cmd_list(config: &Config) {
             .bold()
         );
         for m in custom_matches {
-            let status_str = if let Some(ref cand) = m.candidate {
+            let mut status_str = if let Some(ref cand) = m.candidate {
                 format!("➔ [{}] {}", cand.repo, cand.version)
             } else {
                 format!(
@@ -681,6 +727,9 @@ fn cmd_list(config: &Config) {
                     format!("[{}] NOT FOUND", m.pinned_repo.as_deref().unwrap_or("?")).red()
                 )
             };
+            if m.held {
+                status_str.push_str(&format!(" {}", format!("[DELAYED - {}]", m.hold_reason).yellow()));
+            }
             let inst_db = if !m.installed_db.is_empty() {
                 format!(" (installed from [{}])", m.installed_db)
             } else {
@@ -930,16 +979,21 @@ fn cmd_history(tx_id: Option<usize>) {
             let to_repo = p.get("to_repo").and_then(|v| v.as_str()).unwrap_or("?");
             let to_ver = p.get("to_version").and_then(|v| v.as_str()).unwrap_or("?");
             let state = p.get("state").and_then(|v| v.as_str()).unwrap_or("default");
+            let state_badge = match state {
+                "custom" => "(custom)".cyan(),
+                "sticky" => "(sticky)".blue(),
+                _ => "(default)".dimmed(),
+            };
 
             if from_ver != "?" && to_ver != "?" {
                 println!(
-                    "  • {:<28} : [{}] {} ➔ [{}] {} ({})",
+                    "  • {:<28} : [{}] {} ➔ [{}] {} {}",
                     name.bold(),
                     from_repo,
                     from_ver,
                     to_repo,
                     to_ver,
-                    state
+                    state_badge
                 );
             } else if let Some(restored) = p.get("restored_version").and_then(|v| v.as_str()) {
                 println!(

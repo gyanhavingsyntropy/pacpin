@@ -265,6 +265,7 @@ impl<'a> ResolverEngine<'a> {
             }
 
             let mut candidate: Option<CandidatePackage> = None;
+            let mut is_sticky = false;
 
             if state == "custom" {
                 let target_repo = pinned_repo.as_ref().unwrap();
@@ -325,6 +326,7 @@ impl<'a> ResolverEngine<'a> {
                                 is_aur: true,
                                 depends: Vec::new(),
                             });
+                            is_sticky = true;
                         }
                     } else if let Some(db) = alpm.syncdbs().into_iter().find(|d| d.name() == installed_db) {
                         if let Ok(p) = db.pkg(pkg_name) {
@@ -340,6 +342,7 @@ impl<'a> ResolverEngine<'a> {
                                 is_aur: false,
                                 depends: p.depends().iter().map(|d| d.name().to_string()).collect(),
                             });
+                            is_sticky = true;
                         }
                     }
                 }
@@ -422,7 +425,15 @@ impl<'a> ResolverEngine<'a> {
                 0
             };
 
-            let diverted_from_top = state == "default"
+            let final_state = if state == "custom" {
+                "custom".to_string()
+            } else if is_sticky && candidate.is_some() {
+                "sticky".to_string()
+            } else {
+                "default".to_string()
+            };
+
+            let diverted_from_top = final_state == "default"
                 && candidate.is_some()
                 && natural_top_repo.is_some()
                 && candidate.as_ref().unwrap().repo != *natural_top_repo.as_ref().unwrap();
@@ -431,7 +442,7 @@ impl<'a> ResolverEngine<'a> {
                 pkg_name.to_string(),
                 ResolvedPackage {
                     name: pkg_name.to_string(),
-                    state,
+                    state: final_state,
                     pinned_repo,
                     installed_ver: inst_ver.to_string(),
                     installed_size: inst_size,
@@ -490,9 +501,17 @@ impl<'a> ResolverEngine<'a> {
             .cloned()
             .collect();
         updates.sort_by(|a, b| {
-            let a_cust = if a.state == "custom" { 0 } else { 1 };
-            let b_cust = if b.state == "custom" { 0 } else { 1 };
-            (a_cust, &a.name).cmp(&(b_cust, &b.name))
+            let a_rank = match a.state.as_str() {
+                "custom" => 0,
+                "sticky" => 1,
+                _ => 2,
+            };
+            let b_rank = match b.state.as_str() {
+                "custom" => 0,
+                "sticky" => 1,
+                _ => 2,
+            };
+            (a_rank, &a.name).cmp(&(b_rank, &b.name))
         });
 
         let mut held_packages: Vec<ResolvedPackage> = resolved

@@ -521,9 +521,17 @@ pub fn render_transaction_view(
             } else {
                 p.hold_reason.as_str()
             };
+            let state_badge = match p.state.as_str() {
+                "custom" => "[custom]".cyan(),
+                "sticky" => "[sticky]".blue(),
+                _ => "[default]".dimmed(),
+            };
+            let target_repo = p.candidate.as_ref().map(|c| format!("[{}]", c.repo)).unwrap_or_default();
             println!(
-                "  • {:<28} : {} ➔ {}  ({})",
+                "  • {} {:<24} {:<10} : {} ➔ {}  ({})",
+                state_badge,
                 p.name.bold(),
+                target_repo.dimmed(),
                 p.installed_ver,
                 cand_ver,
                 reason.yellow()
@@ -550,6 +558,7 @@ pub fn render_transaction_view(
     let mut tot_isize: i64 = 0;
     let mut tot_delta: i64 = 0;
     let mut custom_count = 0;
+    let mut sticky_count = 0;
     let mut default_count = 0;
     let mut pacman_count = 0;
     let mut aur_count = 0;
@@ -668,6 +677,9 @@ pub fn render_transaction_view(
                 } else {
                     format!("{:<9}", "[custom]".cyan())
                 }
+            } else if p.state == "sticky" {
+                sticky_count += 1;
+                format!("{:<9}", "[sticky]".blue())
             } else {
                 default_count += 1;
                 format!("{:<9}", "[default]".green())
@@ -676,6 +688,8 @@ pub fn render_transaction_view(
             let repo_raw = format_repo_name(&cand.repo, repo_w);
             let repo_str = if p.state == "custom" {
                 format!("{:<rw$}", repo_raw.yellow(), rw = repo_w)
+            } else if p.state == "sticky" {
+                format!("{:<rw$}", repo_raw.blue(), rw = repo_w)
             } else {
                 format!("{:<rw$}", repo_raw.dimmed(), rw = repo_w)
             };
@@ -800,12 +814,18 @@ pub fn render_transaction_view(
 
     println!("\n  ┌{}┐", "─".repeat(card_inner_w));
     let total_all = updates.len() + external_updates.len();
-    let pkg_summary = format!(
-        "{} ({} custom, {} default)",
-        total_all,
-        custom_count,
-        default_count + external_updates.len()
-    );
+    let mut breakdown = Vec::new();
+    if custom_count > 0 {
+        breakdown.push(format!("{} custom", custom_count));
+    }
+    if sticky_count > 0 {
+        breakdown.push(format!("{} sticky", sticky_count));
+    }
+    let normal_defaults = default_count + external_updates.len();
+    if normal_defaults > 0 || breakdown.is_empty() {
+        breakdown.push(format!("{} default", normal_defaults));
+    }
+    let pkg_summary = format!("{} ({})", total_all, breakdown.join(", "));
     print_card_line(
         "📦 Packages to Upgrade : ",
         &pkg_summary,

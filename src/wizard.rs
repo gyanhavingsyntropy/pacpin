@@ -98,7 +98,7 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
 
     println!("{}", ":: Welcome to pacpin! Let's tailor your package management preferences.\n".cyan().bold());
 
-    let (mut pins, mut exclude, mut delays, mut repo_order, vendor_stickiness) = if let Some(ref cfg) = existing_cfg {
+    let (mut pins, mut exclude, mut delays, mut repo_order, mut vendor_stickiness) = if let Some(ref cfg) = existing_cfg {
         if !cfg.pins.is_empty() || !cfg.delay.is_empty() || !cfg.repo_order.is_empty() {
             println!(
                 "  {}",
@@ -162,6 +162,18 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
                 println!("  ✔ Saved custom repository search order.\n");
             }
         }
+
+        vendor_stickiness = prompt_yn(
+            "Enable Vendor Stickiness? (keep installed packages bound to their originating repo)",
+            vendor_stickiness,
+        );
+        if vendor_stickiness {
+            println!("  ✔ Enabled vendor stickiness.\n");
+        } else {
+            println!("  ℹ Vendor stickiness disabled.\n");
+        }
+    } else {
+        println!();
     }
 
     // 2. Stability Delay Buffer
