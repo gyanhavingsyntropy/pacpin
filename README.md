@@ -2,33 +2,25 @@
 
 **Declarative Package Resolver & Upgrade Engine for Arch Linux / CachyOS**
 
-`pacpin` is a high-performance native package resolver and upgrade engine written in Rust for Arch Linux and CachyOS. It combines declarative repository pinning, repo-level exclusions, stability delay buffers, companion split-package cascades, and transaction snapshot rollback journaling directly on top of `libalpm` via zero-copy C FFI.
+`pacpin` is a high-performance native package resolver, system upgrade engine, and package sandboxing tool written in Rust for Arch Linux and CachyOS. It combines declarative repository pinning, repo-level exclusions, stability delay buffers, companion split-package cascades, vendor stickiness, multi-package manager unification, post-upgrade restart inspection, ephemeral sandboxing, and transaction snapshot rollback journaling directly on top of `libalpm` via zero-copy C FFI.
 
 ---
 
 ## Key Features
 
 1. **Declarative Repository Pins**: Lock packages or wildcard patterns (`linux-firmware*`, `amd-ucode`) to specific repositories (`core`, `extra`, `cachyos`, `aur`). Prevents blind upgrades from epoch-polluted or experimental third-party repos.
-2. **True Resolver**: Synthesizes explicit qualified package targets (`repo/pkg`) instead of blind `pacman -Su` commands.
-3. **Microsecond ALPM Engine**: Powered directly by `libalpm` C FFI. Database loading and evaluation across 16,000+ packages completes in under 30 milliseconds.
-4. **Parallel AUR Querying**: Queries the AUR RPC v5 asynchronously over HTTP/TLS in background threads while ALPM sync databases are parsed.
-5. **Stability Delay Buffers**: Enforce quarantine windows (e.g. `pacpin delay openssl 3`) with automatic reverse-dependency cascade holds to prevent ABI mismatches.
-6. **Companion Cascade Detection**: Automatically detects split packages (sharing `%BASE%`) and prefix-related dependencies when pinning or installing to prevent version desynchronization.
-7. **Transaction Snapshots & Rollback**: Logs transaction state to `~/.local/state/pacpin/history.jsonl` and enables 1-click package rollback (`pacpin rollback`) directly from the local pacman cache directory.
-8. **Single-Confirmation**: Prompts once before execution; passes `--noconfirm` to low-level runners (`pacman` and `paru`).
-
----
-
-## License
-
-`pacpin` is licensed under the **GNU General Public License version 3 (GPLv3)**. See the [LICENSE](LICENSE) file for the full license text.
-
-```
-Copyright (C) 2026 Gyan <330976822+gyanhavingsyntropy@users.noreply.github.com>
-License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>
-This is free software: you are free to change and redistribute it.
-There is NO WARRANTY, to the extent permitted by law.
-```
+2. **True Resolver Engine**: Synthesizes explicit qualified package targets (`repo/pkg`) instead of blind `pacman -Su` commands, preventing unexpected repository hopping.
+3. **Opt-In Vendor Stickiness**: Keep packages bound to their originating repository (`%INSTALLED_DB%`) during upgrades so they don't unexpectedly jump between sync repositories (e.g. `core` ➔ `cachyos`), displaying a distinct `[sticky]` badge in transactions.
+4. **BIOS-Style Repository Priority Menu**: Interactively reorder your system's repository search priority using arrow keys and instant promotion/demotion (`pacpin repos`).
+5. **Ephemeral Package Sandbox (`pacpin try <pkg> [args...]`)**: Like `nix run`, download and execute tools in an isolated `/tmp` sandbox with zero system footprint and no root required, automatically cleaning up on exit.
+6. **Post-Upgrade Restart Inspector (`needrestart`)**: Automatically inspect running processes holding deleted `.so` libraries in RAM (`/proc/*/maps`) and verify running kernel vs installed modules, advising on exact service restart commands (`sudo systemctl restart <srv>`) with zero noise when nothing needs restarting.
+7. **Scrollable Checkbox TUI with Batch Shortcuts**: Interactive viewport checklist (`Space` toggle, `Enter` confirm) with one-key batch actions (`[a]` All, `[n]` None, `[p]` Pure Only, `[i]` Invert, `/` Search) for orphan management and setup.
+8. **Unified Multi-Package Manager Integrations**: Simultaneously check, refresh, and execute updates for Flatpak and Nix alongside Pacman and AUR in a single transaction view.
+9. **Batch Pinning from Files**: Pin multiple packages at once or import a package list from a text file (`pacpin pin <repo> -f <file>`).
+10. **Stability Delay Buffers**: Enforce quarantine windows (e.g. `pacpin delay linux 3`) with automatic reverse-dependency cascade holds to prevent ABI mismatches.
+11. **Companion Cascade Detection**: Automatically detects split packages (sharing `%BASE%`) and prefix-related dependencies when pinning or installing to prevent version desynchronization.
+12. **Transaction Snapshots & Rollback**: Logs transaction state to `~/.local/state/pacpin/history.jsonl` and enables 1-click package rollback (`pacpin rollback`) directly from the local pacman cache.
+13. **Single-Confirmation**: Prompts once before execution; passes `--noconfirm` to low-level runners (`pacman` and `paru`).
 
 ---
 
@@ -37,28 +29,38 @@ There is NO WARRANTY, to the extent permitted by law.
 ```toml
 [features]
 pinning = true
+vendor_stickiness = false
 stability_delays = false
 smart_orphans = true
+integrations = false
 
 [options]
 helper = "paru"
 
+repo_order = ["core", "cachyos", "extra", "multilib"]
+
 [pins]
 "amd-ucode" = "core"
+"intel-ucode" = "core"
 "linux-firmware*" = "core"
 
 [exclude]
 cachyos = ["linux-firmware*"]
 
 [delay]
+# "linux" = 3
 # "openssl" = 3
+
+[integrations]
+flatpak = true
+nix = false
 ```
 
 ---
 
 ## Commands Reference
 
-### Package Management & Wrapper
+### Core Package Operations
 | Command | Pacman / AUR Equivalent | Description |
 | :--- | :--- | :--- |
 | `pacpin check` (`pin check`, `pin -Qu`) | `pacman -Qu` | Check pending updates and verify active pin protections |
@@ -68,21 +70,33 @@ cachyos = ["linux-firmware*"]
 | `pacpin search <query...>` (`pin -Ss`) | `paru -Ss`, `pacman -Ss` | Search official repositories and the AUR simultaneously |
 | `pacpin info <pkg...>` (`pin -Si`) | `paru -Si`, `pacman -Si` | View package metadata, dependencies, and upstream repository info |
 | `pacpin clean` (`pin -Sc`) | `pacman -Sc`, `paru -Sc` | Clean cached package archives and AUR build directories |
-| `pacpin orphans [-c]` (`pin autoremove`) | `pacman -Qdt` | Inspect or remove unneeded orphaned dependencies (`-c` to prompt selection) |
-| `pacpin keep <pkg...>` (`pin adopt`) | `pacman -D --asexplicit` | Mark package(s) as explicitly installed to silence orphan warnings |
 
-### Pinning & System Stability
+### Declarative Rules & Configuration
 | Command | Description |
 | :--- | :--- |
-| `pacpin pin <pkg> <repo>` | Lock package or pattern to a designated repository |
-| `pacpin unpin <pkg>` | Remove a pin rule |
+| `pacpin repos` (`pin priority`) | Interactive BIOS-style repository search priority menu |
+| `pacpin pin <repo> <pkg...>` | Lock package(s) or wildcards to a designated repository |
+| `pacpin pin <repo> -f <file>` | Batch pin packages from a text file (one package per line) |
+| `pacpin unpin <pkg>` | Remove a repository pin rule |
 | `pacpin delay <pkg> <days>` | Set a stability delay buffer on a package |
 | `pacpin undelay <pkg>` | Remove a stability delay buffer |
-| `pacpin list` | List active pins, exclusions, delay rules, and matching packages |
-| `pacpin history [id]` | View transaction history timeline or inspect a transaction |
+| `pacpin list` | List active engine features, pins, exclusions, delays, and repo priority |
+| `pacpin reset [-f]` | Reset all configurations, pins, and delays to default (creates automatic timestamped backup) |
+| `pacpin init [--reset]` | Interactive onboarding wizard to configure preferences from scratch |
+
+### System Maintenance & Hygiene
+| Command | Description |
+| :--- | :--- |
+| `pacpin orphans [-c]` (`pin autoremove`) | Inspect or remove unneeded orphaned dependencies with scrollable interactive checkbox TUI |
+| `pacpin keep <pkg...>` (`pin adopt`) | Mark package(s) as explicitly installed to silence orphan warnings |
+| `pacpin needrestart` (`pin restart-check`) | Inspect processes holding outdated libraries (`/proc/*/maps`) or replaced kernel in RAM |
+
+### Power Tools & Sandboxing
+| Command | Description |
+| :--- | :--- |
+| `pacpin try <pkg> [args...]` (`pin run`) | Run a package in an isolated ephemeral sandbox without installing or needing root |
+| `pacpin history [id]` | View transaction history timeline or inspect full package diff |
 | `pacpin rollback [id] [-n]` | Restore previous package versions from pacman cache |
-| `pacpin init` (`pin setup`) | Interactive onboarding wizard to configure system preferences |
-| `pacpin --version` | Display version and GPLv3 license information |
 
 ### Transparent Pacman Drop-in
 `pacpin` serves as a complete drop-in wrapper. Any native pacman flag sequence (`-Q`, `-Qi`, `-Ql`, `-Qo`, `-F`, `-Fy`, `-U`, `-D`, etc.) passed to `pacpin` or `pin` is transparently handled with proper permission routing (non-root for queries, `sudo` for modifications).
@@ -102,5 +116,19 @@ sudo pacman -S --needed base-devel git rust pacman
 ### Build & Install
 ```bash
 cargo build --release
-cp target/release/pacpin ~/.local/bin/pacpin
+install -m 755 target/release/pacpin ~/.local/bin/pacpin
+install -m 755 target/release/pacpin ~/.local/bin/pin
+```
+
+---
+
+## License
+
+`pacpin` is licensed under the **GNU General Public License version 3 (GPLv3)**. See the [LICENSE](LICENSE) file for the full license text.
+
+```
+Copyright (C) 2026 Gyan <330976822+gyanhavingsyntropy@users.noreply.github.com>
+License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
 ```
