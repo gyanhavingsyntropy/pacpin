@@ -18,6 +18,70 @@ use crate::resolver::{ResolveResult, ResolvedPackage};
 use colored::Colorize;
 use std::collections::HashSet;
 use std::io::{self, Write};
+use terminal_size::{terminal_size, Width};
+
+pub fn get_terminal_width() -> usize {
+    if let Ok(cols) = std::env::var("COLUMNS") {
+        if let Ok(w) = cols.parse::<usize>() {
+            if w >= 40 {
+                return w;
+            }
+        }
+    }
+    if let Some((Width(w), _)) = terminal_size() {
+        if w >= 40 {
+            return w as usize;
+        }
+    }
+    80
+}
+
+pub fn truncate_str(s: &str, max_w: usize) -> String {
+    if s.chars().count() <= max_w {
+        return s.to_string();
+    }
+    if max_w == 0 {
+        return String::new();
+    }
+    if max_w == 1 {
+        return "…".to_string();
+    }
+    let mut res: String = s.chars().take(max_w - 1).collect();
+    res.push('…');
+    res
+}
+
+pub fn format_repo_name(repo: &str, max_w: usize) -> String {
+    let full = format!("[{}]", repo);
+    if str_width(&full) <= max_w {
+        return full;
+    }
+    if repo.starts_with("cachyos-") {
+        let abbr = format!("[c-{}]", &repo["cachyos-".len()..]);
+        if str_width(&abbr) <= max_w {
+            return abbr;
+        }
+    }
+    truncate_str(&full, max_w)
+}
+
+pub fn format_version_diff(old_ver: &str, new_ver: &str, max_w: usize) -> String {
+    let full = format!("{} ➔ {}", old_ver, new_ver);
+    if str_width(&full) <= max_w {
+        return full;
+    }
+    let old_clean = old_ver.split(':').last().unwrap_or(old_ver);
+    let new_clean = new_ver.split(':').last().unwrap_or(new_ver);
+    let clean = format!("{} ➔ {}", old_clean, new_clean);
+    if str_width(&clean) <= max_w {
+        return clean;
+    }
+    let target_only = format!("➔ {}", new_clean);
+    if str_width(&target_only) <= max_w {
+        return target_only;
+    }
+    truncate_str(&clean, max_w)
+}
 
 pub fn print_banner() {
     println!(
@@ -420,6 +484,9 @@ pub fn render_transaction_view(
         return Vec::new();
     }
 
+    let term_w = get_terminal_width();
+    let avail = term_w.saturating_sub(2);
+
     let mut tot_csize: i64 = 0;
     let mut tot_isize: i64 = 0;
     let mut tot_delta: i64 = 0;
@@ -434,21 +501,92 @@ pub fn render_transaction_view(
             format!("Pending Package Transactions ({}):", updates.len()).bold()
         );
 
-        let header = format!(
-            "  {:<9} {:<28} {:<12} {:<32} {:>10} {:>10} {:>11}",
-            "STATE", "PACKAGE", "REPO", "VERSION", "DOWNLOAD", "INSTALLED", "NET DELTA"
-        );
-        println!("{}", header.bold());
-        println!(
-            "  {:<9} {:<28} {:<12} {:<32} {:>10} {:>10} {:>11}",
-            "─────────",
-            "────────────────────────────",
-            "────────────",
-            "────────────────────────────────",
-            "──────────",
-            "──────────",
-            "───────────"
-        );
+        let is_full = avail >= 115;
+        let is_medium = avail >= 95 && avail < 115;
+
+        let max_repo_len = updates
+            .iter()
+            .map(|p| {
+                p.candidate
+                    .as_ref()
+                    .map(|c| format_repo_name(&c.repo, 18).len())
+                    .unwrap_or(6)
+            })
+            .max()
+            .unwrap_or(6)
+            .clamp(6, if is_full { 18 } else { 14 });
+
+        let repo_w = max_repo_len;
+
+        let (pkg_w, ver_w) = if is_full {
+            let fixed = 9 + repo_w + 10 + 10 + 11 + 6;
+            let rem = avail.saturating_sub(fixed);
+            let pw = (rem * 48 / 100).max(22);
+            let vw = rem.saturating_sub(pw).max(20);
+            (pw, vw)
+        } else if is_medium {
+            let fixed = 9 + repo_w + 10 + 10 + 5;
+            let rem = avail.saturating_sub(fixed);
+            let pw = (rem * 50 / 100).max(20);
+            let vw = rem.saturating_sub(pw).max(18);
+            (pw, vw)
+        } else {
+            let fixed = 9 + repo_w + 10 + 4;
+            let rem = avail.saturating_sub(fixed);
+            let pw = (rem * 52 / 100).max(18);
+            let vw = rem.saturating_sub(pw).max(16);
+            (pw, vw)
+        };
+
+        if is_full {
+            println!(
+                "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10} {:>10} {:>11}",
+                "STATE", "PACKAGE", "REPO", "VERSION", "DOWNLOAD", "INSTALLED", "NET DELTA",
+                pw = pkg_w, rw = repo_w, vw = ver_w
+            );
+            println!(
+                "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10} {:>10} {:>11}",
+                "─────────",
+                "─".repeat(pkg_w),
+                "─".repeat(repo_w),
+                "─".repeat(ver_w),
+                "──────────",
+                "──────────",
+                "───────────",
+                pw = pkg_w, rw = repo_w, vw = ver_w
+            );
+        } else if is_medium {
+            println!(
+                "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10} {:>10}",
+                "STATE", "PACKAGE", "REPO", "VERSION", "DOWNLOAD", "NET DELTA",
+                pw = pkg_w, rw = repo_w, vw = ver_w
+            );
+            println!(
+                "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10} {:>10}",
+                "─────────",
+                "─".repeat(pkg_w),
+                "─".repeat(repo_w),
+                "─".repeat(ver_w),
+                "──────────",
+                "──────────",
+                pw = pkg_w, rw = repo_w, vw = ver_w
+            );
+        } else {
+            println!(
+                "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10}",
+                "STATE", "PACKAGE", "REPO", "VERSION", "NET DELTA",
+                pw = pkg_w, rw = repo_w, vw = ver_w
+            );
+            println!(
+                "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10}",
+                "─────────",
+                "─".repeat(pkg_w),
+                "─".repeat(repo_w),
+                "─".repeat(ver_w),
+                "──────────",
+                pw = pkg_w, rw = repo_w, vw = ver_w
+            );
+        }
 
         for p in updates {
             let cand = match p.candidate.as_ref() {
@@ -476,14 +614,16 @@ pub fn render_transaction_view(
                 format!("{:<9}", "[default]".green())
             };
 
-            let repo_display = format!("[{}]", cand.repo);
+            let repo_raw = format_repo_name(&cand.repo, repo_w);
             let repo_str = if p.state == "custom" {
-                format!("{:<12}", repo_display.yellow())
+                format!("{:<rw$}", repo_raw.yellow(), rw = repo_w)
             } else {
-                format!("{:<12}", repo_display.dimmed())
+                format!("{:<rw$}", repo_raw.dimmed(), rw = repo_w)
             };
 
-            let ver_str = format!("{} ➔ {}", p.installed_ver, cand.version.bold());
+            let pkg_raw = truncate_str(&p.name, pkg_w);
+            let ver_raw = format_version_diff(&p.installed_ver, &cand.version, ver_w);
+
             let csize_str = if cand.csize > 0 {
                 format_size(cand.csize)
             } else {
@@ -500,16 +640,40 @@ pub fn render_transaction_view(
             tot_isize += cand.isize;
             tot_delta += p.net_delta;
 
-            println!(
-                "  {} {:<28} {} {:<32} {:>10} {:>10} {:>11}",
-                state_str,
-                p.name.bold(),
-                repo_str,
-                ver_str,
-                csize_str.dimmed(),
-                isize_str.dimmed(),
-                delta_str.color(delta_color)
-            );
+            if is_full {
+                println!(
+                    "  {} {:<pw$} {} {:<vw$} {:>10} {:>10} {:>11}",
+                    state_str,
+                    pkg_raw.bold(),
+                    repo_str,
+                    ver_raw,
+                    csize_str.dimmed(),
+                    isize_str.dimmed(),
+                    delta_str.color(delta_color),
+                    pw = pkg_w, vw = ver_w
+                );
+            } else if is_medium {
+                println!(
+                    "  {} {:<pw$} {} {:<vw$} {:>10} {:>10}",
+                    state_str,
+                    pkg_raw.bold(),
+                    repo_str,
+                    ver_raw,
+                    csize_str.dimmed(),
+                    delta_str.color(delta_color),
+                    pw = pkg_w, vw = ver_w
+                );
+            } else {
+                println!(
+                    "  {} {:<pw$} {} {:<vw$} {:>10}",
+                    state_str,
+                    pkg_raw.bold(),
+                    repo_str,
+                    ver_raw,
+                    delta_str.color(delta_color),
+                    pw = pkg_w, vw = ver_w
+                );
+            }
         }
     }
 
@@ -519,27 +683,33 @@ pub fn render_transaction_view(
             format!("External Package Transactions ({}):", external_updates.len()).bold()
         );
 
-        let ext_header = format!(
-            "  {:<10} {:<32} {:<12} {:<24}",
-            "RUNNER", "PACKAGE / APP ID", "REPO", "TARGET VERSION"
-        );
-        println!("{}", ext_header.bold());
+        let rem_ext = avail.saturating_sub(10 + 14 + 3);
+        let ext_pkg_w = (rem_ext * 55 / 100).max(18);
+        let ext_ver_w = rem_ext.saturating_sub(ext_pkg_w).max(16);
+
         println!(
-            "  {:<10} {:<32} {:<12} {:<24}",
+            "  {:<10} {:<pw$} {:<14} {:<vw$}",
+            "RUNNER", "PACKAGE / APP ID", "REPO", "TARGET VERSION",
+            pw = ext_pkg_w, vw = ext_ver_w
+        );
+        println!(
+            "  {:<10} {:<pw$} {:<14} {:<vw$}",
             "──────────",
-            "────────────────────────────────",
-            "────────────",
-            "────────────────────────"
+            "─".repeat(ext_pkg_w),
+            "──────────────",
+            "─".repeat(ext_ver_w),
+            pw = ext_pkg_w, vw = ext_ver_w
         );
 
         for ext in external_updates {
             let repo_display = format!("[{}]", ext.repo);
             println!(
-                "  {:<10} {:<32} {:<12} {:<24}",
+                "  {:<10} {:<pw$} {:<14} {:<vw$}",
                 ext.runner.cyan(),
-                ext.name.bold(),
-                repo_display.dimmed(),
-                ext.version.green()
+                truncate_str(&ext.name, ext_pkg_w).bold(),
+                truncate_str(&repo_display, 14).dimmed(),
+                truncate_str(&ext.version, ext_ver_w).green(),
+                pw = ext_pkg_w, vw = ext_ver_w
             );
         }
     }
@@ -554,7 +724,7 @@ pub fn render_transaction_view(
         }
     }
 
-    let card_inner_w = 58;
+    let card_inner_w = (avail.saturating_sub(4)).min(60).max(50);
     let (tot_delta_str, tot_delta_color) = format_delta_text(tot_delta);
 
     let print_card_line = |label: &str, val_str: &str, colored_val: String| {
@@ -707,6 +877,26 @@ mod tests {
         assert_eq!(parse_selection_indices("1-2", &items), vec!["pkgA", "pkgB"]);
         assert_eq!(parse_selection_indices("2-4", &items), vec!["pkgB", "pkgC", "pkgD"]);
         assert_eq!(parse_selection_indices("^2", &items), vec!["pkgA", "pkgC", "pkgD"]);
+    }
+
+    #[test]
+    fn test_truncate_str() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello world", 6), "hello…");
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_format_repo_name() {
+        assert_eq!(format_repo_name("core", 10), "[core]");
+        assert_eq!(format_repo_name("cachyos-extra-v3", 18), "[cachyos-extra-v3]");
+        assert_eq!(format_repo_name("cachyos-extra-v3", 14), "[c-extra-v3]");
+    }
+
+    #[test]
+    fn test_format_version_diff() {
+        assert_eq!(format_version_diff("1.0", "1.1", 20), "1.0 ➔ 1.1");
+        assert_eq!(format_version_diff("3:26.2.2-2", "3:26.2.3-1", 20), "26.2.2-2 ➔ 26.2.3-1");
     }
 }
 
