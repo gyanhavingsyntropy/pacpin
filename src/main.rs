@@ -18,6 +18,7 @@ mod alias;
 mod aur;
 mod config;
 mod db;
+mod integrations;
 mod journal;
 mod orphans;
 mod resolver;
@@ -27,6 +28,7 @@ mod wizard;
 use colored::Colorize;
 use config::{load_config, save_config, Config};
 use db::AlpmManager;
+use integrations::IntegrationsManager;
 use journal::TransactionJournal;
 use orphans::OrphanManager;
 use resolver::ResolverEngine;
@@ -94,7 +96,9 @@ fn cmd_check(config: &Config) {
     }
 
     let res = resolver.resolve_all(config);
-    render_transaction_view(&res);
+    let ext_providers = IntegrationsManager::get_active_providers(config);
+    let external_updates = IntegrationsManager::check_updates_parallel(&ext_providers);
+    render_transaction_view(&res, &config.options.helper, &external_updates);
 
     if config.features.smart_orphans {
         let orphans = manager.get_orphans(&[]);
@@ -153,7 +157,9 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
     };
     let resolver = ResolverEngine::new(&manager);
     let res = resolver.resolve_all(config);
-    let updates = render_transaction_view(&res);
+    let ext_providers = IntegrationsManager::get_active_providers(config);
+    let external_updates = IntegrationsManager::check_updates_parallel(&ext_providers);
+    let updates = render_transaction_view(&res, &config.options.helper, &external_updates);
     let orphans = if config.features.smart_orphans {
         manager.get_orphans(&updates)
     } else {
@@ -170,7 +176,7 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
         ui::render_orphans_summary(&orphans);
     }
 
-    if updates.is_empty() {
+    if updates.is_empty() && external_updates.is_empty() {
         if (autoremove || orphan_list_changed) && !dry_run && !orphans.is_empty() {
             let selected_orphans = if !noconfirm {
                 ui::prompt_orphan_selection(&orphans, false)
@@ -228,6 +234,10 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
             helper,
             aur_targets.join(" ")
         ));
+    }
+
+    for p in &ext_providers {
+        command_strs.push(p.upgrade_command_str());
     }
 
     let full_cmd = command_strs.join(" && ");
@@ -309,6 +319,10 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
                 success = false;
             }
         }
+    }
+
+    if success && !ext_providers.is_empty() {
+        IntegrationsManager::execute_upgrades(&ext_providers);
     }
 
     if success {
@@ -1141,6 +1155,11 @@ fn cmd_clean(config: &Config, extra_args: &[String]) {
             eprintln!("{}", format!("Cache clean failed: {}", e).red());
             exit(1);
         }
+    }
+
+    let ext_providers = IntegrationsManager::get_active_providers(config);
+    if !ext_providers.is_empty() {
+        IntegrationsManager::execute_cleanups(&ext_providers);
     }
 }
 

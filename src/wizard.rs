@@ -140,7 +140,7 @@ pub fn run_first_launch_wizard(force: bool) -> Option<Config> {
     println!();
 
     // 4. AUR Integration
-    println!("{}", "[4/4] AUR Helper Integration:".bold());
+    println!("{}", "[4/5] AUR Helper Integration:".bold());
     let detected_helper = detect_aur_helper();
     let helper = if let Some(ref h) = detected_helper {
         println!("      Detected installed AUR helper: '{}'", h.green().bold());
@@ -155,16 +155,37 @@ pub fn run_first_launch_wizard(force: bool) -> Option<Config> {
     };
     println!();
 
+    // 5. External Package Manager Integrations
+    println!("{}", "[5/5] External Package Manager Integrations:".bold());
+    println!("      Automatically check and unify updates for Flatpak and Nix alongside Pacman.");
+    let has_flatpak = Command::new("flatpak").arg("--version").output().is_ok();
+    let has_nix = Command::new("nix").arg("--version").output().is_ok();
+    let enable_integrations = if has_flatpak || has_nix {
+        let mut detected = Vec::new();
+        if has_flatpak { detected.push("Flatpak"); }
+        if has_nix { detected.push("Nix"); }
+        println!("      Detected installed manager(s): {}", detected.join(", ").green().bold());
+        prompt_yn("Enable external package manager integration?", false)
+    } else {
+        false
+    };
+    println!();
+
     let config = Config {
         features: Features {
             pinning: enable_pinning,
             stability_delays: enable_delays,
             smart_orphans: enable_orphans,
+            integrations: enable_integrations,
         },
         options: Options { helper },
         pins,
         exclude,
         delay: delays,
+        integrations: crate::config::IntegrationsConfig {
+            flatpak: enable_integrations && has_flatpak,
+            nix: enable_integrations && has_nix,
+        },
     };
 
     if let Err(e) = save_config(&config) {

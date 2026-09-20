@@ -48,6 +48,8 @@ pub struct Features {
     pub stability_delays: bool,
     #[serde(default = "default_true")]
     pub smart_orphans: bool,
+    #[serde(default = "default_false")]
+    pub integrations: bool,
 }
 
 fn default_true() -> bool {
@@ -64,8 +66,17 @@ impl Default for Features {
             pinning: true,
             stability_delays: false,
             smart_orphans: true,
+            integrations: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IntegrationsConfig {
+    #[serde(default = "default_false")]
+    pub flatpak: bool,
+    #[serde(default = "default_false")]
+    pub nix: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -80,6 +91,8 @@ pub struct Config {
     pub exclude: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub delay: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub integrations: IntegrationsConfig,
 }
 
 fn deserialize_exclude<'de, D>(deserializer: D) -> Result<BTreeMap<String, Vec<String>>, D::Error>
@@ -183,5 +196,22 @@ mod tests {
         assert!(!config.features.pinning);
         assert!(config.features.stability_delays);
         assert!(!config.features.smart_orphans);
+        assert!(!config.features.integrations);
+    }
+
+    #[test]
+    fn test_integrations_config() {
+        let toml_str = r#"
+        [features]
+        integrations = true
+
+        [integrations]
+        flatpak = true
+        nix = true
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.features.integrations);
+        assert!(config.integrations.flatpak);
+        assert!(config.integrations.nix);
     }
 }

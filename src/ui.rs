@@ -370,7 +370,11 @@ pub fn prompt_orphan_selection(
 }
 
 
-pub fn render_transaction_view(data: &ResolveResult) -> Vec<ResolvedPackage> {
+pub fn render_transaction_view(
+    data: &ResolveResult,
+    helper: &str,
+    external_updates: &[crate::integrations::ExternalUpdate],
+) -> Vec<ResolvedPackage> {
     let updates = &data.updates;
     let held = &data.held_packages;
 
@@ -404,7 +408,7 @@ pub fn render_transaction_view(data: &ResolveResult) -> Vec<ResolvedPackage> {
         }
     }
 
-    if updates.is_empty() {
+    if updates.is_empty() && external_updates.is_empty() {
         if held.is_empty() {
             println!("\n{}", "✔ System is fully up to date!".green());
             println!(
@@ -416,87 +420,138 @@ pub fn render_transaction_view(data: &ResolveResult) -> Vec<ResolvedPackage> {
         return Vec::new();
     }
 
-    println!(
-        "\n{}",
-        format!("Pending Package Transactions ({}):", updates.len()).bold()
-    );
-
-    let header = format!(
-        "  {:<9} {:<28} {:<12} {:<32} {:>10} {:>10} {:>11}",
-        "STATE", "PACKAGE", "REPO", "VERSION", "DOWNLOAD", "INSTALLED", "NET DELTA"
-    );
-    println!("{}", header.bold());
-    println!(
-        "  {:<9} {:<28} {:<12} {:<32} {:>10} {:>10} {:>11}",
-        "─────────",
-        "────────────────────────────",
-        "────────────",
-        "────────────────────────────────",
-        "──────────",
-        "──────────",
-        "───────────"
-    );
-
     let mut tot_csize: i64 = 0;
     let mut tot_isize: i64 = 0;
     let mut tot_delta: i64 = 0;
     let mut custom_count = 0;
     let mut default_count = 0;
+    let mut pacman_count = 0;
+    let mut aur_count = 0;
 
-    for p in updates {
-        let cand = match p.candidate.as_ref() {
-            Some(c) => c,
-            None => continue,
-        };
-
-        let state_str = if p.state == "custom" {
-            custom_count += 1;
-            if p.is_downgrade {
-                format!("{:<9}", "[down]".red())
-            } else if p.update_type == "pin_sync" {
-                format!("{:<9}", "[sync]".magenta())
-            } else {
-                format!("{:<9}", "[custom]".cyan())
-            }
-        } else {
-            default_count += 1;
-            format!("{:<9}", "[default]".green())
-        };
-
-        let repo_display = format!("[{}]", cand.repo);
-        let repo_str = if p.state == "custom" {
-            format!("{:<12}", repo_display.yellow())
-        } else {
-            format!("{:<12}", repo_display.dimmed())
-        };
-
-        let ver_str = format!("{} ➔ {}", p.installed_ver, cand.version.bold());
-        let csize_str = if cand.csize > 0 {
-            format_size(cand.csize)
-        } else {
-            "-".to_string()
-        };
-        let isize_str = if cand.isize > 0 {
-            format_size(cand.isize)
-        } else {
-            "-".to_string()
-        };
-        let (delta_str, delta_color) = format_delta_text(p.net_delta);
-
-        tot_csize += cand.csize;
-        tot_isize += cand.isize;
-        tot_delta += p.net_delta;
-
+    if !updates.is_empty() {
         println!(
-            "  {} {:<28} {} {:<32} {:>10} {:>10} {:>11}",
-            state_str,
-            p.name.bold(),
-            repo_str,
-            ver_str,
-            csize_str.dimmed(),
-            isize_str.dimmed(),
-            delta_str.color(delta_color)
+            "\n{}",
+            format!("Pending Package Transactions ({}):", updates.len()).bold()
         );
+
+        let header = format!(
+            "  {:<9} {:<28} {:<12} {:<32} {:>10} {:>10} {:>11}",
+            "STATE", "PACKAGE", "REPO", "VERSION", "DOWNLOAD", "INSTALLED", "NET DELTA"
+        );
+        println!("{}", header.bold());
+        println!(
+            "  {:<9} {:<28} {:<12} {:<32} {:>10} {:>10} {:>11}",
+            "─────────",
+            "────────────────────────────",
+            "────────────",
+            "────────────────────────────────",
+            "──────────",
+            "──────────",
+            "───────────"
+        );
+
+        for p in updates {
+            let cand = match p.candidate.as_ref() {
+                Some(c) => c,
+                None => continue,
+            };
+
+            if cand.is_aur {
+                aur_count += 1;
+            } else {
+                pacman_count += 1;
+            }
+
+            let state_str = if p.state == "custom" {
+                custom_count += 1;
+                if p.is_downgrade {
+                    format!("{:<9}", "[down]".red())
+                } else if p.update_type == "pin_sync" {
+                    format!("{:<9}", "[sync]".magenta())
+                } else {
+                    format!("{:<9}", "[custom]".cyan())
+                }
+            } else {
+                default_count += 1;
+                format!("{:<9}", "[default]".green())
+            };
+
+            let repo_display = format!("[{}]", cand.repo);
+            let repo_str = if p.state == "custom" {
+                format!("{:<12}", repo_display.yellow())
+            } else {
+                format!("{:<12}", repo_display.dimmed())
+            };
+
+            let ver_str = format!("{} ➔ {}", p.installed_ver, cand.version.bold());
+            let csize_str = if cand.csize > 0 {
+                format_size(cand.csize)
+            } else {
+                "-".to_string()
+            };
+            let isize_str = if cand.isize > 0 {
+                format_size(cand.isize)
+            } else {
+                "-".to_string()
+            };
+            let (delta_str, delta_color) = format_delta_text(p.net_delta);
+
+            tot_csize += cand.csize;
+            tot_isize += cand.isize;
+            tot_delta += p.net_delta;
+
+            println!(
+                "  {} {:<28} {} {:<32} {:>10} {:>10} {:>11}",
+                state_str,
+                p.name.bold(),
+                repo_str,
+                ver_str,
+                csize_str.dimmed(),
+                isize_str.dimmed(),
+                delta_str.color(delta_color)
+            );
+        }
+    }
+
+    if !external_updates.is_empty() {
+        println!(
+            "\n{}",
+            format!("External Package Transactions ({}):", external_updates.len()).bold()
+        );
+
+        let ext_header = format!(
+            "  {:<10} {:<32} {:<12} {:<24}",
+            "RUNNER", "PACKAGE / APP ID", "REPO", "TARGET VERSION"
+        );
+        println!("{}", ext_header.bold());
+        println!(
+            "  {:<10} {:<32} {:<12} {:<24}",
+            "──────────",
+            "────────────────────────────────",
+            "────────────",
+            "────────────────────────"
+        );
+
+        for ext in external_updates {
+            let repo_display = format!("[{}]", ext.repo);
+            println!(
+                "  {:<10} {:<32} {:<12} {:<24}",
+                ext.runner.cyan(),
+                ext.name.bold(),
+                repo_display.dimmed(),
+                ext.version.green()
+            );
+        }
+    }
+
+    let mut flatpak_count = 0;
+    let mut nix_count = 0;
+    for ext in external_updates {
+        if ext.runner == "Flatpak" {
+            flatpak_count += 1;
+        } else if ext.runner == "Nix" {
+            nix_count += 1;
+        }
     }
 
     let card_inner_w = 58;
@@ -514,19 +569,61 @@ pub fn render_transaction_view(data: &ResolveResult) -> Vec<ResolvedPackage> {
         println!("  │ {}{}{} │", label, " ".repeat(pad), colored_val);
     };
 
-
     println!("\n  ┌{}┐", "─".repeat(card_inner_w));
+    let total_all = updates.len() + external_updates.len();
     let pkg_summary = format!(
         "{} ({} custom, {} default)",
-        updates.len(),
+        total_all,
         custom_count,
-        default_count
+        default_count + external_updates.len()
     );
     print_card_line(
         "📦 Packages to Upgrade : ",
         &pkg_summary,
         pkg_summary.bold().to_string(),
     );
+
+    if pacman_count > 0 {
+        let s = format!("{} updates", pacman_count);
+        print_card_line(
+            "  • Pacman             : ",
+            &s,
+            s.cyan().to_string(),
+        );
+    }
+
+    if aur_count > 0 {
+        let helper_title = match helper.to_lowercase().as_str() {
+            "paru" => "Paru",
+            "yay" => "Yay",
+            _ => helper,
+        };
+        let label = format!("  • {:<18} : ", helper_title);
+        let s = format!("{} updates", aur_count);
+        print_card_line(
+            &label,
+            &s,
+            s.yellow().to_string(),
+        );
+    }
+
+    if flatpak_count > 0 {
+        let s = format!("{} updates", flatpak_count);
+        print_card_line(
+            "  • Flatpak            : ",
+            &s,
+            s.blue().to_string(),
+        );
+    }
+
+    if nix_count > 0 {
+        let s = format!("{} updates", nix_count);
+        print_card_line(
+            "  • Nix                : ",
+            &s,
+            s.magenta().to_string(),
+        );
+    }
 
     if !held.is_empty() {
         let held_summary = format!("{} packages", held.len());
