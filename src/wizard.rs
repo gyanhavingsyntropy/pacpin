@@ -157,19 +157,26 @@ pub fn run_first_launch_wizard(force: bool) -> Option<Config> {
 
     // 5. External Package Manager Integrations
     println!("{}", "[5/5] External Package Manager Integrations:".bold());
-    println!("      Automatically check and unify updates for Flatpak and Nix alongside Pacman.");
+    println!("      Automatically check and unify updates for additional package managers.");
     let has_flatpak = Command::new("flatpak").arg("--version").output().is_ok();
     let has_nix = Command::new("nix").arg("--version").output().is_ok();
-    let enable_integrations = if has_flatpak || has_nix {
-        let mut detected = Vec::new();
-        if has_flatpak { detected.push("Flatpak"); }
-        if has_nix { detected.push("Nix"); }
-        println!("      Detected installed manager(s): {}", detected.join(", ").green().bold());
-        prompt_yn("Enable external package manager integration?", false)
+
+    let mut enable_flatpak = false;
+    let mut enable_nix = false;
+
+    if has_flatpak || has_nix {
+        if has_flatpak {
+            enable_flatpak = prompt_yn("  • Enable Flatpak integration (flathub updates & cleanup)?", false);
+        }
+        if has_nix {
+            enable_nix = prompt_yn("  • Enable Nix integration (profile updates & garbage collection)?", false);
+        }
     } else {
-        false
-    };
+        println!("      No external package managers detected (Flatpak/Nix).");
+    }
     println!();
+
+    let enable_integrations = enable_flatpak || enable_nix;
 
     let config = Config {
         features: Features {
@@ -183,8 +190,8 @@ pub fn run_first_launch_wizard(force: bool) -> Option<Config> {
         exclude,
         delay: delays,
         integrations: crate::config::IntegrationsConfig {
-            flatpak: enable_integrations && has_flatpak,
-            nix: enable_integrations && has_nix,
+            flatpak: enable_flatpak,
+            nix: enable_nix,
         },
     };
 
