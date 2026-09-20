@@ -223,11 +223,13 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
     println!("      Automatically check and unify updates for additional package managers.");
     let has_flatpak = Command::new("flatpak").arg("--version").output().is_ok();
     let has_nix = Command::new("nix").arg("--version").output().is_ok();
+    let has_pipx = Command::new("pipx").arg("--version").output().is_ok();
 
     let mut enable_flatpak = false;
     let mut enable_nix = false;
+    let mut enable_pipx = false;
 
-    if has_flatpak || has_nix {
+    if has_flatpak || has_nix || has_pipx {
         if io::stdin().is_terminal() {
             let mut items = Vec::new();
             if has_flatpak {
@@ -248,6 +250,15 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
                     false,
                 ));
             }
+            if has_pipx {
+                items.push(crate::tui_select::CheckboxItem::new(
+                    "pipx",
+                    "Pipx",
+                    "Isolated Python CLI app updates (pipx upgrade-all)",
+                    true,
+                    false,
+                ));
+            }
             if let Some(selected) = crate::tui_select::run_checkbox_menu(
                 "EXTERNAL PACKAGE MANAGERS",
                 "Select integrations to enable ([Space] to toggle, [Enter] to confirm)",
@@ -255,6 +266,7 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
             ) {
                 enable_flatpak = selected.contains(&"flatpak".to_string());
                 enable_nix = selected.contains(&"nix".to_string());
+                enable_pipx = selected.contains(&"pipx".to_string());
             }
         } else {
             if has_flatpak {
@@ -262,6 +274,9 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
             }
             if has_nix {
                 enable_nix = prompt_yn("  • Enable Nix integration (profile updates & garbage collection)?", false);
+            }
+            if has_pipx {
+                enable_pipx = prompt_yn("  • Enable Pipx integration (isolated Python CLI updates)?", false);
             }
         }
 
@@ -271,15 +286,18 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
         if enable_nix {
             println!("  ✔ Enabled Nix integration.");
         }
-        if !enable_flatpak && !enable_nix {
+        if enable_pipx {
+            println!("  ✔ Enabled Pipx integration.");
+        }
+        if !enable_flatpak && !enable_nix && !enable_pipx {
             println!("  ℹ External integrations disabled.");
         }
     } else {
-        println!("      No external package managers detected (Flatpak/Nix).");
+        println!("      No external package managers detected (Flatpak/Nix/Pipx).");
     }
     println!();
 
-    let enable_integrations = enable_flatpak || enable_nix;
+    let enable_integrations = enable_flatpak || enable_nix || enable_pipx;
 
     let config = Config {
         features: Features {
@@ -297,6 +315,7 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
         integrations: crate::config::IntegrationsConfig {
             flatpak: enable_flatpak,
             nix: enable_nix,
+            pipx: enable_pipx,
         },
     };
 

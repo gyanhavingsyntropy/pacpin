@@ -647,6 +647,9 @@ fn cmd_list(config: &Config) {
         if config.integrations.nix {
             enabled_exts.push("Nix");
         }
+        if config.integrations.pipx {
+            enabled_exts.push("Pipx");
+        }
         if enabled_exts.is_empty() {
             "Enabled (none active)".yellow().to_string()
         } else {
@@ -1398,6 +1401,124 @@ fn cmd_reset(force: bool) {
     println!("  Run 'pacpin init' to configure preferences from scratch.\n");
 }
 
+fn cmd_print_uris(config: &Config, targets: &[String]) {
+    if targets.is_empty() {
+        eprintln!("{}", "Error: No targets specified.".red());
+        eprintln!("Usage: pacpin -Sp [repo/]pkg ...");
+        exit(1);
+    }
+    let manager = match AlpmManager::with_repo_order(&config.repo_order) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{}", format!("Error initializing ALPM: {}", e).red());
+            exit(1);
+        }
+    };
+
+    let mut stdout = io::stdout().lock();
+    for target in targets {
+        let (repo, pkg) = sandbox::parse_target(target);
+        match manager.resolve_download_urls(repo, pkg) {
+            Ok(urls) => {
+                for (_p_name, url) in urls {
+                    if writeln!(stdout, "{}", url).is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{}", format!("Error resolving '{}': {}", target, e).red());
+                exit(1);
+            }
+        }
+    }
+}
+
+fn cmd_sync_list(config: &Config, repos: &[String]) {
+    let manager = match AlpmManager::with_repo_order(&config.repo_order) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{}", format!("Error initializing ALPM: {}", e).red());
+            exit(1);
+        }
+    };
+
+    let alpm = manager.handle();
+    let local_db = alpm.localdb();
+
+    let filter_repos: std::collections::HashSet<&str> = repos.iter().map(|s| s.as_str()).collect();
+    let mut stdout = io::stdout().lock();
+
+    for db in alpm.syncdbs() {
+        if !filter_repos.is_empty() && !filter_repos.contains(db.name()) {
+            continue;
+        }
+        for pkg in db.pkgs() {
+            let res = if let Ok(local_pkg) = local_db.pkg(pkg.name()) {
+                if local_pkg.version() == pkg.version() {
+                    writeln!(stdout, "{} {} {} [installed]", db.name(), pkg.name(), pkg.version())
+                } else {
+                    writeln!(
+                        stdout,
+                        "{} {} {} [installed: {}]",
+                        db.name(),
+                        pkg.name(),
+                        pkg.version(),
+                        local_pkg.version()
+                    )
+                }
+            } else {
+                writeln!(stdout, "{} {} {}", db.name(), pkg.name(), pkg.version())
+            };
+            if res.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn cmd_sync_groups(config: &Config, groups: &[String]) {
+    let manager = match AlpmManager::with_repo_order(&config.repo_order) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{}", format!("Error initializing ALPM: {}", e).red());
+            exit(1);
+        }
+    };
+
+    let alpm = manager.handle();
+    let filter_groups: std::collections::HashSet<&str> = groups.iter().map(|s| s.as_str()).collect();
+    let mut stdout = io::stdout().lock();
+
+    if filter_groups.is_empty() {
+        let mut all_groups = std::collections::BTreeSet::new();
+        for db in alpm.syncdbs() {
+            for pkg in db.pkgs() {
+                for grp in pkg.groups() {
+                    all_groups.insert(grp.to_string());
+                }
+            }
+        }
+        for grp in all_groups {
+            if writeln!(stdout, "{}", grp).is_err() {
+                return;
+            }
+        }
+    } else {
+        for db in alpm.syncdbs() {
+            for pkg in db.pkgs() {
+                for grp in pkg.groups() {
+                    if filter_groups.contains(grp) {
+                        if writeln!(stdout, "{} {}", grp, pkg.name()).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn print_help() {
     print_banner();
     println!("\nUsage: pacpin <command> [options]");
@@ -1411,6 +1532,9 @@ fn print_help() {
     println!("      -c, --clean              Prompt to clean all orphans during upgrade");
     println!("      --noconfirm              Bypass interactive confirmation prompt");
     println!("  -S [flags] [repo/]pkg        Install packages (auto-pins repo/pkg with companion cascade)");
+    println!("  -Sp, --print-uris <pkg...>   Print package and dependency download URIs");
+    println!("  -Sl, --list [repo...]        List packages in sync repositories");
+    println!("  -Sg, --groups [group...]     List package groups or packages in a group");
     println!("  remove, rm <pkg...>          Remove package(s) and unneeded dependencies (-Rns + smart unpin)");
     println!("  search, -Ss <query...>       Search official repositories and AUR simultaneously");
     println!("  info, -Si <pkg...>           Show detailed package information (-Si / AUR)");
@@ -1434,7 +1558,7 @@ fn print_help() {
     println!("  needrestart                  Inspect processes holding outdated libraries or kernel in RAM");
     println!();
     println!("{}", "Power Tools & Sandboxing:".bold());
-    println!("  try, run [repo/]pkg [args...] Run package in isolated ephemeral sandbox (pacman, flatpak/, nix/)");
+    println!("  try, run [repo/]pkg [args...] Run package in isolated ephemeral sandbox (native, flatpak/, nix/, pipx/)");
     println!("  history [id]                 View transaction history timeline or inspect a transaction");
     println!("  rollback [id] [-n]           Restore previous package versions from cache");
     println!();
@@ -1448,6 +1572,7 @@ fn print_help() {
     println!("  pacpin -Q / -Qo / -Ql        Pacman query and package inspection");
     println!("  pacpin -U <pkg.tar.zst>      Install local package archive");
     println!("  pacpin -F / -Fy              Pacman files database operations");
+    println!("  pacpin -T <deps...>          Check dependency requirements");
     println!();
 }
 
@@ -1572,7 +1697,43 @@ fn main() {
                 exit(1);
             }
         }
-    } else if cmd.starts_with("-Sg") {
+    } else if cmd == "-Sp"
+        || (cmd.starts_with("-S") && cmd.contains('p'))
+        || (cmd.starts_with("-S") && args.iter().any(|a| a == "-p" || a == "--print-uris"))
+    {
+        let targets: Vec<String> = args
+            .iter()
+            .skip(1)
+            .filter(|a| !a.starts_with('-'))
+            .cloned()
+            .collect();
+        cmd_print_uris(&config, &targets);
+        exit(0);
+    } else if cmd == "-Sl"
+        || (cmd.starts_with("-S") && cmd.contains('l'))
+        || (cmd.starts_with("-S") && args.iter().any(|a| a == "-l" || a == "--list"))
+    {
+        let repos: Vec<String> = args
+            .iter()
+            .skip(1)
+            .filter(|a| !a.starts_with('-'))
+            .cloned()
+            .collect();
+        cmd_sync_list(&config, &repos);
+        exit(0);
+    } else if cmd == "-Sg"
+        || (cmd.starts_with("-S") && cmd.contains('g'))
+        || (cmd.starts_with("-S") && args.iter().any(|a| a == "-g" || a == "--groups"))
+    {
+        let groups: Vec<String> = args
+            .iter()
+            .skip(1)
+            .filter(|a| !a.starts_with('-'))
+            .cloned()
+            .collect();
+        cmd_sync_groups(&config, &groups);
+        exit(0);
+    } else if cmd.starts_with("-T") {
         let status = Command::new("pacman").args(&args).status();
         match status {
             Ok(s) => exit(s.code().unwrap_or(0)),

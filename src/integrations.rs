@@ -210,6 +210,74 @@ impl IntegrationProvider for NixProvider {
     }
 }
 
+pub struct PipxProvider;
+
+impl IntegrationProvider for PipxProvider {
+    fn name(&self) -> &'static str {
+        "Pipx"
+    }
+
+    fn is_available(&self) -> bool {
+        Command::new("pipx")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn refresh_metadata(&self) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+
+    fn check_updates(&self) -> Vec<ExternalUpdate> {
+        let output = Command::new("pipx")
+            .args(&["list", "--json"])
+            .output();
+
+        let mut results = Vec::new();
+        if let Ok(out) = output {
+            if out.status.success() {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                    if let Some(venvs) = v.get("venvs").and_then(|v| v.as_object()) {
+                        for (app_name, info) in venvs {
+                            let ver = info.get("metadata")
+                                .and_then(|m| m.get("main_package"))
+                                .and_then(|p| p.get("package_version"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("installed");
+                            results.push(ExternalUpdate {
+                                runner: "Pipx".to_string(),
+                                id: app_name.clone(),
+                                name: app_name.clone(),
+                                repo: "pypi".to_string(),
+                                version: ver.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    fn upgrade_command_str(&self, _updates: &[ExternalUpdate]) -> String {
+        "pipx upgrade-all".to_string()
+    }
+
+    fn execute_upgrade(&self, _updates: &[ExternalUpdate]) -> Result<bool, std::io::Error> {
+        let status = Command::new("pipx").arg("upgrade-all").status()?;
+        Ok(status.success())
+    }
+
+    fn clean_command_str(&self) -> String {
+        "pipx list".to_string()
+    }
+
+    fn execute_clean(&self) -> Result<bool, std::io::Error> {
+        Ok(true)
+    }
+}
+
 pub struct IntegrationsManager;
 
 impl IntegrationsManager {
@@ -234,6 +302,13 @@ impl IntegrationsManager {
             }
         }
 
+        if config.integrations.pipx {
+            let pipx = PipxProvider;
+            if pipx.is_available() {
+                providers.push(Box::new(pipx));
+            }
+        }
+
         providers
     }
 
@@ -254,6 +329,8 @@ impl IntegrationsManager {
                 handles.push(thread::spawn(|| FlatpakProvider.refresh_metadata()));
             } else if name == "Nix" {
                 handles.push(thread::spawn(|| NixProvider.refresh_metadata()));
+            } else if name == "Pipx" {
+                handles.push(thread::spawn(|| PipxProvider.refresh_metadata()));
             }
         }
 
@@ -275,6 +352,8 @@ impl IntegrationsManager {
                 handles.push(thread::spawn(|| FlatpakProvider.check_updates()));
             } else if name == "Nix" {
                 handles.push(thread::spawn(|| NixProvider.check_updates()));
+            } else if name == "Pipx" {
+                handles.push(thread::spawn(|| PipxProvider.check_updates()));
             }
         }
 

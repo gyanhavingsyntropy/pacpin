@@ -80,6 +80,8 @@ pub struct IntegrationsConfig {
     pub flatpak: bool,
     #[serde(default = "default_false")]
     pub nix: bool,
+    #[serde(default = "default_false")]
+    pub pipx: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 struct SandboxGuard {
     sandbox_dir: PathBuf,
-    downloaded_tarball: Option<PathBuf>,
+    downloaded_tarballs: Vec<PathBuf>,
 }
 
 impl Drop for SandboxGuard {
@@ -32,7 +32,7 @@ impl Drop for SandboxGuard {
         if self.sandbox_dir.exists() {
             let _ = fs::remove_dir_all(&self.sandbox_dir);
         }
-        if let Some(ref tarball) = self.downloaded_tarball {
+        for tarball in &self.downloaded_tarballs {
             if tarball.exists() {
                 let _ = fs::remove_file(tarball);
             }
@@ -58,6 +58,7 @@ pub fn cmd_try(target: &str, args: &[String]) {
     match prefix {
         Some("flatpak") => try_flatpak(pkg, args),
         Some("nix") | Some("nixpkgs") => try_nix(pkg, args),
+        Some("pipx") => try_pipx(pkg, args),
         Some(repo) => try_pacman(Some(repo), pkg, args),
         None => try_pacman(None, pkg, args),
     }
@@ -233,6 +234,40 @@ fn try_nix(pkg: &str, args: &[String]) {
     }
 }
 
+fn try_pipx(pkg: &str, args: &[String]) {
+    if !crate::journal::TransactionJournal::is_safe_pkg_name(pkg) {
+        eprintln!(
+            "{}",
+            format!("Error: Invalid Pipx package name '{}'.", pkg).red().bold()
+        );
+        exit(1);
+    }
+
+    if !crate::is_command_available("pipx") {
+        eprintln!("{}", "Error: 'pipx' command not found on this system.".red().bold());
+        exit(1);
+    }
+
+    println!(
+        "{} Running ephemeral Pipx package '{}' (pipx run)...",
+        "::".cyan(),
+        pkg.bold()
+    );
+
+    let mut pipx_args = vec!["run", pkg];
+    pipx_args.extend(args.iter().map(|s| s.as_str()));
+
+    let status = Command::new("pipx").args(&pipx_args).status();
+
+    match status {
+        Ok(s) => exit(s.code().unwrap_or(0)),
+        Err(e) => {
+            eprintln!("{}", format!("Failed to execute pipx: {}", e).red());
+            exit(1);
+        }
+    }
+}
+
 fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String]) {
     if pkg.is_empty() || !crate::journal::TransactionJournal::is_safe_pkg_name(pkg) {
         eprintln!(
@@ -250,42 +285,69 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String]) {
 
     let mut guard = SandboxGuard {
         sandbox_dir: sandbox_dir.clone(),
-        downloaded_tarball: None,
+        downloaded_tarballs: Vec::new(),
     };
 
-    // 1. Locate or download package archive
-    let tarball_path = match find_or_download_package(repo, pkg, &mut guard) {
-        Ok(path) => path,
+    let cfg = crate::config::load_config();
+    let manager = match crate::db::AlpmManager::with_repo_order(&cfg.repo_order) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{}", format!("Error initializing ALPM: {}", e).red());
+            exit(1);
+        }
+    };
+
+    println!("{} Resolving download URLs for '{}' via ALPM...", "::".cyan(), pkg);
+    let resolved = match manager.resolve_download_urls(repo, pkg) {
+        Ok(r) => r,
         Err(err) => {
             eprintln!("{}", format!("Error: {}", err).red().bold());
             exit(1);
         }
     };
 
-    // 2. Extract into isolated sandbox
     if let Err(e) = fs::create_dir_all(&sandbox_dir) {
         eprintln!("{}", format!("Error creating sandbox directory: {}", e).red().bold());
         exit(1);
     }
 
-    println!("{} Extracting '{}' to ephemeral sandbox...", "::".cyan(), pkg);
-    let extract_status = Command::new("tar")
-        .args(["-xf", tarball_path.to_str().unwrap(), "-C", sandbox_dir.to_str().unwrap()])
-        .status();
+    if resolved.len() > 1 {
+        println!(
+            "{} Found {} package(s) (1 target + {} missing dependencies to sandbox).",
+            "::".cyan(),
+            resolved.len(),
+            resolved.len() - 1
+        );
+    }
 
-    match extract_status {
-        Ok(s) if s.success() => {}
-        Ok(s) => {
-            eprintln!("{}", format!("Extraction failed with exit code {}.", s.code().unwrap_or(1)).red());
-            exit(s.code().unwrap_or(1));
-        }
-        Err(e) => {
-            eprintln!("{}", format!("Failed to execute tar: {}", e).red());
-            exit(1);
+    // 1. Download & Extract all resolved packages (dependencies first, then target)
+    for (p_name, url) in &resolved {
+        let tarball_path = match get_or_download_package(p_name, url, &mut guard) {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!("{}", format!("Error: {}", err).red().bold());
+                exit(1);
+            }
+        };
+
+        let extract_status = Command::new("tar")
+            .args(["-xf", tarball_path.to_str().unwrap(), "-C", sandbox_dir.to_str().unwrap()])
+            .status();
+
+        match extract_status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!("{}", format!("Extraction of '{}' failed with exit code {}.", p_name, s.code().unwrap_or(1)).red());
+                exit(s.code().unwrap_or(1));
+            }
+            Err(e) => {
+                eprintln!("{}", format!("Failed to execute tar on '{}': {}", p_name, e).red());
+                exit(1);
+            }
         }
     }
 
-    // 3. Find executable binary
+    // 2. Find executable binary
     let binary_path = match find_executable(&sandbox_dir, pkg) {
         Some(b) => b,
         None => {
@@ -297,7 +359,7 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String]) {
         }
     };
 
-    // 4. Construct isolated environment
+    // 3. Construct isolated environment
     let usr_bin = sandbox_dir.join("usr").join("bin");
     let usr_sbin = sandbox_dir.join("usr").join("sbin");
     let usr_lib = sandbox_dir.join("usr").join("lib");
@@ -330,7 +392,7 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String]) {
         .env("XDG_DATA_DIRS", new_xdg)
         .status();
 
-    // Guard will automatically clean up sandbox_dir upon leaving scope
+    // Guard will automatically clean up sandbox_dir and downloaded tarballs upon leaving scope
     drop(guard);
 
     match child_status {
@@ -342,7 +404,11 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String]) {
     }
 }
 
-fn find_or_download_package(repo: Option<&str>, pkg: &str, guard: &mut SandboxGuard) -> Result<PathBuf, String> {
+fn get_or_download_package(
+    pkg: &str,
+    url: &str,
+    guard: &mut SandboxGuard,
+) -> Result<PathBuf, String> {
     // 1. Check local pacman cache first (/var/cache/pacman/pkg/)
     let cache_dir = Path::new("/var/cache/pacman/pkg");
     if cache_dir.exists() {
@@ -367,42 +433,21 @@ fn find_or_download_package(repo: Option<&str>, pkg: &str, guard: &mut SandboxGu
         }
     }
 
-    // 2. Query pacman for download URL via `pacman -Sp [repo/]pkg`
-    let target_spec = if let Some(r) = repo {
-        format!("{}/{}", r, pkg)
-    } else {
-        pkg.to_string()
-    };
-
-    println!("{} Resolving download URL for '{}' (pacman -Sp)...", "::".cyan(), target_spec);
-    let output = Command::new("pacman")
-        .args(["-Sp", &target_spec])
-        .output()
-        .map_err(|e| format!("Failed to run pacman -Sp: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "Package '{}' could not be resolved from configured repositories.",
-            target_spec
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let url = stdout
-        .lines()
-        .find(|l| l.starts_with("http://") || l.starts_with("https://") || l.starts_with("file://") || l.starts_with("ftp://"))
-        .ok_or_else(|| format!("No download URL returned by pacman for '{}'.", target_spec))?
-        .trim();
-
-    // 3. Download to temporary file
+    // 2. Download to temporary file
     let ext = if url.ends_with(".pkg.tar.xz") {
         "pkg.tar.xz"
     } else {
         "pkg.tar.zst"
     };
 
-    let temp_download = env::temp_dir().join(format!("pacpin-download-{}-{}.{}", pkg, std::process::id(), ext));
-    guard.downloaded_tarball = Some(temp_download.clone());
+    let temp_download = env::temp_dir().join(format!(
+        "pacpin-download-{}-{}-{}.{}",
+        pkg,
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros(),
+        ext
+    ));
+    guard.downloaded_tarballs.push(temp_download.clone());
 
     println!("{} Fetching '{}' from {}...", "::".cyan(), pkg, url.dimmed());
     let curl_status = Command::new("curl")
@@ -495,6 +540,8 @@ mod tests {
         assert_eq!(parse_target("nix/fastfetch"), (Some("nix"), "fastfetch"));
         assert_eq!(parse_target("nix:fastfetch"), (Some("nix"), "fastfetch"));
         assert_eq!(parse_target("nixpkgs#ripgrep"), (Some("nix"), "ripgrep"));
+        assert_eq!(parse_target("pipx/cowsay"), (Some("pipx"), "cowsay"));
+        assert_eq!(parse_target("pipx:cowsay"), (Some("pipx"), "cowsay"));
         assert_eq!(parse_target("extra/tree"), (Some("extra"), "tree"));
         assert_eq!(parse_target("tree"), (None, "tree"));
     }

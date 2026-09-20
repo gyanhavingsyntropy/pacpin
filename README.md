@@ -54,6 +54,7 @@ cachyos = ["linux-firmware*"]
 [integrations]
 flatpak = true
 nix = false
+pipx = true
 ```
 
 ---
@@ -66,6 +67,9 @@ nix = false
 | `pacpin check` (`pin check`, `pin -Qu`) | `pacman -Qu` | Check pending updates and verify active pin protections |
 | `pacpin upgrade` (`pin -Syu`, `pin up`) | `pacman -Syu` | Safe system upgrade with True Resolver (`-y` refresh, `-n` dry-run, `-c` clean orphans) |
 | `pacpin -S [repo/]pkg` (`pin install`) | `pacman -S`, `paru -S` | Install package(s); auto-pins `repo/pkg` with companion cascade (`-y` refresh, `-n` dry-run) |
+| `pacpin -Sp <pkg...>` (`pin -Sp`) | `pacman -Sp` | Natively resolve and print package and missing dependency download URIs via ALPM |
+| `pacpin -Sl [repo...]` (`pin -Sl`) | `pacman -Sl` | List packages in sync repositories with installation status |
+| `pacpin -Sg [group...]` (`pin -Sg`) | `pacman -Sg` | List package groups or packages in a designated group |
 | `pacpin remove <pkg...>` (`pin rm`, `pin -Rns`) | `pacman -Rns` | Remove package(s) and unneeded dependencies with **Smart Unpin** cleanup |
 | `pacpin search <query...>` (`pin -Ss`) | `paru -Ss`, `pacman -Ss` | Search official repositories and the AUR simultaneously |
 | `pacpin info <pkg...>` (`pin -Si`) | `paru -Si`, `pacman -Si` | View package metadata, dependencies, and upstream repository info |
@@ -94,12 +98,12 @@ nix = false
 ### Power Tools & Sandboxing
 | Command | Description |
 | :--- | :--- |
-| `pacpin try [repo/]pkg [args...]` (`pin run`) | Run package in isolated ephemeral sandbox without installing (supports pacman, `flatpak/`, `nix/`) |
+| `pacpin try [repo/]pkg [args...]` (`pin run`) | Run package in isolated ephemeral `/tmp` sandbox with multi-dependency extraction (supports native, `flatpak/`, `nix/`, `pipx/`) |
 | `pacpin history [id]` | View transaction history timeline or inspect full package diff |
 | `pacpin rollback [id] [-n]` | Restore previous package versions from pacman cache |
 
 ### Transparent Pacman Drop-in
-`pacpin` serves as a complete drop-in wrapper. Any native pacman flag sequence (`-Q`, `-Qi`, `-Ql`, `-Qo`, `-F`, `-Fy`, `-U`, `-D`, etc.) passed to `pacpin` or `pin` is transparently handled with proper permission routing (non-root for queries, `sudo` for modifications).
+`pacpin` serves as a complete drop-in wrapper. Any native pacman flag sequence (`-Sp`, `-Sl`, `-Sg`, `-Sw`, `-T`, `-Q`, `-Qi`, `-Ql`, `-Qo`, `-F`, `-Fy`, `-U`, `-D`, etc.) passed to `pacpin` or `pin` is transparently handled with proper permission routing (non-root for queries, `sudo` for modifications).
 
 ---
 

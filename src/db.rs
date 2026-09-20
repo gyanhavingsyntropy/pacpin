@@ -16,7 +16,7 @@
 
 use alpm::{Alpm, SigLevel};
 use glob::Pattern;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use std::process::Command;
 
@@ -90,6 +90,140 @@ impl AlpmManager {
 
     pub fn repos(&self) -> &[String] {
         &self.repos
+    }
+
+    pub fn get_mirror_servers(repo: &str) -> Vec<String> {
+        if let Ok(output) = Command::new("pacman-conf").args(["--repo", repo, "Server"]).output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let servers: Vec<String> = stdout
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                if !servers.is_empty() {
+                    return servers;
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn resolve_download_urls(
+        &self,
+        repo: Option<&str>,
+        pkg_name: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        // Find target package
+        let (target_db_name, target_pkg) = if let Some(r) = repo {
+            let db = self
+                .handle
+                .syncdbs()
+                .into_iter()
+                .find(|d| d.name() == r)
+                .ok_or_else(|| format!("Repository '{}' not found", r))?;
+            let p = db
+                .pkg(pkg_name)
+                .map_err(|_| format!("Package '{}' not found in repository '{}'", pkg_name, r))?;
+            (r.to_string(), p)
+        } else {
+            let mut found = None;
+            for r in &self.repos {
+                if let Some(db) = self.handle.syncdbs().into_iter().find(|d| d.name() == r) {
+                    if let Ok(p) = db.pkg(pkg_name) {
+                        found = Some((r.clone(), p));
+                        break;
+                    }
+                }
+            }
+            found.ok_or_else(|| format!("Package '{}' not found in any configured repository", pkg_name))?
+        };
+
+        let mut server_cache: HashMap<String, String> = HashMap::new();
+        let mut get_server = |repo_name: &str| -> Result<String, String> {
+            if let Some(s) = server_cache.get(repo_name) {
+                return Ok(s.clone());
+            }
+            let servers = Self::get_mirror_servers(repo_name);
+            let s = servers
+                .first()
+                .cloned()
+                .ok_or_else(|| format!("No mirror server configured for repository '{}'", repo_name))?;
+            server_cache.insert(repo_name.to_string(), s.clone());
+            Ok(s)
+        };
+
+        let local_db = self.handle.localdb();
+        let mut visited = HashSet::new();
+        let mut ordered_urls = Vec::new();
+
+        fn resolve_deps(
+            pkg: &alpm::Package,
+            manager: &AlpmManager,
+            local_db: &alpm::Db,
+            visited: &mut HashSet<String>,
+            ordered_urls: &mut Vec<(String, String)>,
+            get_server: &mut dyn FnMut(&str) -> Result<String, String>,
+        ) -> Result<(), String> {
+            for dep in pkg.depends() {
+                let dep_name = dep.name();
+                // Check if already satisfied locally
+                if local_db.pkgs().find_satisfier(dep_name).is_some() {
+                    continue;
+                }
+
+                // Check if already visited in this resolution chain
+                if visited.contains(dep_name) {
+                    continue;
+                }
+
+                // Search syncdbs in priority order
+                let mut found = None;
+                for r in &manager.repos {
+                    if let Some(db) = manager.handle.syncdbs().into_iter().find(|d| d.name() == r) {
+                        if let Some(p) = db.pkgs().find_satisfier(dep_name) {
+                            found = Some((r.clone(), p));
+                            break;
+                        }
+                    }
+                }
+
+                if let Some((sdb_name, dep_pkg)) = found {
+                    let real_name = dep_pkg.name().to_string();
+                    if visited.insert(real_name.clone()) {
+                        // Recurse first so dependencies precede this package
+                        resolve_deps(&dep_pkg, manager, local_db, visited, ordered_urls, get_server)?;
+
+                        let filename = dep_pkg
+                            .filename()
+                            .ok_or_else(|| format!("No filename found for package '{}'", real_name))?;
+                        let server = get_server(&sdb_name)?;
+                        let url = format!("{}/{}", server.trim_end_matches('/'), filename);
+                        ordered_urls.push((real_name, url));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        visited.insert(target_pkg.name().to_string());
+        resolve_deps(
+            &target_pkg,
+            self,
+            &local_db,
+            &mut visited,
+            &mut ordered_urls,
+            &mut get_server,
+        )?;
+
+        let target_filename = target_pkg
+            .filename()
+            .ok_or_else(|| format!("No filename found for package '{}'", target_pkg.name()))?;
+        let target_server = get_server(&target_db_name)?;
+        let target_url = format!("{}/{}", target_server.trim_end_matches('/'), target_filename);
+        ordered_urls.push((target_pkg.name().to_string(), target_url));
+
+        Ok(ordered_urls)
     }
 
     pub fn handle(&self) -> &Alpm {
@@ -214,6 +348,51 @@ mod tests {
         let repo_order = vec!["custom-repo".to_string(), "core".to_string()];
         let order = AlpmManager::order_repos(&discovered, &repo_order);
         assert_eq!(order, vec!["custom-repo", "core", "extra"]);
+    }
+
+    #[test]
+    fn test_alpm_find_satisfier() {
+        let manager = AlpmManager::new().unwrap();
+        let local_db = manager.handle().localdb();
+        // check if find_satisfier exists
+        if let Some(pkg) = local_db.pkgs().first() {
+            for dep in pkg.depends() {
+                let _sat = local_db.pkgs().find_satisfier(dep.name());
+            }
+        }
+
+        // Test resolving nix
+        let mut target_pkg = None;
+        for sdb in manager.handle().syncdbs() {
+            if let Ok(p) = sdb.pkg("nix") {
+                target_pkg = Some((sdb.name().to_string(), p));
+                break;
+            }
+        }
+        assert!(target_pkg.is_some());
+        let (db_name, pkg) = target_pkg.unwrap();
+        println!("Found nix in {}: filename = {:?}", db_name, pkg.filename());
+        for dep in pkg.depends() {
+            let sat_local = local_db.pkgs().find_satisfier(dep.name()).is_some();
+            println!("  dep {}: satisfied locally = {}", dep.name(), sat_local);
+        }
+    }
+
+    #[test]
+    fn test_resolve_download_urls_nix() {
+        let manager = AlpmManager::new().unwrap();
+        let urls = manager.resolve_download_urls(None, "nix");
+        assert!(urls.is_ok());
+        let list = urls.unwrap();
+        assert!(!list.is_empty());
+        // nix should be the last item
+        let (last_name, last_url) = list.last().unwrap();
+        assert_eq!(last_name, "nix");
+        assert!(last_url.contains("nix-"));
+        println!("Resolved {} packages for nix:", list.len());
+        for (name, url) in &list {
+            println!("  {} -> {}", name, url);
+        }
     }
 }
 
