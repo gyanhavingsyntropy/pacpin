@@ -40,7 +40,200 @@ impl Drop for SandboxGuard {
     }
 }
 
-pub fn cmd_try(pkg: &str, args: &[String]) {
+pub fn parse_target(target: &str) -> (Option<&str>, &str) {
+    if let Some((prefix, rest)) = target.split_once('/') {
+        (Some(prefix), rest)
+    } else if let Some((prefix, rest)) = target.split_once(':') {
+        (Some(prefix), rest)
+    } else if let Some(rest) = target.strip_prefix("nixpkgs#") {
+        (Some("nix"), rest)
+    } else {
+        (None, target)
+    }
+}
+
+pub fn cmd_try(target: &str, args: &[String]) {
+    let (prefix, pkg) = parse_target(target);
+
+    match prefix {
+        Some("flatpak") => try_flatpak(pkg, args),
+        Some("nix") | Some("nixpkgs") => try_nix(pkg, args),
+        Some(repo) => try_pacman(Some(repo), pkg, args),
+        None => try_pacman(None, pkg, args),
+    }
+}
+
+fn try_flatpak(app_id: &str, args: &[String]) {
+    if !is_safe_flatpak_id(app_id) {
+        eprintln!(
+            "{}",
+            format!("Error: Invalid Flatpak Application ID '{}'.", app_id).red().bold()
+        );
+        eprintln!("Flatpak IDs follow reverse-DNS notation, e.g. 'org.gnome.Calculator' or 'com.spotify.Client'.");
+        exit(1);
+    }
+
+    if !crate::is_command_available("flatpak") {
+        eprintln!("{}", "Error: 'flatpak' command not found on this system.".red().bold());
+        eprintln!("Install flatpak or enable Flatpak integration in 'pacpin init'.");
+        exit(1);
+    }
+
+    // Check if the application is already installed on the system
+    let is_already_installed = Command::new("flatpak")
+        .args(["info", app_id])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    struct FlatpakGuard<'a> {
+        app_id: &'a str,
+        needs_cleanup: bool,
+    }
+
+    impl<'a> Drop for FlatpakGuard<'a> {
+        fn drop(&mut self) {
+            if self.needs_cleanup {
+                println!("\n{} Purging ephemeral Flatpak '{}'...", "::".cyan(), self.app_id);
+                let _ = Command::new("flatpak")
+                    .args(["uninstall", "--user", "-y", self.app_id])
+                    .status();
+
+                if let Ok(home) = env::var("HOME") {
+                    let app_data = Path::new(&home).join(".var").join("app").join(self.app_id);
+                    if app_data.exists() {
+                        let _ = fs::remove_dir_all(&app_data);
+                    }
+                }
+                println!("✔ Ephemeral Flatpak '{}' removed.", self.app_id.green());
+            }
+        }
+    }
+
+    let mut guard = FlatpakGuard {
+        app_id,
+        needs_cleanup: false,
+    };
+
+    if !is_already_installed {
+        println!(
+            "{} Installing ephemeral Flatpak '{}' (--user)...",
+            "::".cyan(),
+            app_id.bold()
+        );
+        let install_status = Command::new("flatpak")
+            .args(["install", "--user", "--noninteractive", "-y", "flathub", app_id])
+            .status();
+
+        match install_status {
+            Ok(s) if s.success() => {
+                guard.needs_cleanup = true;
+            }
+            Ok(s) => {
+                eprintln!(
+                    "{}",
+                    format!("Flatpak installation failed with exit code {}.", s.code().unwrap_or(1)).red()
+                );
+                exit(s.code().unwrap_or(1));
+            }
+            Err(e) => {
+                eprintln!("{}", format!("Failed to run flatpak install: {}", e).red());
+                exit(1);
+            }
+        }
+    } else {
+        println!(
+            "{} Flatpak '{}' is already installed. Running directly...",
+            "::".cyan(),
+            app_id.bold()
+        );
+    }
+
+    println!(
+        "{} Running Flatpak '{}'{}...\n",
+        "::".cyan(),
+        app_id.bold(),
+        if guard.needs_cleanup { " (will be purged upon exit)" } else { "" }
+    );
+
+    let mut run_args = vec!["run", app_id];
+    run_args.extend(args.iter().map(|s| s.as_str()));
+
+    let child_status = Command::new("flatpak").args(&run_args).status();
+
+    drop(guard);
+
+    match child_status {
+        Ok(s) => exit(s.code().unwrap_or(0)),
+        Err(e) => {
+            eprintln!("{}", format!("Failed to execute flatpak run: {}", e).red());
+            exit(1);
+        }
+    }
+}
+
+fn try_nix(pkg: &str, args: &[String]) {
+    if !crate::journal::TransactionJournal::is_safe_pkg_name(pkg) {
+        eprintln!(
+            "{}",
+            format!("Error: Invalid Nix package name '{}'.", pkg).red().bold()
+        );
+        exit(1);
+    }
+
+    if !crate::is_command_available("nix") {
+        eprintln!("{}", "Error: 'nix' command not found on this system.".red().bold());
+        exit(1);
+    }
+
+    println!(
+        "{} Running ephemeral Nix package '{}' (nix run)...",
+        "::".cyan(),
+        pkg.bold()
+    );
+
+    let target = format!("nixpkgs#{}", pkg);
+    let mut nix_args = vec!["run", target.as_str()];
+    if !args.is_empty() {
+        nix_args.push("--");
+        nix_args.extend(args.iter().map(|s| s.as_str()));
+    }
+
+    let status = Command::new("nix").args(&nix_args).status();
+
+    match status {
+        Ok(s) if s.success() => exit(0),
+        Ok(s) => {
+            // Fallback: nix-shell -p <pkg> --run "<pkg> [args...]"
+            println!(
+                "{} 'nix run' exited with {}. Trying 'nix-shell' fallback...",
+                "::".yellow(),
+                s.code().unwrap_or(1)
+            );
+            let mut shell_cmd = pkg.to_string();
+            if !args.is_empty() {
+                shell_cmd.push(' ');
+                shell_cmd.push_str(&args.join(" "));
+            }
+            let shell_status = Command::new("nix-shell")
+                .args(["-p", pkg, "--run", &shell_cmd])
+                .status();
+            match shell_status {
+                Ok(ss) => exit(ss.code().unwrap_or(0)),
+                Err(e) => {
+                    eprintln!("{}", format!("Failed to run nix-shell: {}", e).red());
+                    exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", format!("Failed to execute nix: {}", e).red());
+            exit(1);
+        }
+    }
+}
+
+fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String]) {
     if pkg.is_empty() || !crate::journal::TransactionJournal::is_safe_pkg_name(pkg) {
         eprintln!(
             "{}",
@@ -61,7 +254,7 @@ pub fn cmd_try(pkg: &str, args: &[String]) {
     };
 
     // 1. Locate or download package archive
-    let tarball_path = match find_or_download_package(pkg, &mut guard) {
+    let tarball_path = match find_or_download_package(repo, pkg, &mut guard) {
         Ok(path) => path,
         Err(err) => {
             eprintln!("{}", format!("Error: {}", err).red().bold());
@@ -149,7 +342,7 @@ pub fn cmd_try(pkg: &str, args: &[String]) {
     }
 }
 
-fn find_or_download_package(pkg: &str, guard: &mut SandboxGuard) -> Result<PathBuf, String> {
+fn find_or_download_package(repo: Option<&str>, pkg: &str, guard: &mut SandboxGuard) -> Result<PathBuf, String> {
     // 1. Check local pacman cache first (/var/cache/pacman/pkg/)
     let cache_dir = Path::new("/var/cache/pacman/pkg");
     if cache_dir.exists() {
@@ -166,7 +359,6 @@ fn find_or_download_package(pkg: &str, guard: &mut SandboxGuard) -> Result<PathB
                 .collect();
 
             if !matching.is_empty() {
-                // Sort by modification time or name, take latest
                 matching.sort_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
                 let found = matching.last().unwrap().clone();
                 println!("{} Found '{}' in local pacman cache.", "::".cyan(), pkg);
@@ -175,17 +367,23 @@ fn find_or_download_package(pkg: &str, guard: &mut SandboxGuard) -> Result<PathB
         }
     }
 
-    // 2. Query pacman for download URL via `pacman -Sp <pkg>`
-    println!("{} Resolving download URL for '{}' (pacman -Sp)...", "::".cyan(), pkg);
+    // 2. Query pacman for download URL via `pacman -Sp [repo/]pkg`
+    let target_spec = if let Some(r) = repo {
+        format!("{}/{}", r, pkg)
+    } else {
+        pkg.to_string()
+    };
+
+    println!("{} Resolving download URL for '{}' (pacman -Sp)...", "::".cyan(), target_spec);
     let output = Command::new("pacman")
-        .args(["-Sp", pkg])
+        .args(["-Sp", &target_spec])
         .output()
         .map_err(|e| format!("Failed to run pacman -Sp: {}", e))?;
 
     if !output.status.success() {
         return Err(format!(
             "Package '{}' could not be resolved from configured repositories.",
-            pkg
+            target_spec
         ));
     }
 
@@ -193,7 +391,7 @@ fn find_or_download_package(pkg: &str, guard: &mut SandboxGuard) -> Result<PathB
     let url = stdout
         .lines()
         .find(|l| l.starts_with("http://") || l.starts_with("https://") || l.starts_with("file://") || l.starts_with("ftp://"))
-        .ok_or_else(|| format!("No download URL returned by pacman for '{}'.", pkg))?
+        .ok_or_else(|| format!("No download URL returned by pacman for '{}'.", target_spec))?
         .trim();
 
     // 3. Download to temporary file
@@ -263,6 +461,18 @@ fn find_executable(sandbox_dir: &Path, pkg: &str) -> Option<PathBuf> {
     None
 }
 
+fn is_safe_flatpak_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains(';')
+        && !id.contains('&')
+        && !id.contains('|')
+        && !id.contains('`')
+        && !id.contains('$')
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
 fn is_executable_file(path: &Path) -> bool {
     if !path.is_file() {
         return false;
@@ -277,6 +487,26 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_target() {
+        assert_eq!(parse_target("flatpak/org.gnome.Calculator"), (Some("flatpak"), "org.gnome.Calculator"));
+        assert_eq!(parse_target("flatpak:org.gnome.Calculator"), (Some("flatpak"), "org.gnome.Calculator"));
+        assert_eq!(parse_target("nix/fastfetch"), (Some("nix"), "fastfetch"));
+        assert_eq!(parse_target("nix:fastfetch"), (Some("nix"), "fastfetch"));
+        assert_eq!(parse_target("nixpkgs#ripgrep"), (Some("nix"), "ripgrep"));
+        assert_eq!(parse_target("extra/tree"), (Some("extra"), "tree"));
+        assert_eq!(parse_target("tree"), (None, "tree"));
+    }
+
+    #[test]
+    fn test_is_safe_flatpak_id() {
+        assert!(is_safe_flatpak_id("org.gnome.Calculator"));
+        assert!(is_safe_flatpak_id("com.spotify.Client"));
+        assert!(is_safe_flatpak_id("com.github.tchx84.Flatseal"));
+        assert!(!is_safe_flatpak_id("org.gnome/calc"));
+        assert!(!is_safe_flatpak_id("org.gnome;rm -rf"));
+    }
 
     #[test]
     fn test_is_executable_file() {

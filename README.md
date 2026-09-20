@@ -12,7 +12,7 @@
 2. **True Resolver Engine**: Synthesizes explicit qualified package targets (`repo/pkg`) instead of blind `pacman -Su` commands, preventing unexpected repository hopping.
 3. **Opt-In Vendor Stickiness**: Keep packages bound to their originating repository (`%INSTALLED_DB%`) during upgrades so they don't unexpectedly jump between sync repositories (e.g. `core` ➔ `cachyos`), displaying a distinct `[sticky]` badge in transactions.
 4. **BIOS-Style Repository Priority Menu**: Interactively reorder your system's repository search priority using arrow keys and instant promotion/demotion (`pacpin repos`).
-5. **Ephemeral Package Sandbox (`pacpin try <pkg> [args...]`)**: Like `nix run`, download and execute tools in an isolated `/tmp` sandbox with zero system footprint and no root required, automatically cleaning up on exit.
+5. **Ephemeral Package Sandbox (`pacpin try [repo/]pkg [args...]`)**: Like `nix run`, download and execute tools in an isolated `/tmp` sandbox with zero system footprint and no root required (supports Arch repos, `flatpak/<app-id>`, and `nix/<pkg>`), automatically cleaning up on exit.
 6. **Post-Upgrade Restart Inspector (`needrestart`)**: Automatically inspect running processes holding deleted `.so` libraries in RAM (`/proc/*/maps`) and verify running kernel vs installed modules, advising on exact service restart commands (`sudo systemctl restart <srv>`) with zero noise when nothing needs restarting.
 7. **Scrollable Checkbox TUI with Batch Shortcuts**: Interactive viewport checklist (`Space` toggle, `Enter` confirm) with one-key batch actions (`[a]` All, `[n]` None, `[p]` Pure Only, `[i]` Invert, `/` Search) for orphan management and setup.
 8. **Unified Multi-Package Manager Integrations**: Simultaneously check, refresh, and execute updates for Flatpak and Nix alongside Pacman and AUR in a single transaction view.
@@ -94,7 +94,7 @@ nix = false
 ### Power Tools & Sandboxing
 | Command | Description |
 | :--- | :--- |
-| `pacpin try <pkg> [args...]` (`pin run`) | Run a package in an isolated ephemeral sandbox without installing or needing root |
+| `pacpin try [repo/]pkg [args...]` (`pin run`) | Run package in isolated ephemeral sandbox without installing (supports pacman, `flatpak/`, `nix/`) |
 | `pacpin history [id]` | View transaction history timeline or inspect full package diff |
 | `pacpin rollback [id] [-n]` | Restore previous package versions from pacman cache |
 

@@ -1434,7 +1434,7 @@ fn print_help() {
     println!("  needrestart                  Inspect processes holding outdated libraries or kernel in RAM");
     println!();
     println!("{}", "Power Tools & Sandboxing:".bold());
-    println!("  try, run <pkg> [args...]     Run a package in an isolated ephemeral sandbox without installing");
+    println!("  try, run [repo/]pkg [args...] Run package in isolated ephemeral sandbox (pacman, flatpak/, nix/)");
     println!("  history [id]                 View transaction history timeline or inspect a transaction");
     println!("  rollback [id] [-n]           Restore previous package versions from cache");
     println!();
