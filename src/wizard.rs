@@ -75,17 +75,19 @@ fn has_cachyos_repos() -> bool {
     }
 }
 
-pub fn run_first_launch_wizard(force: bool) -> Option<Config> {
+pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
     print_banner();
 
     let config_path = get_config_path();
-    let existing_cfg = if config_path.exists() {
+    let existing_cfg = if config_path.exists() && !reset {
         Some(crate::config::load_config())
     } else {
         None
     };
 
-    if existing_cfg.is_some() && !force {
+    if reset && config_path.exists() {
+        println!("{}", ":: Resetting configuration and launching setup from scratch...\n".yellow().bold());
+    } else if existing_cfg.is_some() && !force {
         println!("{}", ":: Existing configuration found at ~/.config/pacpin/config.toml.".yellow());
         if !prompt_yn("Run setup wizard and reconfigure?", false) {
             println!("Configuration unchanged.");

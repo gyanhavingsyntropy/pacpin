@@ -1222,6 +1222,47 @@ fn cmd_remove(config: Config, args: &[String], is_friendly: bool) {
     }
 }
 
+fn cmd_reset(force: bool) {
+    let path = config::get_config_path();
+    if !path.exists() {
+        println!("{}", "No configuration file found to reset.".yellow());
+        return;
+    }
+
+    if !force {
+        print!("{}", "Are you sure you want to reset all configurations and pins to default? [y/N] ".bold());
+        io::stdout().flush().unwrap();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            println!("\nAborted.");
+            return;
+        }
+        let r = input.trim().to_lowercase();
+        if r != "y" && r != "yes" {
+            println!("Aborted.");
+            return;
+        }
+    }
+
+    // Backup current configuration
+    let now = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let bak_path = path.with_extension(format!("toml.bak.{}", now));
+    if let Err(e) = std::fs::copy(&path, &bak_path) {
+        eprintln!("{}", format!("Warning: Could not create backup file: {}", e).yellow());
+    } else {
+        println!("  {}", format!("📦 Backup created at {}", bak_path.display()).dimmed());
+    }
+
+    let default_cfg = Config::default();
+    if let Err(e) = config::save_config(&default_cfg) {
+        eprintln!("{}", format!("Error resetting configuration: {}", e).red());
+        exit(1);
+    }
+
+    println!("{}", "✔ All configurations, pins, exclusions, and delays have been reset to default.".green().bold());
+    println!("  Run 'pacpin init' to configure preferences from scratch.\n");
+}
+
 fn print_help() {
     print_banner();
     println!("\nUsage:");
@@ -1247,7 +1288,8 @@ fn print_help() {
     println!("  pacpin history [id]          View transaction history timeline or inspect a transaction");
     println!("  pacpin rollback [id] [-n]    Restore previous package versions from cache");
     println!("  pacpin list                  List active pins, exclusions, and matching packages");
-    println!("  pacpin init                  Interactive onboarding wizard to configure system preferences");
+    println!("  pacpin reset [-f]            Reset all configurations, pins, and delays to default (-f force)");
+    println!("  pacpin init [--reset]        Interactive onboarding wizard (use --reset for clean slate)");
     println!("  pacpin --version             Show version and GPLv3 license notice");
     println!();
     println!("Pacman & AUR Drop-in Aliases:");
@@ -1285,14 +1327,23 @@ fn main() {
         exit(0);
     }
 
+    if args.first().map(|s| s == "reset" || s == "config-reset").unwrap_or(false)
+        || (args.len() >= 2 && args[0] == "config" && args[1] == "reset")
+    {
+        let force = args.iter().any(|a| a == "-f" || a == "--force" || a == "-y");
+        cmd_reset(force);
+        exit(0);
+    }
+
     if args.first().map(|s| s == "init" || s == "setup").unwrap_or(false) {
-        wizard::run_first_launch_wizard(true);
+        let reset = args.iter().any(|a| a == "-r" || a == "--reset");
+        wizard::run_first_launch_wizard(true, reset);
         exit(0);
     }
 
     // Auto-launch wizard if no config exists and running in an interactive terminal
     let (config, just_initialized) = if !config::config_exists() && io::stdin().is_terminal() {
-        if let Some(cfg) = wizard::run_first_launch_wizard(false) {
+        if let Some(cfg) = wizard::run_first_launch_wizard(false, false) {
             (cfg, true)
         } else {
             (load_config(), false)
