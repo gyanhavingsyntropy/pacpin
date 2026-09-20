@@ -86,6 +86,8 @@ pub struct Config {
     #[serde(default)]
     pub options: Options,
     #[serde(default)]
+    pub repo_order: Vec<String>,
+    #[serde(default)]
     pub pins: BTreeMap<String, String>,
     #[serde(default, deserialize_with = "deserialize_exclude")]
     pub exclude: BTreeMap<String, Vec<String>>,
@@ -213,5 +215,14 @@ mod tests {
         assert!(config.features.integrations);
         assert!(config.integrations.flatpak);
         assert!(config.integrations.nix);
+    }
+
+    #[test]
+    fn test_repo_order_config() {
+        let toml_str = r#"
+        repo_order = ["core", "cachyos", "extra"]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.repo_order, vec!["core", "cachyos", "extra"]);
     }
 }

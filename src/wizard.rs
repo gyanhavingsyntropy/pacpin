@@ -98,12 +98,12 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
 
     println!("{}", ":: Welcome to pacpin! Let's tailor your package management preferences.\n".cyan().bold());
 
-    let (mut pins, mut exclude, mut delays) = if let Some(ref cfg) = existing_cfg {
-        if !cfg.pins.is_empty() || !cfg.delay.is_empty() {
+    let (mut pins, mut exclude, mut delays, mut repo_order) = if let Some(ref cfg) = existing_cfg {
+        if !cfg.pins.is_empty() || !cfg.delay.is_empty() || !cfg.repo_order.is_empty() {
             println!(
                 "  {}",
                 format!(
-                    "ℹ Preserving {} existing pin(s), {} exclusion rule(s), and {} delay rule(s).",
+                    "ℹ Preserving {} existing pin(s), {} exclusion rule(s), {} delay rule(s), and custom repo order.",
                     cfg.pins.len(),
                     cfg.exclude.len(),
                     cfg.delay.len()
@@ -111,9 +111,9 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
                 .cyan()
             );
         }
-        (cfg.pins.clone(), cfg.exclude.clone(), cfg.delay.clone())
+        (cfg.pins.clone(), cfg.exclude.clone(), cfg.delay.clone(), cfg.repo_order.clone())
     } else {
-        (BTreeMap::new(), BTreeMap::new(), BTreeMap::new())
+        (BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), Vec::new())
     };
 
     // 1. Repository Pinning & Shielding
@@ -123,16 +123,44 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
     let enable_pinning = prompt_yn("Enable Repository Pinning?", true);
     println!();
 
-    if enable_pinning && has_cachyos_repos() {
-        println!("  {}", "ℹ Detected CachyOS repositories on your system.".cyan());
-        if prompt_yn("Add baseline protection pins (amd-ucode, intel-ucode, linux-firmware* to core)?", true) {
-            pins.insert("amd-ucode".to_string(), "core".to_string());
-            pins.insert("intel-ucode".to_string(), "core".to_string());
-            pins.insert("linux-firmware*".to_string(), "core".to_string());
-            exclude.insert("cachyos".to_string(), vec!["linux-firmware*".to_string()]);
-            println!("  ✔ Added core microcode and firmware protection pins.\n");
-        } else {
-            println!();
+    if enable_pinning {
+        let discovered_repos = crate::db::AlpmManager::resolve_repo_order(&repo_order);
+        println!(
+            "  {}",
+            format!(
+                "ℹ Detected {} repositories on your system:",
+                discovered_repos.len()
+            )
+            .cyan()
+        );
+        for (i, r) in discovered_repos.iter().enumerate() {
+            print!("    {}. [{}]", i + 1, r);
+            if (i + 1) % 4 == 0 || i == discovered_repos.len() - 1 {
+                println!();
+            } else {
+                print!("  ");
+            }
+        }
+        println!();
+
+        if has_cachyos_repos() {
+            println!("  {}", "ℹ Detected CachyOS repositories on your system.".cyan());
+            if prompt_yn("Add baseline protection pins (amd-ucode, intel-ucode, linux-firmware* to core)?", true) {
+                pins.insert("amd-ucode".to_string(), "core".to_string());
+                pins.insert("intel-ucode".to_string(), "core".to_string());
+                pins.insert("linux-firmware*".to_string(), "core".to_string());
+                exclude.insert("cachyos".to_string(), vec!["linux-firmware*".to_string()]);
+                println!("  ✔ Added core microcode and firmware protection pins.\n");
+            } else {
+                println!();
+            }
+        }
+
+        if prompt_yn("Customize repository search priority order or add repos?", false) {
+            if let Some(new_order) = crate::repo_menu::run_repo_menu(&discovered_repos) {
+                repo_order = new_order;
+                println!("  ✔ Saved custom repository search order.\n");
+            }
         }
     }
 
@@ -209,6 +237,7 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
             integrations: enable_integrations,
         },
         options: Options { helper },
+        repo_order,
         pins,
         exclude,
         delay: delays,

@@ -21,6 +21,7 @@ mod db;
 mod integrations;
 mod journal;
 mod orphans;
+mod repo_menu;
 mod resolver;
 mod ui;
 mod wizard;
@@ -53,7 +54,7 @@ fn check_pacman_lock() {
 
 fn cmd_check(config: &Config) {
     print_banner();
-    let manager = match AlpmManager::new() {
+    let manager = match AlpmManager::with_repo_order(&config.repo_order) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}", format!("Error initializing ALPM: {}", e).red());
@@ -148,7 +149,7 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
         }
     }
 
-    let manager = match AlpmManager::new() {
+    let manager = match AlpmManager::with_repo_order(&config.repo_order) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}", format!("Error initializing ALPM: {}", e).red());
@@ -405,7 +406,7 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
         }
     }
 
-    let manager = match AlpmManager::new() {
+    let manager = match AlpmManager::with_repo_order(&config.repo_order) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}", format!("Error initializing ALPM: {}", e).red());
@@ -583,7 +584,7 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
 
 fn cmd_list(config: &Config) {
     print_banner();
-    let manager = match AlpmManager::new() {
+    let manager = match AlpmManager::with_repo_order(&config.repo_order) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}", format!("Error initializing ALPM: {}", e).red());
@@ -593,6 +594,22 @@ fn cmd_list(config: &Config) {
     let resolver = ResolverEngine::new(&manager);
 
     println!("\n{}", "Configured Repository Rules:".bold());
+
+    if !config.repo_order.is_empty() {
+        println!("  {}", "Repository Search Priority Order:".bold());
+        for (i, r) in config.repo_order.iter().enumerate() {
+            let prio = if i == 0 {
+                "(Priority 1 - Highest)".green().bold().to_string()
+            } else if i == config.repo_order.len() - 1 {
+                format!("(Priority {} - Lowest)", i + 1).dimmed().to_string()
+            } else {
+                format!("(Priority {})", i + 1).cyan().to_string()
+            };
+            println!("    {:>2}. [{}] {}", i + 1, r.cyan(), prio);
+        }
+        println!();
+    }
+
     if config.pins.is_empty() {
         println!("  {}", "No custom package pins configured.".yellow());
     } else {
@@ -663,24 +680,49 @@ fn cmd_list(config: &Config) {
     println!();
 }
 
-fn cmd_pin(mut config: Config, pattern: String, repo: String) {
-    print_banner();
-
-    let is_valid_pattern = !pattern.is_empty()
-        && !pattern.contains('/')
-        && !pattern.contains('\\')
-        && !pattern.contains(';')
-        && !pattern.contains('&')
-        && !pattern.contains('|')
-        && !pattern.contains('`')
-        && !pattern.contains('$');
-    if !is_valid_pattern {
-        eprintln!(
+fn cmd_repos(mut config: Config) {
+    let manager = match AlpmManager::with_repo_order(&config.repo_order) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{}", format!("Error initializing ALPM: {}", e).red());
+            exit(1);
+        }
+    };
+    let current_repos = manager.repos();
+    if let Some(new_order) = repo_menu::run_repo_menu(current_repos) {
+        config.repo_order = new_order.clone();
+        if let Err(e) = save_config(&config) {
+            eprintln!("{}", format!("Failed to save config: {}", e).red());
+            exit(1);
+        }
+        print_banner();
+        println!(
             "{}",
-            format!("Error: Invalid package pattern '{}'.", pattern).red().bold()
+            format!(
+                "✔ Successfully saved repository search priority order ({} repositories):",
+                new_order.len()
+            )
+            .green()
+            .bold()
         );
-        exit(1);
+        for (i, r) in new_order.iter().enumerate() {
+            let prio = if i == 0 {
+                "(Priority 1 - Highest)".green().bold().to_string()
+            } else if i == new_order.len() - 1 {
+                format!("(Priority {} - Lowest)", i + 1).dimmed().to_string()
+            } else {
+                format!("(Priority {})", i + 1).cyan().to_string()
+            };
+            println!("  {:>2}. [{}] {}", i + 1, r.cyan(), prio);
+        }
+        println!();
+    } else {
+        println!("{}", "Repository order unchanged.".dimmed());
     }
+}
+
+fn cmd_pin(mut config: Config, repo: String, patterns: Vec<String>) {
+    print_banner();
 
     let is_valid_repo_name = !repo.is_empty()
         && repo.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
@@ -693,7 +735,7 @@ fn cmd_pin(mut config: Config, pattern: String, repo: String) {
         exit(1);
     }
 
-    let manager = match AlpmManager::new() {
+    let manager = match AlpmManager::with_repo_order(&config.repo_order) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}", format!("Error initializing ALPM: {}", e).red());
@@ -712,13 +754,36 @@ fn cmd_pin(mut config: Config, pattern: String, repo: String) {
         exit(1);
     }
 
-    let mut to_pin = vec![pattern.clone()];
-    if repo != "aur" && !pattern.contains('*') && !pattern.contains('?') && !pattern.contains('[') {
-        let companions = manager.find_companions(&pattern, &repo, &config.pins);
+    if patterns.is_empty() {
+        eprintln!("{}", "Error: No packages or patterns specified to pin.".red().bold());
+        exit(1);
+    }
+
+    for pattern in &patterns {
+        let is_valid_pattern = !pattern.is_empty()
+            && !pattern.contains('/')
+            && !pattern.contains('\\')
+            && !pattern.contains(';')
+            && !pattern.contains('&')
+            && !pattern.contains('|')
+            && !pattern.contains('`')
+            && !pattern.contains('$');
+        if !is_valid_pattern {
+            eprintln!(
+                "{}",
+                format!("Error: Invalid package pattern '{}'.", pattern).red().bold()
+            );
+            exit(1);
+        }
+    }
+
+    let mut to_pin = patterns.clone();
+    if repo != "aur" && patterns.len() == 1 && !patterns[0].contains('*') && !patterns[0].contains('?') && !patterns[0].contains('[') {
+        let companions = manager.find_companions(&patterns[0], &repo, &config.pins);
         if !companions.is_empty() {
             let title = format!(
                 "'{}' has companion packages in [{}] to avoid version mismatches",
-                pattern, repo
+                patterns[0], repo
             );
             let selected = prompt_multiselect(&title, &repo, &companions);
             to_pin.extend(selected);
@@ -737,21 +802,19 @@ fn cmd_pin(mut config: Config, pattern: String, repo: String) {
     if to_pin.len() == 1 {
         println!(
             "{}",
-            format!("✔ Successfully pinned '{}' to repository [{}].", pattern, repo).green()
+            format!("✔ Successfully pinned '{}' to repository [{}].", to_pin[0], repo).green()
         );
     } else {
-        let companions_pinned = &to_pin[1..];
         println!(
             "{}",
             format!(
-                "✔ Successfully pinned '{}' and {} companion package(s) to [{}]:",
-                pattern,
-                companions_pinned.len(),
+                "✔ Successfully pinned {} package(s) to [{}]:",
+                to_pin.len(),
                 repo
             )
             .green()
         );
-        for c in companions_pinned {
+        for c in &to_pin {
             println!("    • {:<26} ➔  [{}]", c.cyan(), repo.green());
         }
     }
@@ -1281,13 +1344,15 @@ fn print_help() {
     println!("  pacpin orphans [-c]          Inspect or remove orphaned dependencies (-c to clean)");
     println!("  pacpin autoremove            Alias for 'pacpin orphans -c'");
     println!("  pacpin keep <pkg...>         Mark package(s) as explicitly installed (silences orphan warnings)");
-    println!("  pacpin pin <pkg> <repo>      Lock a package pattern to a designated repository");
+    println!("  pacpin repos                 Interactive BIOS-style repository search priority menu");
+    println!("  pacpin pin <repo> <pkg...>   Lock package(s) or wildcards to a designated repository");
+    println!("  pacpin pin <repo> -f <file>  Batch pin packages from a text file (one package per line)");
     println!("  pacpin unpin <pkg>           Remove a pin rule");
     println!("  pacpin delay <pkg> <days>    Set a stability delay buffer on a package");
     println!("  pacpin undelay <pkg>         Remove a package stability delay rule");
     println!("  pacpin history [id]          View transaction history timeline or inspect a transaction");
     println!("  pacpin rollback [id] [-n]    Restore previous package versions from cache");
-    println!("  pacpin list                  List active pins, exclusions, and matching packages");
+    println!("  pacpin list                  List active pins, exclusions, delays, and repo priority");
     println!("  pacpin reset [-f]            Reset all configurations, pins, and delays to default (-f force)");
     println!("  pacpin init [--reset]        Interactive onboarding wizard (use --reset for clean slate)");
     println!("  pacpin --version             Show version and GPLv3 license notice");
@@ -1362,7 +1427,10 @@ fn main() {
     }
 
     let cmd = &args[0];
-    if cmd == "check" || cmd == "-Qu" {
+    if cmd == "repos" || cmd == "repo-order" || cmd == "priority" {
+        cmd_repos(config);
+        exit(0);
+    } else if cmd == "check" || cmd == "-Qu" {
         cmd_check(&config);
     } else if cmd == "upgrade"
         || cmd == "-Syu"
@@ -1559,13 +1627,20 @@ fn main() {
                 exit(1);
             }
         }
-    } else if cmd == "pin" {
-        if args.len() < 3 {
-            eprintln!("{}", "Error: 'pacpin pin' requires <pattern> and <repo>.".red());
-            eprintln!("Usage: pacpin pin <pattern> <repo> (e.g. pacpin pin 'linux-firmware*' core)");
-            exit(1);
+    } else if cmd == "pin" || cmd == "add-pin" || cmd == "add-pins" {
+        let mut known_repos = AlpmManager::discover_repos();
+        known_repos.push("aur".to_string());
+
+        match parse_pin_args(&args[1..], &known_repos) {
+            Ok((repo, patterns)) => cmd_pin(config, repo, patterns),
+            Err(e) => {
+                eprintln!("{}", format!("Error: {}", e).red());
+                eprintln!("Usage: pacpin pin <repo> <pkg1> [pkg2...]");
+                eprintln!("       pacpin pin <repo> -f <packages.txt>");
+                eprintln!("       pacpin pin <pkg> <repo>");
+                exit(1);
+            }
         }
-        cmd_pin(config, args[1].clone(), args[2].clone());
     } else if cmd == "unpin" {
         if args.len() < 2 {
             eprintln!("{}", "Error: 'pacpin unpin' requires a pattern.".red());
@@ -1597,6 +1672,67 @@ fn main() {
     }
 }
 
+fn parse_pin_args(
+    pin_args: &[String],
+    known_repos: &[String],
+) -> Result<(String, Vec<String>), String> {
+    let mut file_patterns = Vec::new();
+    let mut positional = Vec::new();
+    let mut i = 0;
+    while i < pin_args.len() {
+        let arg = &pin_args[i];
+        if arg == "-f" || arg == "--file" {
+            if i + 1 >= pin_args.len() {
+                return Err("'-f/--file' requires a file path.".to_string());
+            }
+            let file_path = &pin_args[i + 1];
+            match std::fs::read_to_string(file_path) {
+                Ok(content) => {
+                    for line in content.lines() {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                            file_patterns.push(trimmed.to_string());
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("Error reading package list file '{}': {}", file_path, e));
+                }
+            }
+            i += 2;
+        } else {
+            positional.push(arg.clone());
+            i += 1;
+        }
+    }
+
+    if positional.is_empty() {
+        return Err("'pacpin pin' requires a repository name.".to_string());
+    } else if positional.len() == 1 {
+        if file_patterns.is_empty() {
+            return Err("'pacpin pin' requires both a repository and at least one package.".to_string());
+        }
+        Ok((positional[0].clone(), file_patterns))
+    } else if positional.len() == 2 && file_patterns.is_empty() {
+        if known_repos.iter().any(|r| r == &positional[1]) && !known_repos.iter().any(|r| r == &positional[0]) {
+            Ok((positional[1].clone(), vec![positional[0].clone()]))
+        } else {
+            Ok((positional[0].clone(), vec![positional[1].clone()]))
+        }
+    } else {
+        let (r, mut p) = if known_repos.iter().any(|r| r == &positional[0]) {
+            (positional[0].clone(), positional[1..].to_vec())
+        } else if known_repos.iter().any(|r| r == positional.last().unwrap()) {
+            let last_idx = positional.len() - 1;
+            (positional[last_idx].clone(), positional[..last_idx].to_vec())
+        } else {
+            (positional[0].clone(), positional[1..].to_vec())
+        };
+        p.extend(file_patterns);
+        Ok((r, p))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1622,5 +1758,46 @@ mod tests {
             Some(("linux-firmware*".to_string(), "cachyos".to_string(), false))
         );
         assert_eq!(find_matching_pin("git", &pins), None);
+    }
+
+    #[test]
+    fn test_parse_pin_args_legacy_syntax() {
+        let known_repos = vec!["core".to_string(), "extra".to_string(), "aur".to_string()];
+        let args = vec!["linux-firmware*".to_string(), "core".to_string()];
+        let (repo, patterns) = parse_pin_args(&args, &known_repos).unwrap();
+        assert_eq!(repo, "core");
+        assert_eq!(patterns, vec!["linux-firmware*"]);
+    }
+
+    #[test]
+    fn test_parse_pin_args_repo_first() {
+        let known_repos = vec!["core".to_string(), "extra".to_string(), "aur".to_string()];
+        let args = vec!["core".to_string(), "linux-firmware*".to_string()];
+        let (repo, patterns) = parse_pin_args(&args, &known_repos).unwrap();
+        assert_eq!(repo, "core");
+        assert_eq!(patterns, vec!["linux-firmware*"]);
+    }
+
+    #[test]
+    fn test_parse_pin_args_batch() {
+        let known_repos = vec!["core".to_string(), "extra".to_string(), "aur".to_string()];
+        let args = vec!["core".to_string(), "pkg1".to_string(), "pkg2".to_string(), "pkg3".to_string()];
+        let (repo, patterns) = parse_pin_args(&args, &known_repos).unwrap();
+        assert_eq!(repo, "core");
+        assert_eq!(patterns, vec!["pkg1", "pkg2", "pkg3"]);
+    }
+
+    #[test]
+    fn test_parse_pin_args_file() {
+        let known_repos = vec!["core".to_string(), "extra".to_string(), "aur".to_string()];
+        let tmp_file = std::env::temp_dir().join("pacpin_test_pkgs.txt");
+        std::fs::write(&tmp_file, "pkgA\n# comment\npkgB\n\npkgC\n").unwrap();
+
+        let args = vec!["core".to_string(), "-f".to_string(), tmp_file.to_str().unwrap().to_string()];
+        let (repo, patterns) = parse_pin_args(&args, &known_repos).unwrap();
+        assert_eq!(repo, "core");
+        assert_eq!(patterns, vec!["pkgA", "pkgB", "pkgC"]);
+
+        let _ = std::fs::remove_file(&tmp_file);
     }
 }

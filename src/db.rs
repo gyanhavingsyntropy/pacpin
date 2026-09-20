@@ -27,12 +27,48 @@ pub struct AlpmManager {
 
 impl AlpmManager {
     pub fn new() -> Result<Self, alpm::Error> {
+        Self::with_repo_order(&[])
+    }
+
+    pub fn with_repo_order(repo_order: &[String]) -> Result<Self, alpm::Error> {
         let handle = Alpm::new("/", "/var/lib/pacman")?;
-        let repos = Self::discover_repos();
+        let repos = Self::resolve_repo_order(repo_order);
         for repo in &repos {
             let _ = handle.register_syncdb(repo.as_str(), SigLevel::USE_DEFAULT);
         }
         Ok(Self { handle, repos })
+    }
+
+    pub fn resolve_repo_order(repo_order: &[String]) -> Vec<String> {
+        let discovered = Self::discover_repos();
+        Self::order_repos(&discovered, repo_order)
+    }
+
+    pub fn order_repos(discovered: &[String], repo_order: &[String]) -> Vec<String> {
+        if repo_order.is_empty() {
+            return discovered.to_vec();
+        }
+
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+
+        // 1. Add configured repos in order
+        for r in repo_order {
+            if !seen.contains(r) {
+                result.push(r.clone());
+                seen.insert(r.clone());
+            }
+        }
+
+        // 2. Add remaining discovered repos that weren't in repo_order
+        for r in discovered {
+            if !seen.contains(r) {
+                result.push(r.clone());
+                seen.insert(r.clone());
+            }
+        }
+
+        result
     }
 
     pub fn discover_repos() -> Vec<String> {
@@ -148,4 +184,36 @@ impl AlpmManager {
 }
 
 pub use crate::orphans::OrphanPackage;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_order_repos_empty_override() {
+        let discovered = vec!["cachyos".to_string(), "core".to_string(), "extra".to_string()];
+        let order = AlpmManager::order_repos(&discovered, &[]);
+        assert_eq!(order, discovered);
+    }
+
+    #[test]
+    fn test_order_repos_prioritization() {
+        let discovered = vec![
+            "cachyos".to_string(),
+            "core".to_string(),
+            "extra".to_string(),
+            "multilib".to_string(),
+        ];
+        let repo_order = vec!["core".to_string(), "extra".to_string()];
+        let order = AlpmManager::order_repos(&discovered, &repo_order);
+        assert_eq!(order, vec!["core", "extra", "cachyos", "multilib"]);
+    }
+
+    #[test]
+    fn test_order_repos_with_custom_new_repo() {
+        let discovered = vec!["core".to_string(), "extra".to_string()];
+        let repo_order = vec!["custom-repo".to_string(), "core".to_string()];
+        let order = AlpmManager::order_repos(&discovered, &repo_order);
+        assert_eq!(order, vec!["custom-repo", "core", "extra"]);
+    }
+}
 
