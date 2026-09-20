@@ -32,9 +32,10 @@ pub struct ExternalUpdate {
 pub trait IntegrationProvider: Send + Sync {
     fn name(&self) -> &'static str;
     fn is_available(&self) -> bool;
+    fn refresh_metadata(&self) -> Result<(), std::io::Error>;
     fn check_updates(&self) -> Vec<ExternalUpdate>;
-    fn upgrade_command_str(&self) -> String;
-    fn execute_upgrade(&self) -> Result<bool, std::io::Error>;
+    fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String;
+    fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> Result<bool, std::io::Error>;
     fn clean_command_str(&self) -> String;
     fn execute_clean(&self) -> Result<bool, std::io::Error>;
 }
@@ -52,6 +53,13 @@ impl IntegrationProvider for FlatpakProvider {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    fn refresh_metadata(&self) -> Result<(), std::io::Error> {
+        let _ = Command::new("flatpak")
+            .args(&["update", "--appstream"])
+            .output()?;
+        Ok(())
     }
 
     fn check_updates(&self) -> Vec<ExternalUpdate> {
@@ -91,14 +99,22 @@ impl IntegrationProvider for FlatpakProvider {
         results
     }
 
-    fn upgrade_command_str(&self) -> String {
-        "flatpak update -y".to_string()
+    fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String {
+        if updates.is_empty() {
+            "flatpak update -y".to_string()
+        } else {
+            let ids: Vec<&str> = updates.iter().map(|u| u.id.as_str()).collect();
+            format!("flatpak update -y {}", ids.join(" "))
+        }
     }
 
-    fn execute_upgrade(&self) -> Result<bool, std::io::Error> {
-        let status = Command::new("flatpak")
-            .args(&["update", "-y"])
-            .status()?;
+    fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> Result<bool, std::io::Error> {
+        let mut cmd = Command::new("flatpak");
+        cmd.arg("update").arg("-y");
+        for u in updates {
+            cmd.arg(&u.id);
+        }
+        let status = cmd.status()?;
         Ok(status.success())
     }
 
@@ -129,6 +145,13 @@ impl IntegrationProvider for NixProvider {
             .unwrap_or(false)
     }
 
+    fn refresh_metadata(&self) -> Result<(), std::io::Error> {
+        if Command::new("nix-channel").arg("--version").output().is_ok() {
+            let _ = Command::new("nix-channel").arg("--update").output()?;
+        }
+        Ok(())
+    }
+
     fn check_updates(&self) -> Vec<ExternalUpdate> {
         // Check outdated packages via nix-env or nix profile
         let output = Command::new("nix-env")
@@ -156,11 +179,11 @@ impl IntegrationProvider for NixProvider {
         results
     }
 
-    fn upgrade_command_str(&self) -> String {
+    fn upgrade_command_str(&self, _updates: &[ExternalUpdate]) -> String {
         "nix profile upgrade '.*'".to_string()
     }
 
-    fn execute_upgrade(&self) -> Result<bool, std::io::Error> {
+    fn execute_upgrade(&self, _updates: &[ExternalUpdate]) -> Result<bool, std::io::Error> {
         let status = Command::new("nix")
             .args(&["profile", "upgrade", ".*"])
             .status();
@@ -214,6 +237,31 @@ impl IntegrationsManager {
         providers
     }
 
+    pub fn refresh_all_parallel(providers: &[Box<dyn IntegrationProvider>]) {
+        if providers.is_empty() {
+            return;
+        }
+
+        println!(
+            "{}",
+            ":: Refreshing external package manager metadata...".cyan()
+        );
+        let mut handles = Vec::new();
+
+        for p in providers {
+            let name = p.name();
+            if name == "Flatpak" {
+                handles.push(thread::spawn(|| FlatpakProvider.refresh_metadata()));
+            } else if name == "Nix" {
+                handles.push(thread::spawn(|| NixProvider.refresh_metadata()));
+            }
+        }
+
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+
     pub fn check_updates_parallel(providers: &[Box<dyn IntegrationProvider>]) -> Vec<ExternalUpdate> {
         if providers.is_empty() {
             return Vec::new();
@@ -240,15 +288,29 @@ impl IntegrationsManager {
         all_updates
     }
 
-    pub fn execute_upgrades(providers: &[Box<dyn IntegrationProvider>]) {
+    pub fn execute_upgrades(
+        providers: &[Box<dyn IntegrationProvider>],
+        external_updates: &[ExternalUpdate],
+    ) {
         for p in providers {
+            let p_updates: Vec<ExternalUpdate> = external_updates
+                .iter()
+                .filter(|u| u.runner == p.name())
+                .cloned()
+                .collect();
+
+            if p_updates.is_empty() {
+                continue;
+            }
+
             println!(
-                "\n{} Upgrading {} packages ({})...",
+                "\n{} Upgrading {} ({} packages: {})...",
                 "::".cyan(),
                 p.name().bold(),
-                p.upgrade_command_str().dimmed()
+                p_updates.len(),
+                p.upgrade_command_str(&p_updates).dimmed()
             );
-            match p.execute_upgrade() {
+            match p.execute_upgrade(&p_updates) {
                 Ok(true) => {
                     println!("✔ {} upgrade completed successfully.", p.name().green());
                 }

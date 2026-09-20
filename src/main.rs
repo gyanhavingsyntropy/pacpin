@@ -126,6 +126,8 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
     check_pacman_lock();
     print_banner();
 
+    let ext_providers = IntegrationsManager::get_active_providers(config);
+
     if refresh && !dry_run {
         println!(
             "{}",
@@ -148,6 +150,10 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
                 exit(1);
             }
         }
+
+        if !ext_providers.is_empty() {
+            IntegrationsManager::refresh_all_parallel(&ext_providers);
+        }
     }
 
     let manager = match AlpmManager::with_repo_order(&config.repo_order) {
@@ -159,7 +165,6 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
     };
     let resolver = ResolverEngine::new(&manager);
     let res = resolver.resolve_all(config);
-    let ext_providers = IntegrationsManager::get_active_providers(config);
     let external_updates = IntegrationsManager::check_updates_parallel(&ext_providers);
     let updates = render_transaction_view(&res, &config.options.helper, &external_updates);
     let orphans = if config.features.smart_orphans {
@@ -239,7 +244,14 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
     }
 
     for p in &ext_providers {
-        command_strs.push(p.upgrade_command_str());
+        let p_updates: Vec<integrations::ExternalUpdate> = external_updates
+            .iter()
+            .filter(|u| u.runner == p.name())
+            .cloned()
+            .collect();
+        if !p_updates.is_empty() {
+            command_strs.push(p.upgrade_command_str(&p_updates));
+        }
     }
 
     let full_cmd = command_strs.join(" && ");
@@ -323,8 +335,8 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
         }
     }
 
-    if success && !ext_providers.is_empty() {
-        IntegrationsManager::execute_upgrades(&ext_providers);
+    if success && !external_updates.is_empty() {
+        IntegrationsManager::execute_upgrades(&ext_providers, &external_updates);
     }
 
     if success {
