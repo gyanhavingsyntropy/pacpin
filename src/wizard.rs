@@ -79,7 +79,13 @@ pub fn run_first_launch_wizard(force: bool) -> Option<Config> {
     print_banner();
 
     let config_path = get_config_path();
-    if config_path.exists() && !force {
+    let existing_cfg = if config_path.exists() {
+        Some(crate::config::load_config())
+    } else {
+        None
+    };
+
+    if existing_cfg.is_some() && !force {
         println!("{}", ":: Existing configuration found at ~/.config/pacpin/config.toml.".yellow());
         if !prompt_yn("Run setup wizard and reconfigure?", false) {
             println!("Configuration unchanged.");
@@ -90,15 +96,31 @@ pub fn run_first_launch_wizard(force: bool) -> Option<Config> {
 
     println!("{}", ":: Welcome to pacpin! Let's tailor your package management preferences.\n".cyan().bold());
 
+    let (mut pins, mut exclude, mut delays) = if let Some(ref cfg) = existing_cfg {
+        if !cfg.pins.is_empty() || !cfg.delay.is_empty() {
+            println!(
+                "  {}",
+                format!(
+                    "ℹ Preserving {} existing pin(s), {} exclusion rule(s), and {} delay rule(s).",
+                    cfg.pins.len(),
+                    cfg.exclude.len(),
+                    cfg.delay.len()
+                )
+                .cyan()
+            );
+        }
+        (cfg.pins.clone(), cfg.exclude.clone(), cfg.delay.clone())
+    } else {
+        (BTreeMap::new(), BTreeMap::new(), BTreeMap::new())
+    };
+
     // 1. Repository Pinning & Shielding
-    println!("{}", "[1/4] Repository Pinning & Shielding:".bold());
+    println!("{}", "[1/5] Repository Pinning & Shielding:".bold());
     println!("      Lock packages or wildcards to specific repos (e.g. core, cachyos, extra)");
     println!("      to prevent unwanted upstream overrides and prioritize curated repositories.");
     let enable_pinning = prompt_yn("Enable Repository Pinning?", true);
     println!();
 
-    let mut pins = BTreeMap::new();
-    let mut exclude = BTreeMap::new();
     if enable_pinning && has_cachyos_repos() {
         println!("  {}", "ℹ Detected CachyOS repositories on your system.".cyan());
         if prompt_yn("Add baseline protection pins (amd-ucode, intel-ucode, linux-firmware* to core)?", true) {
@@ -113,11 +135,10 @@ pub fn run_first_launch_wizard(force: bool) -> Option<Config> {
     }
 
     // 2. Stability Delay Buffer
-    println!("{}", "[2/4] Stability Delay Buffer:".bold());
+    println!("{}", "[2/5] Stability Delay Buffer:".bold());
     println!("      Hold back bleeding-edge updates (e.g., Linux kernel, mesa, nvidia)");
     println!("      for a designated buffer period (in days) to avoid day-0 upstream regressions.");
     let enable_delays = prompt_yn("Enable Stability Delay Buffer?", false);
-    let mut delays = BTreeMap::new();
     if enable_delays {
         let default_days_str = prompt_input("Default buffer period for kernel/drivers in days", "3");
         let days = default_days_str.parse::<u32>().unwrap_or(3);
@@ -133,7 +154,7 @@ pub fn run_first_launch_wizard(force: bool) -> Option<Config> {
     }
 
     // 3. Smart Orphan Lifecycle Management
-    println!("{}", "[3/4] Smart Orphan Lifecycle Management:".bold());
+    println!("{}", "[3/5] Smart Orphan Lifecycle Management:".bold());
     println!("      Distinguish pure useless dependencies from active optional plugins");
     println!("      (like LADSPA for ffmpeg), and only prompt when dependencies actually change.");
     let enable_orphans = prompt_yn("Enable Smart Orphan Management?", true);
