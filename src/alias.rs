@@ -64,6 +64,11 @@ impl AliasManager {
     }
 
     pub fn setup_aliases() -> Vec<String> {
+        let cfg = crate::config::load_config();
+        if !cfg.features.shell_aliases {
+            return Vec::new();
+        }
+
         let home = match env::var("HOME") {
             Ok(h) => h,
             Err(_) => return Vec::new(),
@@ -153,6 +158,11 @@ impl AliasManager {
     }
 
     pub fn check_and_notify_once() {
+        let cfg = crate::config::load_config();
+        if !cfg.features.shell_aliases {
+            return;
+        }
+
         if !Self::try_acquire_first_notification() {
             return;
         }

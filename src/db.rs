@@ -297,20 +297,33 @@ impl AlpmManager {
 
         let mut companions = HashSet::new();
 
+        let matching_pins: Vec<(&String, Option<Pattern>)> = pins
+            .iter()
+            .filter(|(_, rep)| *rep == repo)
+            .map(|(pat, _)| {
+                let pat_obj = if pat.contains('*') || pat.contains('?') || pat.contains('[') {
+                    Pattern::new(pat).ok()
+                } else {
+                    None
+                };
+                (pat, pat_obj)
+            })
+            .collect();
+
         for p in sync_db.pkgs() {
             let name = p.name();
             if name == pkg_name {
                 continue;
             }
 
-            let is_pinned = pins.iter().any(|(pat, rep)| {
-                if rep != repo {
-                    return false;
-                }
-                if pat == name {
+            let is_pinned = matching_pins.iter().any(|(pat, pat_obj)| {
+                if *pat == name {
                     return true;
                 }
-                Pattern::new(pat).map(|pat_obj| pat_obj.matches(name)).unwrap_or(false)
+                if let Some(p) = pat_obj {
+                    return p.matches(name);
+                }
+                false
             });
             if is_pinned {
                 continue;

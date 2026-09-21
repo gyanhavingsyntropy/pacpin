@@ -185,9 +185,10 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
     if enable_delays {
         let default_days_str = prompt_input("Default buffer period for kernel/drivers in days", "3");
         let days = default_days_str.parse::<u32>().unwrap_or(3);
-        if prompt_yn("Apply default delay buffer to 'linux' kernel packages?", true) {
-            delays.insert("linux".to_string(), days);
-            delays.insert("linux-cachyos".to_string(), days);
+        if prompt_yn("Apply default delay buffer to kernel packages?", true) {
+            for k in crate::utils::KERNEL_PACKAGES {
+                delays.insert(k.to_string(), days);
+            }
             println!("  ✔ Set {}-day stability buffer on kernel packages.\n", days);
         } else {
             println!();
@@ -307,6 +308,7 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
             smart_orphans: enable_orphans,
             integrations: enable_integrations,
             vendor_stickiness,
+            shell_aliases: true,
         },
         options: Options { helper },
         repo_order,
@@ -325,8 +327,10 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
         return None;
     }
 
-    crate::alias::AliasManager::setup_aliases();
-    crate::alias::AliasManager::mark_notified();
+    if config.features.shell_aliases {
+        crate::alias::AliasManager::setup_aliases();
+        crate::alias::AliasManager::mark_notified();
+    }
 
     println!("{}", "✔ Configuration saved successfully!".green().bold());
     println!("  Path: {}", config_path.display().to_string().cyan());

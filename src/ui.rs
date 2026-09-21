@@ -800,7 +800,7 @@ pub fn render_transaction_view(
         }
     }
 
-    let card_inner_w = (avail.saturating_sub(4)).min(60).max(50);
+    let card_inner_w = (avail.saturating_sub(4)).clamp(30, 60);
     let (tot_delta_str, tot_delta_color) = format_delta_text(tot_delta);
 
     let print_card_line = |label: &str, val_str: &str, colored_val: String| {

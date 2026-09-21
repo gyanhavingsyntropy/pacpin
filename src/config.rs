@@ -76,6 +76,8 @@ pub struct Features {
     pub integrations: bool,
     #[serde(default = "default_false")]
     pub vendor_stickiness: bool,
+    #[serde(default = "default_true")]
+    pub shell_aliases: bool,
 }
 
 fn default_true() -> bool {
@@ -94,6 +96,7 @@ impl Default for Features {
             smart_orphans: true,
             integrations: false,
             vendor_stickiness: false,
+            shell_aliases: true,
         }
     }
 }
@@ -208,12 +211,28 @@ pub fn load_config() -> Config {
 
 pub fn save_config(config: &Config) -> Result<(), std::io::Error> {
     let path = get_config_path();
+    save_config_to_path(config, &path)
+}
+
+pub fn save_config_to_path(config: &Config, path: &Path) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let toml_str = toml::to_string_pretty(config)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    fs::write(path, toml_str)
+
+    let temp_path = parent.join(format!(
+        ".config.toml.tmp.{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::write(&temp_path, toml_str)?;
+    fs::rename(&temp_path, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -245,6 +264,14 @@ mod tests {
         assert!(config.features.stability_delays);
         assert!(!config.features.smart_orphans);
         assert!(!config.features.integrations);
+        assert!(config.features.shell_aliases);
+
+        let toml_opt_out = r#"
+        [features]
+        shell_aliases = false
+        "#;
+        let cfg_opt_out: Config = toml::from_str(toml_opt_out).unwrap();
+        assert!(!cfg_opt_out.features.shell_aliases);
     }
 
     #[test]
@@ -300,5 +327,29 @@ mod tests {
         if std::path::Path::new(sh_path).exists() {
             assert_eq!(validate_helper(sh_path).unwrap(), sh_path);
         }
+    }
+
+    #[test]
+    fn test_atomic_save_config() {
+        let temp_dir = std::env::temp_dir().join(format!("pacpin_test_cfg_{}", std::process::id()));
+        let cfg_path = temp_dir.join("config.toml");
+        let mut config = Config::default();
+        config.pins.insert("test-pkg".to_string(), "extra".to_string());
+
+        assert!(save_config_to_path(&config, &cfg_path).is_ok());
+        assert!(cfg_path.exists());
+
+        let content = fs::read_to_string(&cfg_path).unwrap();
+        assert!(content.contains("test-pkg"));
+        assert!(content.contains("extra"));
+
+        // Ensure no leftover temp files exist
+        let leftover = fs::read_dir(&temp_dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(".config.toml.tmp"));
+        assert!(!leftover);
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

@@ -17,7 +17,6 @@
 use colored::Colorize;
 use std::env;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,32 +51,36 @@ pub fn parse_target(target: &str) -> (Option<&str>, &str) {
     }
 }
 
-pub fn cmd_try(target: &str, args: &[String]) {
+pub fn cmd_try(target: &str, args: &[String], no_sandbox: bool) {
     let (prefix, pkg) = parse_target(target);
 
-    match prefix {
+    let res = match prefix {
         Some("flatpak") => try_flatpak(pkg, args),
         Some("nix") | Some("nixpkgs") => try_nix(pkg, args),
         Some("pipx") => try_pipx(pkg, args),
-        Some(repo) => try_pacman(Some(repo), pkg, args),
-        None => try_pacman(None, pkg, args),
+        Some(repo) => try_pacman(Some(repo), pkg, args, no_sandbox),
+        None => try_pacman(None, pkg, args, no_sandbox),
+    };
+
+    match res {
+        Ok(code) => exit(code),
+        Err(err) => {
+            eprintln!("{}", format!("Error: {}", err).red().bold());
+            exit(1);
+        }
     }
 }
 
-fn try_flatpak(app_id: &str, args: &[String]) {
+fn try_flatpak(app_id: &str, args: &[String]) -> Result<i32, String> {
     if !is_safe_flatpak_id(app_id) {
-        eprintln!(
-            "{}",
-            format!("Error: Invalid Flatpak Application ID '{}'.", app_id).red().bold()
-        );
-        eprintln!("Flatpak IDs follow reverse-DNS notation, e.g. 'org.gnome.Calculator' or 'com.spotify.Client'.");
-        exit(1);
+        return Err(format!(
+            "Invalid Flatpak Application ID '{}'. Flatpak IDs follow reverse-DNS notation, e.g. 'org.gnome.Calculator'.",
+            app_id
+        ));
     }
 
     if !crate::is_command_available("flatpak") {
-        eprintln!("{}", "Error: 'flatpak' command not found on this system.".red().bold());
-        eprintln!("Install flatpak or enable Flatpak integration in 'pacpin init'.");
-        exit(1);
+        return Err("'flatpak' command not found on this system. Install flatpak or enable Flatpak integration in 'pacpin init'.".to_string());
     }
 
     // Check if the application is already installed on the system
@@ -124,23 +127,16 @@ fn try_flatpak(app_id: &str, args: &[String]) {
         );
         let install_status = Command::new("flatpak")
             .args(["install", "--user", "--noninteractive", "-y", "flathub", app_id])
-            .status();
+            .status()
+            .map_err(|e| format!("Failed to run flatpak install: {}", e))?;
 
-        match install_status {
-            Ok(s) if s.success() => {
-                guard.needs_cleanup = true;
-            }
-            Ok(s) => {
-                eprintln!(
-                    "{}",
-                    format!("Flatpak installation failed with exit code {}.", s.code().unwrap_or(1)).red()
-                );
-                exit(s.code().unwrap_or(1));
-            }
-            Err(e) => {
-                eprintln!("{}", format!("Failed to run flatpak install: {}", e).red());
-                exit(1);
-            }
+        if install_status.success() {
+            guard.needs_cleanup = true;
+        } else {
+            return Err(format!(
+                "Flatpak installation failed with exit code {}.",
+                install_status.code().unwrap_or(1)
+            ));
         }
     } else {
         println!(
@@ -160,31 +156,22 @@ fn try_flatpak(app_id: &str, args: &[String]) {
     let mut run_args = vec!["run", app_id];
     run_args.extend(args.iter().map(|s| s.as_str()));
 
-    let child_status = Command::new("flatpak").args(&run_args).status();
+    let child_status = Command::new("flatpak")
+        .args(&run_args)
+        .status()
+        .map_err(|e| format!("Failed to execute flatpak run: {}", e))?;
 
     drop(guard);
-
-    match child_status {
-        Ok(s) => exit(s.code().unwrap_or(0)),
-        Err(e) => {
-            eprintln!("{}", format!("Failed to execute flatpak run: {}", e).red());
-            exit(1);
-        }
-    }
+    Ok(child_status.code().unwrap_or(0))
 }
 
-fn try_nix(pkg: &str, args: &[String]) {
+fn try_nix(pkg: &str, args: &[String]) -> Result<i32, String> {
     if !crate::journal::TransactionJournal::is_safe_pkg_name(pkg) {
-        eprintln!(
-            "{}",
-            format!("Error: Invalid Nix package name '{}'.", pkg).red().bold()
-        );
-        exit(1);
+        return Err(format!("Invalid Nix package name '{}'.", pkg));
     }
 
     if !crate::is_command_available("nix") {
-        eprintln!("{}", "Error: 'nix' command not found on this system.".red().bold());
-        exit(1);
+        return Err("'nix' command not found on this system.".to_string());
     }
 
     println!(
@@ -200,50 +187,39 @@ fn try_nix(pkg: &str, args: &[String]) {
         nix_args.extend(args.iter().map(|s| s.as_str()));
     }
 
-    let status = Command::new("nix").args(&nix_args).status();
+    let status = Command::new("nix")
+        .args(&nix_args)
+        .status()
+        .map_err(|e| format!("Failed to execute nix: {}", e))?;
 
-    match status {
-        Ok(s) if s.success() => exit(0),
-        Ok(s) => {
-            // Fallback: nix-shell -p <pkg> --run "<pkg> [args...]"
-            println!(
-                "{} 'nix run' exited with {}. Trying 'nix-shell' fallback...",
-                "::".yellow(),
-                s.code().unwrap_or(1)
-            );
-            let mut cmd_parts = vec![crate::utils::shell_quote(pkg)];
-            cmd_parts.extend(args.iter().map(|s| crate::utils::shell_quote(s)));
-            let shell_cmd = cmd_parts.join(" ");
-            let shell_status = Command::new("nix-shell")
-                .args(["-p", pkg, "--run", &shell_cmd])
-                .status();
-            match shell_status {
-                Ok(ss) => exit(ss.code().unwrap_or(0)),
-                Err(e) => {
-                    eprintln!("{}", format!("Failed to run nix-shell: {}", e).red());
-                    exit(1);
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("{}", format!("Failed to execute nix: {}", e).red());
-            exit(1);
-        }
+    if status.success() {
+        return Ok(0);
     }
+
+    // Fallback: nix-shell -p <pkg> --run "<pkg> [args...]"
+    println!(
+        "{} 'nix run' exited with {}. Trying 'nix-shell' fallback...",
+        "::".yellow(),
+        status.code().unwrap_or(1)
+    );
+    let mut cmd_parts = vec![crate::utils::shell_quote(pkg)];
+    cmd_parts.extend(args.iter().map(|s| crate::utils::shell_quote(s)));
+    let shell_cmd = cmd_parts.join(" ");
+    let shell_status = Command::new("nix-shell")
+        .args(["-p", pkg, "--run", &shell_cmd])
+        .status()
+        .map_err(|e| format!("Failed to run nix-shell: {}", e))?;
+
+    Ok(shell_status.code().unwrap_or(0))
 }
 
-fn try_pipx(pkg: &str, args: &[String]) {
+fn try_pipx(pkg: &str, args: &[String]) -> Result<i32, String> {
     if !crate::journal::TransactionJournal::is_safe_pkg_name(pkg) {
-        eprintln!(
-            "{}",
-            format!("Error: Invalid Pipx package name '{}'.", pkg).red().bold()
-        );
-        exit(1);
+        return Err(format!("Invalid Pipx package name '{}'.", pkg));
     }
 
     if !crate::is_command_available("pipx") {
-        eprintln!("{}", "Error: 'pipx' command not found on this system.".red().bold());
-        exit(1);
+        return Err("'pipx' command not found on this system.".to_string());
     }
 
     println!(
@@ -255,24 +231,35 @@ fn try_pipx(pkg: &str, args: &[String]) {
     let mut pipx_args = vec!["run", pkg];
     pipx_args.extend(args.iter().map(|s| s.as_str()));
 
-    let status = Command::new("pipx").args(&pipx_args).status();
+    let status = Command::new("pipx")
+        .args(&pipx_args)
+        .status()
+        .map_err(|e| format!("Failed to execute pipx: {}", e))?;
 
-    match status {
-        Ok(s) => exit(s.code().unwrap_or(0)),
-        Err(e) => {
-            eprintln!("{}", format!("Failed to execute pipx: {}", e).red());
-            exit(1);
-        }
-    }
+    Ok(status.code().unwrap_or(0))
 }
 
-fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String]) {
+pub fn is_safe_tar_entry(entry: &str) -> bool {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    // Absolute paths or drive letters
+    if trimmed.starts_with('/') || trimmed.starts_with('\\') {
+        return false;
+    }
+    // Path traversal components
+    for component in trimmed.split(['/', '\\']) {
+        if component == ".." {
+            return false;
+        }
+    }
+    true
+}
+
+fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], no_sandbox: bool) -> Result<i32, String> {
     if pkg.is_empty() || !crate::journal::TransactionJournal::is_safe_pkg_name(pkg) {
-        eprintln!(
-            "{}",
-            format!("Error: Invalid package name '{}'.", pkg).red().bold()
-        );
-        exit(1);
+        return Err(format!("Invalid package name '{}'.", pkg));
     }
 
     let timestamp = SystemTime::now()
@@ -287,27 +274,15 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String]) {
     };
 
     let cfg = crate::config::load_config();
-    let manager = match crate::db::AlpmManager::with_repo_order(&cfg.repo_order) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("{}", format!("Error initializing ALPM: {}", e).red());
-            exit(1);
-        }
-    };
+    let manager = crate::db::AlpmManager::with_repo_order(&cfg.repo_order)
+        .map_err(|e| format!("Error initializing ALPM: {}", e))?;
 
     println!("{} Resolving download URLs for '{}' via ALPM...", "::".cyan(), pkg);
-    let resolved = match manager.resolve_download_urls(repo, pkg) {
-        Ok(r) => r,
-        Err(err) => {
-            eprintln!("{}", format!("Error: {}", err).red().bold());
-            exit(1);
-        }
-    };
+    let resolved = manager.resolve_download_urls(repo, pkg)
+        .map_err(|err| format!("Error resolving download URLs: {}", err))?;
 
-    if let Err(e) = fs::create_dir_all(&sandbox_dir) {
-        eprintln!("{}", format!("Error creating sandbox directory: {}", e).red().bold());
-        exit(1);
-    }
+    fs::create_dir_all(&sandbox_dir)
+        .map_err(|e| format!("Error creating sandbox directory: {}", e))?;
 
     if resolved.len() > 1 {
         println!(
@@ -318,44 +293,53 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String]) {
         );
     }
 
-    // 1. Download & Extract all resolved packages (dependencies first, then target)
+    // 1. Download, verify, and extract all resolved packages
     for target in &resolved {
-        let tarball_path = match get_or_download_package(&target.name, &target.url, target.sha256.as_deref(), &mut guard) {
-            Ok(path) => path,
-            Err(err) => {
-                eprintln!("{}", format!("Error: {}", err).red().bold());
-                exit(1);
+        let tarball_path = get_or_download_package(&target.name, &target.url, target.sha256.as_deref(), &mut guard)?;
+
+        // Tar Path Traversal Guard: inspect entries before extraction
+        let tar_tf = Command::new("tar")
+            .args(["-tf", tarball_path.to_str().unwrap()])
+            .output()
+            .map_err(|e| format!("Failed to inspect archive '{}': {}", tarball_path.display(), e))?;
+
+        if !tar_tf.status.success() {
+            return Err(format!(
+                "Failed to list archive contents for '{}' (exit code {:?})",
+                tarball_path.display(),
+                tar_tf.status.code()
+            ));
+        }
+
+        let listing = String::from_utf8_lossy(&tar_tf.stdout);
+        for line in listing.lines() {
+            let entry = line.trim();
+            if !is_safe_tar_entry(entry) {
+                return Err(format!(
+                    "Security violation: archive '{}' contains unsafe path traversal entry '{}'. Extraction aborted.",
+                    tarball_path.display(),
+                    entry
+                ));
             }
-        };
+        }
 
         let extract_status = Command::new("tar")
             .args(["-xf", tarball_path.to_str().unwrap(), "-C", sandbox_dir.to_str().unwrap()])
-            .status();
+            .status()
+            .map_err(|e| format!("Failed to execute tar on '{}': {}", target.name, e))?;
 
-        match extract_status {
-            Ok(s) if s.success() => {}
-            Ok(s) => {
-                eprintln!("{}", format!("Extraction of '{}' failed with exit code {}.", target.name, s.code().unwrap_or(1)).red());
-                exit(s.code().unwrap_or(1));
-            }
-            Err(e) => {
-                eprintln!("{}", format!("Failed to execute tar on '{}': {}", target.name, e).red());
-                exit(1);
-            }
+        if !extract_status.success() {
+            return Err(format!(
+                "Extraction of '{}' failed with exit code {}.",
+                target.name,
+                extract_status.code().unwrap_or(1)
+            ));
         }
     }
 
     // 2. Find executable binary
-    let binary_path = match find_executable(&sandbox_dir, pkg) {
-        Some(b) => b,
-        None => {
-            eprintln!(
-                "{}",
-                format!("Error: No executable found for package '{}' in sandbox (usr/bin).", pkg).red().bold()
-            );
-            exit(1);
-        }
-    };
+    let binary_path = find_executable(&sandbox_dir, pkg)
+        .ok_or_else(|| format!("No executable found for package '{}' in sandbox (usr/bin).", pkg))?;
 
     // 3. Construct isolated environment
     let usr_bin = sandbox_dir.join("usr").join("bin");
@@ -377,28 +361,98 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String]) {
     let current_xdg = env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
     let new_xdg = format!("{}:{}", usr_share.display(), current_xdg);
 
-    println!(
-        "{} Running ephemeral '{}' (sandbox will be destroyed upon exit)...\n",
-        "::".cyan(),
-        pkg.bold()
-    );
+    let bwrap_available = !no_sandbox && crate::is_command_available("bwrap");
 
-    let child_status = Command::new(&binary_path)
-        .args(args)
-        .env("PATH", new_path)
-        .env("LD_LIBRARY_PATH", new_ld)
-        .env("XDG_DATA_DIRS", new_xdg)
-        .status();
+    if no_sandbox {
+        println!(
+            "{} Running ephemeral '{}' with host environment isolation (--no-sandbox; sandbox will be destroyed upon exit)...\n",
+            "::".cyan(),
+            pkg.bold()
+        );
+    } else if bwrap_available {
+        println!(
+            "{} Spawning ephemeral sandbox in unshared container (bubblewrap)...",
+            "::".cyan()
+        );
+        println!(
+            "{} Running ephemeral '{}' (sandbox will be destroyed upon exit)...\n",
+            "::".cyan(),
+            pkg.bold()
+        );
+    } else {
+        println!(
+            "{} Bubblewrap ('bwrap') not found: running with process-level environment isolation.",
+            "ℹ".yellow()
+        );
+        println!(
+            "  {}",
+            "Install 'bubblewrap' (`pacman -S bubblewrap`) for kernel-level unshared container sandboxing.".dimmed()
+        );
+        println!(
+            "{} Running ephemeral '{}' (sandbox will be destroyed upon exit)...\n",
+            "::".cyan(),
+            pkg.bold()
+        );
+    }
 
-    // Guard will automatically clean up sandbox_dir and downloaded tarballs upon leaving scope
+    let child_status = if bwrap_available {
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut bwrap_cmd = Command::new("bwrap");
+        bwrap_cmd
+            .arg("--ro-bind").arg("/").arg("/")
+            .arg("--tmpfs").arg("/tmp");
+
+        // Allow access to X11 socket if present for GUI applications
+        let x11_socket = Path::new("/tmp/.X11-unix");
+        if x11_socket.exists() {
+            bwrap_cmd.arg("--ro-bind").arg(x11_socket).arg(x11_socket);
+        }
+
+        if cwd.exists() && !cwd.starts_with("/tmp") {
+            bwrap_cmd.arg("--bind").arg(&cwd).arg(&cwd);
+        }
+
+        bwrap_cmd
+            .arg("--ro-bind").arg(&sandbox_dir).arg(&sandbox_dir)
+            .arg("--proc").arg("/proc")
+            .arg("--dev").arg("/dev");
+
+        // Pass GPU DRI nodes if available (hardware acceleration)
+        let dri_dir = Path::new("/dev/dri");
+        if dri_dir.exists() {
+            bwrap_cmd.arg("--dev-bind").arg(dri_dir).arg(dri_dir);
+        }
+
+        // Pass sound devices if available (audio output)
+        let snd_dir = Path::new("/dev/snd");
+        if snd_dir.exists() {
+            bwrap_cmd.arg("--dev-bind").arg(snd_dir).arg(snd_dir);
+        }
+
+        bwrap_cmd
+            .arg("--unshare-all")
+            .arg("--share-net")
+            .args(["--setenv", "PATH", &new_path])
+            .args(["--setenv", "LD_LIBRARY_PATH", &new_ld])
+            .args(["--setenv", "XDG_DATA_DIRS", &new_xdg])
+            .arg(&binary_path)
+            .args(args);
+
+        bwrap_cmd.status()
+    } else {
+        Command::new(&binary_path)
+            .args(args)
+            .env("PATH", &new_path)
+            .env("LD_LIBRARY_PATH", &new_ld)
+            .env("XDG_DATA_DIRS", &new_xdg)
+            .status()
+    };
+
     drop(guard);
 
     match child_status {
-        Ok(s) => exit(s.code().unwrap_or(0)),
-        Err(e) => {
-            eprintln!("{}", format!("Execution failed: {}", e).red());
-            exit(1);
-        }
+        Ok(s) => Ok(s.code().unwrap_or(0)),
+        Err(e) => Err(format!("Execution failed: {}", e)),
     }
 }
 
@@ -426,8 +480,33 @@ fn get_or_download_package(
             if !matching.is_empty() {
                 matching.sort_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
                 let found = matching.last().unwrap().clone();
-                println!("{} Found '{}' in local pacman cache.", "::".cyan(), pkg);
-                return Ok(found);
+
+                let cache_valid = if let Some(expected) = expected_sha {
+                    if let Ok(out) = Command::new("sha256sum").arg(&found).output() {
+                        if out.status.success() {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            let computed = stdout.split_whitespace().next().unwrap_or("");
+                            computed.eq_ignore_ascii_case(expected)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                };
+
+                if cache_valid {
+                    println!("{} Found verified '{}' in local pacman cache.", "::".cyan(), pkg);
+                    return Ok(found);
+                } else {
+                    println!(
+                        "{} Cached package for '{}' failed checksum verification or was outdated; downloading fresh...",
+                        "::".yellow(),
+                        pkg
+                    );
+                }
             }
         }
     }
@@ -459,24 +538,43 @@ fn get_or_download_package(
         .map_err(|e| format!("Failed to execute curl: {}", e))?;
 
     if !curl_status.success() {
+        let _ = fs::remove_file(&temp_download);
         return Err(format!("curl download failed with exit code {:?}", curl_status.code()));
     }
 
-    // 3. Verify SHA256 integrity against ALPM database metadata
+    // 3. Fail-Closed SHA256 integrity check against ALPM database metadata
     if let Some(expected) = expected_sha {
-        if let Ok(out) = Command::new("sha256sum").arg(&temp_download).output() {
-            if out.status.success() {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let computed = stdout.split_whitespace().next().unwrap_or("");
-                if !computed.eq_ignore_ascii_case(expected) {
-                    let _ = fs::remove_file(&temp_download);
-                    return Err(format!(
-                        "SHA256 checksum verification failed for '{}'!\n  Expected: {}\n  Computed: {}\nDownloaded package was discarded for security.",
-                        pkg, expected, computed
-                    ));
-                }
-            }
+        let out = Command::new("sha256sum")
+            .arg(&temp_download)
+            .output()
+            .map_err(|e| {
+                let _ = fs::remove_file(&temp_download);
+                format!("Failed to execute sha256sum for integrity verification: {}", e)
+            })?;
+
+        if !out.status.success() {
+            let _ = fs::remove_file(&temp_download);
+            return Err(format!(
+                "sha256sum verification failed with exit code {:?}.",
+                out.status.code()
+            ));
         }
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let computed = stdout.split_whitespace().next().unwrap_or("");
+        if !computed.eq_ignore_ascii_case(expected) {
+            let _ = fs::remove_file(&temp_download);
+            return Err(format!(
+                "SHA256 checksum verification failed for '{}'!\n  Expected: {}\n  Computed: {}\nDownloaded package was discarded for security.",
+                pkg, expected, computed
+            ));
+        }
+    } else {
+        println!(
+            "{} Warning: No SHA256 checksum in repository metadata for '{}'; proceeding without verification.",
+            "::".yellow(),
+            pkg
+        );
     }
 
     Ok(temp_download)
@@ -538,15 +636,8 @@ fn is_safe_flatpak_id(id: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
-fn is_executable_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    if let Ok(meta) = fs::metadata(path) {
-        let mode = meta.permissions().mode();
-        return (mode & 0o111) != 0;
-    }
-    false
+pub fn is_executable_file(path: &Path) -> bool {
+    crate::utils::is_executable_file(path)
 }
 
 #[cfg(test)]
@@ -585,5 +676,26 @@ mod tests {
         if non_exec.exists() {
             assert!(!is_executable_file(non_exec));
         }
+    }
+
+    #[test]
+    fn test_is_safe_tar_entry() {
+        assert!(is_safe_tar_entry(".PKGINFO"));
+        assert!(is_safe_tar_entry(".BUILDINFO"));
+        assert!(is_safe_tar_entry("usr/bin/jq"));
+        assert!(is_safe_tar_entry("./usr/bin/jq"));
+        assert!(is_safe_tar_entry("usr/share/man/man1/jq.1.gz"));
+        assert!(is_safe_tar_entry(".hidden/file"));
+        assert!(is_safe_tar_entry(""));
+
+        // Unsafe entries
+        assert!(!is_safe_tar_entry("/etc/shadow"));
+        assert!(!is_safe_tar_entry("/usr/bin/jq"));
+        assert!(!is_safe_tar_entry("../../../etc/shadow"));
+        assert!(!is_safe_tar_entry("usr/bin/../../etc/passwd"));
+        assert!(!is_safe_tar_entry("usr/bin/.."));
+        assert!(!is_safe_tar_entry(".."));
+        assert!(!is_safe_tar_entry("\\etc\\shadow"));
+        assert!(!is_safe_tar_entry("..\\..\\windows\\system32"));
     }
 }

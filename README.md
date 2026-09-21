@@ -12,10 +12,10 @@
 2. **True Resolver Engine**: Synthesizes explicit qualified package targets (`repo/pkg`) instead of blind `pacman -Su` commands, preventing unexpected repository hopping.
 3. **Opt-In Vendor Stickiness**: Keep packages bound to their originating repository (`%INSTALLED_DB%`) during upgrades so they don't unexpectedly jump between sync repositories (e.g. `core` ➔ `cachyos`), displaying a distinct `[sticky]` badge in transactions.
 4. **BIOS-Style Repository Priority Menu**: Interactively reorder your system's repository search priority using arrow keys and instant promotion/demotion (`pacpin repos`).
-5. **Ephemeral Package Sandbox (`pacpin try [repo/]pkg [args...]`)**: Like `nix run`, download and execute tools in an isolated `/tmp` sandbox with zero system footprint and no root required (supports Arch repos, `flatpak/<app-id>`, and `nix/<pkg>`), automatically cleaning up on exit.
-6. **Post-Upgrade Restart Inspector (`needrestart`)**: Automatically inspect running processes holding deleted `.so` libraries in RAM (`/proc/*/maps`) and verify running kernel vs installed modules, advising on exact service restart commands (`sudo systemctl restart <srv>`) with zero noise when nothing needs restarting.
+5. **Ephemeral Package Sandbox (`pacpin try [repo/]pkg [args...]`)**: Like `nix run`, download and execute tools in a kernel-isolated container using Bubblewrap (`bwrap`) with unshared namespaces, read-only system mounts, private in-memory `/tmp`, fail-closed SHA256 integrity verification, archive traversal guards, and zero host residue upon exit (supports native Arch repos, `flatpak/<app-id>`, `nix/<pkg>`, and `pipx/<pkg>`).
+6. **Post-Upgrade Restart Inspector (`needrestart`)**: Automatically inspect running processes holding deleted `.so` libraries in RAM (`/proc/*/maps`) and verify running kernel vs installed modules (supporting Arch, CachyOS, XanMod, RT, TKG, and Bochs kernels), advising on exact service restart commands (`sudo systemctl restart <srv>`) with zero noise when nothing needs restarting.
 7. **Scrollable Checkbox TUI with Batch Shortcuts**: Interactive viewport checklist (`Space` toggle, `Enter` confirm) with one-key batch actions (`[a]` All, `[n]` None, `[p]` Pure Only, `[i]` Invert, `/` Search) for orphan management and setup.
-8. **Unified Multi-Package Manager Integrations**: Simultaneously check, refresh, and execute updates for Flatpak and Nix alongside Pacman and AUR in a single transaction view.
+8. **Unified Multi-Package Manager Integrations**: Simultaneously check, refresh, and execute updates for Flatpak, Nix, and Pipx alongside Pacman and AUR in a single transaction view.
 9. **Batch Pinning from Files**: Pin multiple packages at once or import a package list from a text file (`pacpin pin <repo> -f <file>`).
 10. **Stability Delay Buffers**: Enforce quarantine windows (e.g. `pacpin delay linux 3`) with automatic reverse-dependency cascade holds to prevent ABI mismatches.
 11. **Companion Cascade Detection**: Automatically detects split packages (sharing `%BASE%`) and prefix-related dependencies when pinning or installing to prevent version desynchronization.
@@ -33,6 +33,7 @@ vendor_stickiness = false
 stability_delays = false
 smart_orphans = true
 integrations = false
+shell_aliases = true
 
 [options]
 helper = "paru"
@@ -98,23 +99,23 @@ pipx = true
 ### Power Tools & Sandboxing
 | Command | Description |
 | :--- | :--- |
-| `pacpin try [repo/]pkg [args...]` (`pin run`) | Run package in isolated ephemeral `/tmp` sandbox with multi-dependency extraction (supports native, `flatpak/`, `nix/`, `pipx/`) |
+| `pacpin try [--no-sandbox] [repo/]pkg [args...]` (`pin run`) | Run package in an ephemeral Bubblewrap container (`--no-sandbox` / `--bare` runs with host environment isolation) |
 | `pacpin history [id]` | View transaction history timeline or inspect full package diff |
 | `pacpin rollback [id] [-n]` | Restore previous package versions from pacman cache |
 
 ### Transparent Pacman Drop-in
-`pacpin` serves as a complete drop-in wrapper. Any native pacman flag sequence (`-Sp`, `-Sl`, `-Sg`, `-Sw`, `-T`, `-Q`, `-Qi`, `-Ql`, `-Qo`, `-F`, `-Fy`, `-U`, `-D`, etc.) passed to `pacpin` or `pin` is transparently handled with proper permission routing (non-root for queries, `sudo` for modifications).
+`pacpin` serves as a complete drop-in wrapper. Any native pacman flag sequence (`-Syu`, `-S -y -u`, `-Ss`, `-Si`, `-Sc`, `-Sp`, `-Sl`, `-Sg`, `-Sw`, `-T`, `-Q`, `-Qi`, `-Ql`, `-Qo`, `-F`, `-Fy`, `-U`, `-D`, etc.) passed to `pacpin` or `pin` is transparently handled with proper permission routing (non-root for queries, `sudo` for modifications).
 
 ---
 
 ## Building from Source
 
 ### Prerequisites
-Building `pacpin` requires `pacman` / `libalpm` (C libraries and headers) and a Rust toolchain (1.75+):
+Building `pacpin` requires `pacman` / `libalpm` (C libraries and headers), `bubblewrap` (for container sandboxing), and a modern Rust toolchain (Rust 1.85+, Edition 2024 required by `alpm 5.0.2`):
 
 ```bash
 # On Arch Linux / CachyOS
-sudo pacman -S --needed base-devel git rust pacman
+sudo pacman -S --needed base-devel git rust pacman bubblewrap
 ```
 
 ### Build & Install

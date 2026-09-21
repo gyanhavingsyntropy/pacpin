@@ -36,9 +36,8 @@ use db::AlpmManager;
 use integrations::IntegrationsManager;
 use journal::TransactionJournal;
 use orphans::OrphanManager;
-use resolver::ResolverEngine;
-use glob::Pattern;
-use std::collections::BTreeMap;
+use resolver::{ResolverEngine, ResolvedPackage};
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
@@ -70,11 +69,14 @@ fn cmd_check(config: &Config) {
     let alpm = manager.handle();
     let local_pkgs = alpm.localdb().pkgs();
 
+    let glob_pins = ResolverEngine::compile_glob_pins(&config.pins);
+    let syncdb_map: HashMap<&str, &alpm::Db> = alpm.syncdbs().into_iter().map(|d| (d.name(), d)).collect();
+
     let mut custom_pkgs = Vec::new();
     for p in local_pkgs {
-        if let Some(target_repo) = ResolverEngine::is_pinned(p.name(), &config.pins) {
+        if let Some(target_repo) = ResolverEngine::match_pinned_package(p.name(), &config.pins, &glob_pins) {
             let mut cand_ver = "pinned".to_string();
-            if let Some(db) = alpm.syncdbs().into_iter().find(|d| d.name() == target_repo) {
+            if let Some(&db) = syncdb_map.get(target_repo.as_str()) {
                 if let Ok(cand) = db.pkg(p.name()) {
                     cand_ver = cand.version().to_string();
                 }
@@ -319,50 +321,88 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
             .collect();
     }
 
+    let mut applied_updates: Vec<ResolvedPackage> = Vec::new();
+    let mut executed_commands: Vec<String> = Vec::new();
     let mut exit_status = Ok(std::process::ExitStatus::default());
-    let mut success = true;
+    let mut all_success = true;
 
     if !pacman_targets.is_empty() {
         let mut args = vec!["pacman", "-S", "--needed", "--noconfirm"];
         args.extend(pacman_targets.iter().map(|s| s.as_str()));
         let status = Command::new("sudo").args(&args).status();
         match status {
-            Ok(s) if s.success() => {}
+            Ok(s) if s.success() => {
+                for u in &updates {
+                    if let Some(cand) = &u.candidate {
+                        if !cand.is_aur {
+                            applied_updates.push(u.clone());
+                        }
+                    }
+                }
+                executed_commands.push(format!(
+                    "sudo pacman -S --needed --noconfirm {}",
+                    pacman_targets.join(" ")
+                ));
+            }
             Ok(s) => {
                 exit_status = Ok(s);
-                success = false;
+                all_success = false;
             }
             Err(e) => {
                 exit_status = Err(e);
-                success = false;
+                all_success = false;
             }
         }
     }
 
-    if success && !aur_targets.is_empty() {
+    if all_success && !aur_targets.is_empty() {
         let helper = &config.options.helper;
         let mut args = vec!["-S", "--needed", "--aur", "--noconfirm"];
         args.extend(aur_targets.iter().map(|s| s.as_str()));
         let status = Command::new(helper).args(&args).status();
         match status {
-            Ok(s) if s.success() => {}
+            Ok(s) if s.success() => {
+                for u in &updates {
+                    if let Some(cand) = &u.candidate {
+                        if cand.is_aur {
+                            applied_updates.push(u.clone());
+                        }
+                    }
+                }
+                executed_commands.push(format!(
+                    "{} -S --needed --aur --noconfirm {}",
+                    helper,
+                    aur_targets.join(" ")
+                ));
+            }
             Ok(s) => {
                 exit_status = Ok(s);
-                success = false;
+                all_success = false;
             }
             Err(e) => {
                 exit_status = Err(e);
-                success = false;
+                all_success = false;
             }
         }
     }
 
-    if success && !external_updates.is_empty() {
+    if all_success && !external_updates.is_empty() {
         IntegrationsManager::execute_upgrades(&ext_providers, &external_updates);
+        for p in &ext_providers {
+            let p_updates: Vec<integrations::ExternalUpdate> = external_updates
+                .iter()
+                .filter(|u| u.runner == p.name())
+                .cloned()
+                .collect();
+            if !p_updates.is_empty() {
+                executed_commands.push(p.upgrade_command_str(&p_updates));
+            }
+        }
     }
 
-    if success {
-        let tx_packages: Vec<serde_json::Value> = updates
+    // Journal any packages that were successfully applied to disk
+    if !applied_updates.is_empty() {
+        let tx_packages: Vec<serde_json::Value> = applied_updates
             .iter()
             .map(|u| {
                 let cand = u.candidate.as_ref();
@@ -376,9 +416,19 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
                 })
             })
             .collect();
-        let _ = TransactionJournal::record_transaction("upgrade", tx_packages, &full_cmd);
+        let cmd_to_record = if executed_commands.is_empty() {
+            full_cmd.clone()
+        } else {
+            executed_commands.join(" && ")
+        };
+        let _ = TransactionJournal::record_transaction("upgrade", tx_packages, &cmd_to_record);
 
-        // Execute orphan removal ONLY AFTER successful upgrade
+        // Inspect kernel and running services for post-upgrade restart advisory on applied packages
+        restart::RestartInspector::print_restart_advisory(&applied_updates);
+    }
+
+    if all_success {
+        // Execute orphan removal ONLY AFTER full successful upgrade
         if !selected_orphans.is_empty() {
             OrphanManager::execute_removal(&selected_orphans);
         }
@@ -390,9 +440,6 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
             .filter(|name| !selected_orphans.contains(name))
             .collect();
         OrphanManager::save_known(&remaining_orphans);
-
-        // Inspect kernel and running services for post-upgrade restart advisory (zero noise if none)
-        restart::RestartInspector::print_restart_advisory(&updates);
     } else {
         match exit_status {
             Ok(s) => exit(s.code().unwrap_or(1)),
@@ -501,10 +548,6 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
         }
     }
 
-    if new_pins_added && !dry_run {
-        let _ = save_config(&config);
-    }
-
     let mut command_strs = Vec::new();
     if refresh {
         command_strs.push("sudo pacman -Sy".to_string());
@@ -548,8 +591,10 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
     }
 
     println!("\n{} {}", ":: Executing:".cyan(), full_cmd.bold());
+    let mut installed_targets: Vec<String> = Vec::new();
+    let mut executed_commands: Vec<String> = Vec::new();
     let mut exit_status = Ok(std::process::ExitStatus::default());
-    let mut success = true;
+    let mut all_success = true;
 
     if !pacman_targets.is_empty() {
         let mut args = vec!["pacman", "-S"];
@@ -562,19 +607,27 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
         args.extend(pacman_targets.iter().map(|s| s.as_str()));
         let status = Command::new("sudo").args(&args).status();
         match status {
-            Ok(s) if s.success() => {}
+            Ok(s) if s.success() => {
+                installed_targets.extend(pacman_targets.clone());
+                executed_commands.push(format!(
+                    "sudo pacman -S{}{}{}",
+                    if needed { " --needed" } else { "" },
+                    if noconfirm { " --noconfirm" } else { "" },
+                    format!(" {}", pacman_targets.join(" "))
+                ));
+            }
             Ok(s) => {
                 exit_status = Ok(s);
-                success = false;
+                all_success = false;
             }
             Err(e) => {
                 exit_status = Err(e);
-                success = false;
+                all_success = false;
             }
         }
     }
 
-    if success && !aur_targets.is_empty() {
+    if all_success && !aur_targets.is_empty() {
         let helper = &config.options.helper;
         let mut args = vec!["-S", "--aur"];
         if needed {
@@ -586,20 +639,36 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
         args.extend(aur_targets.iter().map(|s| s.as_str()));
         let status = Command::new(helper).args(&args).status();
         match status {
-            Ok(s) if s.success() => {}
+            Ok(s) if s.success() => {
+                installed_targets.extend(aur_targets.clone());
+                executed_commands.push(format!(
+                    "{} -S --aur{}{}{}",
+                    helper,
+                    if needed { " --needed" } else { "" },
+                    if noconfirm { " --noconfirm" } else { "" },
+                    format!(" {}", aur_targets.join(" "))
+                ));
+            }
             Ok(s) => {
                 exit_status = Ok(s);
-                success = false;
+                all_success = false;
             }
             Err(e) => {
                 exit_status = Err(e);
-                success = false;
+                all_success = false;
             }
         }
     }
 
-    if success {
-        let tx_packages: Vec<serde_json::Value> = targets
+    if !installed_targets.is_empty() {
+        if new_pins_added && !dry_run {
+            if let Err(e) = save_config(&config) {
+                eprintln!("{}", format!("Warning: Failed to save pins to configuration: {}", e).yellow());
+            } else {
+                println!("{}", "✔ Configuration updated with new repository pins.".green());
+            }
+        }
+        let tx_packages: Vec<serde_json::Value> = installed_targets
             .iter()
             .map(|t| {
                 serde_json::json!({
@@ -608,8 +677,15 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
                 })
             })
             .collect();
-        let _ = TransactionJournal::record_transaction("install", tx_packages, &full_cmd);
-    } else {
+        let cmd_to_record = if executed_commands.is_empty() {
+            full_cmd.clone()
+        } else {
+            executed_commands.join(" && ")
+        };
+        let _ = TransactionJournal::record_transaction("install", tx_packages, &cmd_to_record);
+    }
+
+    if !all_success {
         match exit_status {
             Ok(s) => exit(s.code().unwrap_or(1)),
             Err(e) => {
@@ -629,7 +705,6 @@ fn cmd_list(config: &Config) {
             exit(1);
         }
     };
-    let resolver = ResolverEngine::new(&manager);
 
     println!("\n{}", "Active Engine Features:".bold());
     println!(
@@ -717,13 +792,32 @@ fn cmd_list(config: &Config) {
         }
     }
 
-    let res = resolver.resolve_all(config);
-    let mut custom_matches: Vec<_> = res
-        .packages
-        .values()
-        .filter(|p| p.state == "custom")
-        .collect();
-    custom_matches.sort_by(|a, b| a.name.cmp(&b.name));
+    let alpm = manager.handle();
+    let local_pkgs = alpm.localdb().pkgs();
+    let glob_pins = ResolverEngine::compile_glob_pins(&config.pins);
+    let glob_delays = ResolverEngine::compile_glob_delays(&config.delay);
+    let syncdb_map: HashMap<&str, &alpm::Db> = alpm.syncdbs().into_iter().map(|d| (d.name(), d)).collect();
+    let installed_dbs = ResolverEngine::load_installed_dbs();
+
+    let mut custom_matches = Vec::new();
+    for p in local_pkgs {
+        if let Some((_, target_repo, _)) = ResolverEngine::find_matching_pin_rule(p.name(), &config.pins, &glob_pins) {
+            let inst_db = installed_dbs.get(p.name()).cloned().unwrap_or_default();
+            let mut cand_info = None;
+            if let Some(&db) = syncdb_map.get(target_repo.as_str()) {
+                if let Ok(cand) = db.pkg(p.name()) {
+                    cand_info = Some((target_repo.clone(), cand.version().to_string()));
+                }
+            }
+            let delay_info = if config.features.stability_delays {
+                ResolverEngine::match_delay_days(p.name(), &config.delay, &glob_delays)
+            } else {
+                None
+            };
+            custom_matches.push((p.name().to_string(), p.version().to_string(), inst_db, target_repo, cand_info, delay_info));
+        }
+    }
+    custom_matches.sort_by(|a, b| a.0.cmp(&b.0));
 
     if !custom_matches.is_empty() {
         println!(
@@ -734,28 +828,28 @@ fn cmd_list(config: &Config) {
             )
             .bold()
         );
-        for m in custom_matches {
-            let mut status_str = if let Some(ref cand) = m.candidate {
-                format!("➔ [{}] {}", cand.repo, cand.version)
+        for (name, installed_ver, inst_db, pinned_repo, cand_info, delay_info) in custom_matches {
+            let mut status_str = if let Some((repo, version)) = cand_info {
+                format!("➔ [{}] {}", repo, version)
             } else {
                 format!(
                     "➔ {}",
-                    format!("[{}] NOT FOUND", m.pinned_repo.as_deref().unwrap_or("?")).red()
+                    format!("[{}] NOT FOUND", pinned_repo).red()
                 )
             };
-            if m.held {
-                status_str.push_str(&format!(" {}", format!("[DELAYED - {}]", m.hold_reason).yellow()));
+            if let Some(days) = delay_info {
+                status_str.push_str(&format!(" {}", format!("[DELAYED - {}d buffer]", days).yellow()));
             }
-            let inst_db = if !m.installed_db.is_empty() {
-                format!(" (installed from [{}])", m.installed_db)
+            let inst_db_str = if !inst_db.is_empty() {
+                format!(" (installed from [{}])", inst_db)
             } else {
                 String::new()
             };
             println!(
                 "  ✔ {:<28} : {}{} {}",
-                m.name.bold(),
-                m.installed_ver,
-                inst_db,
+                name.bold(),
+                installed_ver,
+                inst_db_str,
                 status_str
             );
         }
@@ -861,14 +955,32 @@ fn cmd_pin(mut config: Config, repo: String, patterns: Vec<String>) {
     }
 
     let mut to_pin = patterns.clone();
-    if repo != "aur" && patterns.len() == 1 && !patterns[0].contains('*') && !patterns[0].contains('?') && !patterns[0].contains('[') {
-        let companions = manager.find_companions(&patterns[0], &repo, &config.pins);
-        if !companions.is_empty() {
-            let title = format!(
-                "'{}' has companion packages in [{}] to avoid version mismatches",
-                patterns[0], repo
-            );
-            let selected = prompt_multiselect(&title, &repo, &companions);
+    if repo != "aur" {
+        let mut all_companions = Vec::new();
+        let existing_set: std::collections::HashSet<String> = to_pin.iter().cloned().collect();
+        for pat in &patterns {
+            if !pat.contains('*') && !pat.contains('?') && !pat.contains('[') {
+                let companions = manager.find_companions(pat, &repo, &config.pins);
+                for c in companions {
+                    if !existing_set.contains(&c) && !all_companions.contains(&c) {
+                        all_companions.push(c);
+                    }
+                }
+            }
+        }
+        if !all_companions.is_empty() {
+            let title = if patterns.len() == 1 {
+                format!(
+                    "'{}' has companion packages in [{}] to avoid version mismatches",
+                    patterns[0], repo
+                )
+            } else {
+                format!(
+                    "Target packages have companion packages in [{}] to avoid version mismatches",
+                    repo
+                )
+            };
+            let selected = prompt_multiselect(&title, &repo, &all_companions);
             to_pin.extend(selected);
         }
     }
@@ -919,8 +1031,8 @@ fn cmd_unpin(mut config: Config, pattern: &str) {
 fn cmd_delay(mut config: Config, pkg: &str, days: u32) {
     print_banner();
 
-    if !crate::journal::TransactionJournal::is_safe_pkg_name(pkg) {
-        eprintln!("{}", format!("Error: Invalid package name '{}'.", pkg).red().bold());
+    if !crate::utils::is_safe_pattern(pkg) {
+        eprintln!("{}", format!("Error: Invalid package or pattern '{}'.", pkg).red().bold());
         exit(1);
     }
 
@@ -942,14 +1054,16 @@ fn cmd_delay(mut config: Config, pkg: &str, days: u32) {
         format!("✔ Set {}-day stability delay on '{}'.", days, pkg).green()
     );
 
-    let dependents = manager.get_dependents(pkg);
-    if !dependents.is_empty() {
-        println!(
-            "{}",
-            ":: Notice: The following installed package(s) will also be held during this window to prevent ABI breakage:".cyan()
-        );
-        for d in dependents {
-            println!("    • {}", d.yellow());
+    if !pkg.contains('*') && !pkg.contains('?') && !pkg.contains('[') {
+        let dependents = manager.get_dependents(pkg);
+        if !dependents.is_empty() {
+            println!(
+                "{}",
+                ":: Notice: The following installed package(s) will also be held during this window to prevent ABI breakage:".cyan()
+            );
+            for d in dependents {
+                println!("    • {}", d.yellow());
+            }
         }
     }
 }
@@ -1128,9 +1242,15 @@ fn cmd_orphans(clean: bool, noconfirm: bool) {
 
 
 pub fn is_command_available(cmd: &str) -> bool {
+    let p = Path::new(cmd);
+    if p.is_absolute() {
+        return crate::utils::is_executable_file(p);
+    }
+
     if let Ok(path) = env::var("PATH") {
         for dir in env::split_paths(&path) {
-            if dir.join(cmd).is_file() {
+            let candidate = dir.join(cmd);
+            if crate::utils::is_executable_file(&candidate) {
                 return true;
             }
         }
@@ -1142,15 +1262,8 @@ pub fn find_matching_pin(
     pkg: &str,
     pins: &BTreeMap<String, String>,
 ) -> Option<(String, String, bool)> {
-    if let Some(repo) = pins.get(pkg) {
-        return Some((pkg.to_string(), repo.clone(), true));
-    }
-    for (pat, repo) in pins {
-        if Pattern::new(pat).map(|p| p.matches(pkg)).unwrap_or(false) {
-            return Some((pat.clone(), repo.clone(), false));
-        }
-    }
-    None
+    let glob_pins = ResolverEngine::compile_glob_pins(pins);
+    ResolverEngine::find_matching_pin_rule(pkg, pins, &glob_pins)
 }
 
 fn check_and_prompt_smart_unpin(mut config: Config, removed_pkgs: &[String], noconfirm: bool) {
@@ -1605,6 +1718,61 @@ fn print_version() {
     println!("There is NO WARRANTY, to the extent permitted by law.");
 }
 
+pub fn is_upgrade_invocation(args: &[String]) -> bool {
+    if args.is_empty() {
+        return false;
+    }
+    let first = &args[0];
+    if first == "upgrade" || first == "up" {
+        return true;
+    }
+    if !first.starts_with("-S") {
+        return false;
+    }
+
+    // Has any non-flag target arguments?
+    let has_targets = args.iter().skip(1).any(|a| !a.starts_with('-'));
+    if has_targets {
+        return false;
+    }
+
+    // Collect all short flag characters across all args that start with '-' (and not '--')
+    let mut flags = std::collections::HashSet::new();
+    for a in args {
+        if a.starts_with('-') && !a.starts_with("--") {
+            for c in a[1..].chars() {
+                flags.insert(c);
+            }
+        }
+    }
+
+    // Reject if other -S sub-operations are requested:
+    // s (search), i (info), w (downloadonly), p (print-uris), l (list), g (groups), c (clean without u)
+    if flags.contains(&'s')
+        || flags.contains(&'i')
+        || flags.contains(&'w')
+        || flags.contains(&'p')
+        || flags.contains(&'l')
+        || flags.contains(&'g')
+        || (flags.contains(&'c') && !flags.contains(&'u'))
+        || args.iter().any(|a| {
+            a == "--search"
+                || a == "--info"
+                || a == "--downloadonly"
+                || a == "--print"
+                || a == "--print-uris"
+                || a == "--list"
+                || a == "--groups"
+        })
+    {
+        return false;
+    }
+
+    // It's an upgrade if flags contains 'u' or 'y' or long options
+    flags.contains(&'u')
+        || flags.contains(&'y')
+        || args.iter().any(|a| a == "--sysupgrade" || a == "--refresh")
+}
 
 fn main() {
     if std::env::var_os("NO_COLOR").is_some()
@@ -1665,42 +1833,52 @@ fn main() {
         exit(0);
     } else if cmd == "check" || cmd == "-Qu" {
         cmd_check(&config);
-    } else if cmd == "upgrade"
-        || cmd == "-Syu"
-        || cmd == "up"
-        || (cmd.starts_with("-S")
-            && (cmd.contains('u') || cmd.contains('y'))
-            && !cmd.starts_with("-Ss")
-            && !cmd.starts_with("-Si")
-            && !cmd.starts_with("-Sc")
-            && !cmd.starts_with("-Sw")
-            && !cmd.starts_with("-Sg")
-            && !args.iter().skip(1).any(|a| !a.starts_with('-')))
-    {
-        let dry_run = args.iter().any(|a| a == "-n" || a == "--dry-run");
-        let refresh = args.iter().any(|a| a == "-y" || a == "--refresh") || cmd.contains('y');
+    } else if is_upgrade_invocation(&args) {
+        let dry_run = args.iter().any(|a| a == "-n" || a == "--dry-run")
+            || args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains('n'));
+        let refresh = args.iter().any(|a| a == "-y" || a == "--refresh")
+            || args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains('y'));
         let noconfirm = args.iter().any(|a| a == "--noconfirm");
-        let autoremove = args.iter().any(|a| a == "-c" || a == "--clean" || a == "--autoremove") || cmd.contains('c');
+        let autoremove = args.iter().any(|a| a == "-c" || a == "--clean" || a == "--autoremove")
+            || args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains('c'));
         cmd_upgrade(&config, dry_run, refresh, noconfirm, autoremove);
-    } else if cmd == "search" || cmd == "-Ss" || (cmd.starts_with("-S") && cmd.contains('s')) {
+    } else if cmd == "search"
+        || cmd == "-Ss"
+        || (cmd.starts_with("-S")
+            && (cmd.contains('s') || args.iter().any(|a| a == "-s" || a == "--search")))
+    {
         let query_args: Vec<String> = if cmd.starts_with("-S") {
             let mut q = Vec::new();
-            if cmd.len() > 3 {
+            if cmd.len() > 3 && cmd.starts_with("-Ss") {
                 q.push(cmd[3..].to_string());
             }
-            q.extend(args.iter().skip(1).cloned());
+            q.extend(
+                args.iter()
+                    .skip(1)
+                    .filter(|a| *a != "-s" && *a != "--search" && !a.starts_with("-Ss"))
+                    .cloned(),
+            );
             q
         } else {
             args.iter().skip(1).cloned().collect()
         };
         cmd_search(&config, &query_args);
-    } else if cmd == "info" || cmd == "-Si" || (cmd.starts_with("-S") && cmd.contains('i')) {
+    } else if cmd == "info"
+        || cmd == "-Si"
+        || (cmd.starts_with("-S")
+            && (cmd.contains('i') || args.iter().any(|a| a == "-i" || a == "--info")))
+    {
         let pkg_args: Vec<String> = if cmd.starts_with("-S") {
             let mut p = Vec::new();
-            if cmd.len() > 3 {
+            if cmd.len() > 3 && cmd.starts_with("-Si") {
                 p.push(cmd[3..].to_string());
             }
-            p.extend(args.iter().skip(1).cloned());
+            p.extend(
+                args.iter()
+                    .skip(1)
+                    .filter(|a| *a != "-i" && *a != "--info" && !a.starts_with("-Si"))
+                    .cloned(),
+            );
             p
         } else {
             args.iter().skip(1).cloned().collect()
@@ -1710,11 +1888,19 @@ fn main() {
         || cmd == "clean-cache"
         || cmd == "-Sc"
         || cmd == "-Scc"
-        || (cmd.starts_with("-S") && cmd.contains('c') && !cmd.contains('u') && !args.iter().skip(1).any(|a| !a.starts_with('-')))
+        || (cmd.starts_with("-S")
+            && (cmd.contains('c') || args.iter().any(|a| a == "-c" || a == "--clean"))
+            && !is_upgrade_invocation(&args)
+            && !args.iter().skip(1).any(|a| !a.starts_with('-')))
     {
-        let extra_args: Vec<String> = args.iter().skip(1).cloned().collect();
+        let extra_args: Vec<String> = args
+            .iter()
+            .skip(1)
+            .filter(|a| *a != "-c" && *a != "--clean" && !a.starts_with("-Sc"))
+            .cloned()
+            .collect();
         cmd_clean(&config, &extra_args);
-    } else if cmd.starts_with("-Sw") {
+    } else if cmd.starts_with("-Sw") || (cmd.starts_with("-S") && args.iter().any(|a| a == "-w" || a == "--downloadonly")) {
         check_pacman_lock();
         let status = Command::new("sudo").arg("pacman").args(&args).status();
         match status {
@@ -1726,7 +1912,7 @@ fn main() {
         }
     } else if cmd == "-Sp"
         || (cmd.starts_with("-S") && cmd.contains('p'))
-        || (cmd.starts_with("-S") && args.iter().any(|a| a == "-p" || a == "--print-uris"))
+        || (cmd.starts_with("-S") && args.iter().any(|a| a == "-p" || a == "--print-uris" || a == "--print"))
     {
         let targets: Vec<String> = args
             .iter()
@@ -1854,24 +2040,40 @@ fn main() {
         }
         TransactionJournal::rollback(tx_id, dry_run);
     } else if cmd == "try" || cmd == "run" {
-        if args.len() < 2 {
-            eprintln!("{}", "Error: 'pacpin try' requires a package name.".red().bold());
-            eprintln!("Usage: pacpin try <package> [arguments...]");
-            eprintln!("Example: pacpin try btop");
-            eprintln!("         pacpin try tree -- -L 2");
+        let try_args = &args[1..];
+        let no_sandbox = try_args
+            .iter()
+            .any(|a| a == "--no-sandbox" || a == "--bare" || a == "--unsandboxed");
+        let remaining: Vec<String> = try_args
+            .iter()
+            .filter(|a| *a != "--no-sandbox" && *a != "--bare" && *a != "--unsandboxed")
+            .cloned()
+            .collect();
+
+        if remaining.is_empty() {
+            eprintln!("{}", "Error: 'pacpin try' requires a package target.".red().bold());
+            eprintln!("Usage: pacpin try [--no-sandbox] [repo/]package [arguments...]");
+            eprintln!("Options:");
+            eprintln!("  --no-sandbox, --bare   Bypass Bubblewrap containerization and run with host environment isolation");
+            eprintln!("Examples:");
+            eprintln!("  pacpin try jq . foo.json");
+            eprintln!("  pacpin try --no-sandbox micro ~/.bashrc");
+            eprintln!("  pacpin try flatpak/org.gnome.Calculator");
+            eprintln!("  pacpin try nix/ripgrep -i 'foo'");
             exit(1);
         }
-        let pkg = &args[1];
-        let sub_args = if args.len() > 2 {
-            if args[2] == "--" {
-                args[3..].to_vec()
+
+        let pkg = &remaining[0];
+        let sub_args = if remaining.len() > 1 {
+            if remaining[1] == "--" {
+                remaining[2..].to_vec()
             } else {
-                args[2..].to_vec()
+                remaining[1..].to_vec()
             }
         } else {
             Vec::new()
         };
-        sandbox::cmd_try(pkg, &sub_args);
+        sandbox::cmd_try(pkg, &sub_args, no_sandbox);
     } else if cmd == "needrestart" || cmd == "restart-check" {
         restart::RestartInspector::print_restart_advisory(&[]);
         exit(0);
@@ -2036,18 +2238,40 @@ mod tests {
     }
 
     #[test]
+    fn test_is_command_available_permissions() {
+        let temp_dir = std::env::temp_dir();
+        let non_exec = temp_dir.join(format!("pacpin_non_exec_test_{}", std::process::id()));
+        std::fs::write(&non_exec, b"#!/bin/sh\necho hi\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&non_exec).unwrap().permissions();
+            perms.set_mode(0o644); // No executable bit
+            std::fs::set_permissions(&non_exec, perms).unwrap();
+        }
+        assert!(!is_command_available(&non_exec.to_string_lossy()));
+        let _ = std::fs::remove_file(&non_exec);
+    }
+
+    #[test]
     fn test_find_matching_pin_exact_and_glob() {
         let mut pins = BTreeMap::new();
         pins.insert("mesa".to_string(), "core".to_string());
+        pins.insert("linux-*".to_string(), "extra".to_string());
         pins.insert("linux-firmware*".to_string(), "cachyos".to_string());
 
         assert_eq!(
             find_matching_pin("mesa", &pins),
             Some(("mesa".to_string(), "core".to_string(), true))
         );
+        // Specificity tie-break: "linux-firmware*" must beat "linux-*" despite ASCII key order
         assert_eq!(
             find_matching_pin("linux-firmware-intel", &pins),
             Some(("linux-firmware*".to_string(), "cachyos".to_string(), false))
+        );
+        assert_eq!(
+            find_matching_pin("linux-zen", &pins),
+            Some(("linux-*".to_string(), "extra".to_string(), false))
         );
         assert_eq!(find_matching_pin("git", &pins), None);
     }
@@ -2124,5 +2348,41 @@ mod tests {
             .collect();
 
         assert_eq!(pure, vec!["pure-orphan"]);
+    }
+
+    #[test]
+    fn test_is_upgrade_invocation() {
+        let to_vec = |slice: &[&str]| slice.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Valid upgrade forms
+        assert!(is_upgrade_invocation(&to_vec(&["upgrade"])));
+        assert!(is_upgrade_invocation(&to_vec(&["up"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-Syu"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-Suy"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-Su"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-Sy"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-Syuu"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-S", "-y", "-u"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-S", "-u", "-y"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-S", "-u"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-S", "-y"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-S", "-u", "-n"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-Syu", "--noconfirm"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-S", "--sysupgrade"])));
+
+        // Non-upgrade forms (should not match upgrade)
+        assert!(!is_upgrade_invocation(&to_vec(&["-S"])));
+        assert!(!is_upgrade_invocation(&to_vec(&["-S", "ripgrep"])));
+        assert!(!is_upgrade_invocation(&to_vec(&["-Syu", "ripgrep"])));
+        assert!(!is_upgrade_invocation(&to_vec(&["-Ss", "ripgrep"])));
+        assert!(!is_upgrade_invocation(&to_vec(&["-S", "-s", "ripgrep"])));
+        assert!(!is_upgrade_invocation(&to_vec(&["-Si", "ripgrep"])));
+        assert!(!is_upgrade_invocation(&to_vec(&["-S", "-i", "ripgrep"])));
+        assert!(!is_upgrade_invocation(&to_vec(&["-Sc"])));
+        assert!(!is_upgrade_invocation(&to_vec(&["-S", "-c"])));
+        assert!(!is_upgrade_invocation(&to_vec(&["-Sw", "ripgrep"])));
+        assert!(!is_upgrade_invocation(&to_vec(&["-Sp", "ripgrep"])));
+        assert!(!is_upgrade_invocation(&to_vec(&["check"])));
+        assert!(!is_upgrade_invocation(&to_vec(&["-Qu"])));
     }
 }

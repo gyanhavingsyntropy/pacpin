@@ -36,8 +36,77 @@ pub fn is_safe_version(ver: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '+' || c == '-' || c == ':' || c == '~')
 }
 
+pub const KERNEL_PACKAGES: &[&str] = &[
+    "linux",
+    "linux-lts",
+    "linux-zen",
+    "linux-hardened",
+    "linux-cachyos",
+    "linux-cachyos-lts",
+    "linux-cachyos-server",
+    "linux-cachyos-bore",
+    "linux-xanmod",
+    "linux-rt",
+    "linux-rt-lts",
+    "linux-tkg",
+    "linux-bochs",
+];
+
+pub fn is_kernel_package(name: &str) -> bool {
+    if name == "linux-firmware" || name.starts_with("linux-firmware-") {
+        return false;
+    }
+    KERNEL_PACKAGES.iter().any(|k| {
+        if *k == "linux" {
+            name == "linux" || name == "linux-headers" || name == "linux-docs"
+        } else {
+            name == *k || name.starts_with(&format!("{}-", k))
+        }
+    })
+}
+
+pub fn is_safe_pattern(pat: &str) -> bool {
+    !pat.is_empty()
+        && !pat.starts_with('.')
+        && !pat.starts_with('-')
+        && !pat.contains('/')
+        && !pat.contains('\\')
+        && !pat.contains("..")
+        && pat.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || c == '.'
+                || c == '_'
+                || c == '+'
+                || c == '-'
+                || c == '@'
+                || c == '*'
+                || c == '?'
+                || c == '['
+                || c == ']'
+        })
+}
+
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+pub fn is_executable_file(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode();
+            return (mode & 0o111) != 0;
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -78,4 +147,30 @@ mod tests {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote("; rm -rf /"), "'; rm -rf /'");
     }
+
+    #[test]
+    fn test_is_kernel_package() {
+        assert!(is_kernel_package("linux"));
+        assert!(is_kernel_package("linux-headers"));
+        assert!(is_kernel_package("linux-lts"));
+        assert!(is_kernel_package("linux-zen"));
+        assert!(is_kernel_package("linux-cachyos"));
+        assert!(is_kernel_package("linux-cachyos-bore"));
+        assert!(is_kernel_package("linux-xanmod"));
+        assert!(!is_kernel_package("linux-firmware"));
+        assert!(!is_kernel_package("util-linux"));
+    }
+
+    #[test]
+    fn test_is_safe_pattern() {
+        assert!(is_safe_pattern("linux*"));
+        assert!(is_safe_pattern("linux-*"));
+        assert!(is_safe_pattern("*nvidia*"));
+        assert!(is_safe_pattern("mesa?"));
+        assert!(!is_safe_pattern(""));
+        assert!(!is_safe_pattern("; rm -rf /"));
+        assert!(!is_safe_pattern("../foo"));
+        assert!(!is_safe_pattern("/etc/*"));
+    }
 }
+

@@ -346,8 +346,8 @@ fn render_checkbox_ui<W: Write>(
 
         // Label and description with truncation if needed
         let label_width = 24;
-        let label_str = if item.label.len() > label_width {
-            format!("{}…", &item.label[..label_width - 1])
+        let label_str = if item.label.chars().count() > label_width {
+            crate::ui::truncate_str(&item.label, label_width)
         } else {
             format!("{:<width$}", item.label, width = label_width)
         };
@@ -355,8 +355,8 @@ fn render_checkbox_ui<W: Write>(
         // Calculate available description width
         // pointer (3) + box_glyph (3) + 1 + num (3) + 1 + label_width (24) + 1 + tag (2) = 38
         let desc_max = inner_width.saturating_sub(42);
-        let desc_str = if item.description.len() > desc_max && desc_max > 3 {
-            format!("{}…", &item.description[..desc_max - 1])
+        let desc_str = if item.description.chars().count() > desc_max && desc_max > 3 {
+            crate::ui::truncate_str(&item.description, desc_max)
         } else {
             item.description.clone()
         };
@@ -506,5 +506,18 @@ mod tests {
         assert!(!items[0].checked);
         assert!(items[1].checked);
         assert!(!items[2].checked);
+    }
+
+    #[test]
+    fn test_multibyte_utf8_truncation() {
+        let label = "🚀🦀日本語ラベル";
+        let truncated = crate::ui::truncate_str(label, 5);
+        assert!(truncated.ends_with('…'));
+        assert_eq!(truncated.chars().count(), 5);
+
+        let desc = "这是一个很长的描述字符串用于测试中文字符截断边界";
+        let desc_trunc = crate::ui::truncate_str(desc, 10);
+        assert!(desc_trunc.ends_with('…'));
+        assert_eq!(desc_trunc.chars().count(), 10);
     }
 }

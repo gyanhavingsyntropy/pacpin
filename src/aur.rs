@@ -26,6 +26,8 @@ pub struct AurItem {
     pub version: String,
     #[serde(rename = "Description")]
     pub description: Option<String>,
+    #[serde(rename = "LastModified", default)]
+    pub last_modified: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

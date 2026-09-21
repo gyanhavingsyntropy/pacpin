@@ -107,8 +107,6 @@ impl TransactionJournal {
                                 if canon.starts_with(&c_dir_canon) {
                                     return Some(entry);
                                 }
-                            } else if entry.starts_with(c_dir) {
-                                return Some(entry);
                             }
                         }
                     }
@@ -408,5 +406,12 @@ mod tests {
 
         assert_eq!(TransactionJournal::get_last_transaction_id(&tmp), Some(42));
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_find_cached_package_rejection() {
+        // Non-existent or traversal versions/names are rejected immediately
+        assert_eq!(TransactionJournal::find_cached_package("../etc", "1.0"), None);
+        assert_eq!(TransactionJournal::find_cached_package("pacpin-nonexistent-xyz-pkg", "99.99"), None);
     }
 }

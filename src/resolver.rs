@@ -79,6 +79,7 @@ pub struct ResolvedPackage {
 pub struct ResolveResult {
     pub installed_count: usize,
     pub repos: Vec<String>,
+    #[allow(dead_code)]
     pub packages: HashMap<String, ResolvedPackage>,
     pub updates: Vec<ResolvedPackage>,
     pub held_packages: Vec<ResolvedPackage>,
@@ -94,25 +95,72 @@ impl<'a> ResolverEngine<'a> {
         Self { manager }
     }
 
-    pub fn is_pinned(pkg_name: &str, pins: &BTreeMap<String, String>) -> Option<String> {
+    pub fn find_matching_pin_rule(
+        pkg_name: &str,
+        pins: &BTreeMap<String, String>,
+        glob_pins: &[(String, Pattern, String)],
+    ) -> Option<(String, String, bool)> {
         if let Some(repo) = pins.get(pkg_name) {
-            return Some(repo.clone());
+            return Some((pkg_name.to_string(), repo.clone(), true));
         }
-        let mut sorted_pins: Vec<(&String, &String)> = pins
+        glob_pins
             .iter()
-            .filter(|(pat, _)| pat.contains('*') || pat.contains('?') || pat.contains('['))
-            .collect();
-        sorted_pins.sort_by_key(|(pat, _)| std::cmp::Reverse(pat.len()));
+            .find(|(_, pattern, _)| pattern.matches(pkg_name))
+            .map(|(pat, _, repo)| (pat.clone(), repo.clone(), false))
+    }
 
-        for (pat, repo) in sorted_pins {
-            if Pattern::new(pat)
-                .map(|p| p.matches(pkg_name))
-                .unwrap_or(false)
-            {
-                return Some((*repo).clone());
+    pub fn match_pinned_package(
+        pkg_name: &str,
+        pins: &BTreeMap<String, String>,
+        glob_pins: &[(String, Pattern, String)],
+    ) -> Option<String> {
+        Self::find_matching_pin_rule(pkg_name, pins, glob_pins).map(|(_, repo, _)| repo)
+    }
+
+    pub fn compile_glob_pins(pins: &BTreeMap<String, String>) -> Vec<(String, Pattern, String)> {
+        let mut glob_pins = Vec::new();
+        for (pat, repo) in pins {
+            if pat.contains('*') || pat.contains('?') || pat.contains('[') {
+                if let Ok(p) = Pattern::new(pat) {
+                    glob_pins.push((pat.clone(), p, repo.clone()));
+                }
             }
         }
-        None
+        glob_pins.sort_by_key(|(pat, _, _)| std::cmp::Reverse(pat.len()));
+        glob_pins
+    }
+
+    #[allow(dead_code)]
+    pub fn is_pinned(pkg_name: &str, pins: &BTreeMap<String, String>) -> Option<String> {
+        let glob_pins = Self::compile_glob_pins(pins);
+        Self::match_pinned_package(pkg_name, pins, &glob_pins)
+    }
+
+    pub fn compile_glob_delays(delays: &BTreeMap<String, u32>) -> Vec<(String, Pattern, u32)> {
+        let mut glob_delays = Vec::new();
+        for (pat, days) in delays {
+            if pat.contains('*') || pat.contains('?') || pat.contains('[') {
+                if let Ok(p) = Pattern::new(pat) {
+                    glob_delays.push((pat.clone(), p, *days));
+                }
+            }
+        }
+        glob_delays.sort_by_key(|(pat, _, _)| std::cmp::Reverse(pat.len()));
+        glob_delays
+    }
+
+    pub fn match_delay_days(
+        pkg_name: &str,
+        delays: &BTreeMap<String, u32>,
+        glob_delays: &[(String, Pattern, u32)],
+    ) -> Option<u32> {
+        if let Some(days) = delays.get(pkg_name) {
+            return Some(*days);
+        }
+        glob_delays
+            .iter()
+            .find(|(_, pattern, _)| pattern.matches(pkg_name))
+            .map(|(_, _, days)| *days)
     }
 
     pub fn is_excluded(
@@ -218,17 +266,11 @@ impl<'a> ResolverEngine<'a> {
         let syncdbs_list: Vec<&alpm::Db> = alpm.syncdbs().into_iter().collect();
         let syncdb_map: HashMap<&str, &alpm::Db> = syncdbs_list.iter().map(|d| (d.name(), *d)).collect();
 
-        let mut glob_pins: Vec<(&str, Pattern, &str)> = Vec::new();
-        if config.features.pinning {
-            for (pat, repo) in &config.pins {
-                if pat.contains('*') || pat.contains('?') || pat.contains('[') {
-                    if let Ok(p) = Pattern::new(pat) {
-                        glob_pins.push((pat.as_str(), p, repo.as_str()));
-                    }
-                }
-            }
-            glob_pins.sort_by_key(|(pat, _, _)| std::cmp::Reverse(pat.len()));
-        }
+        let glob_pins = if config.features.pinning {
+            Self::compile_glob_pins(&config.pins)
+        } else {
+            Vec::new()
+        };
 
         let mut resolved: HashMap<String, ResolvedPackage> = HashMap::new();
         let mut unresolved_pins: Vec<(String, String)> = Vec::new();
@@ -262,14 +304,7 @@ impl<'a> ResolverEngine<'a> {
             }
 
             let pinned_repo = if config.features.pinning {
-                if let Some(repo) = config.pins.get(pkg_name) {
-                    Some(repo.clone())
-                } else {
-                    glob_pins
-                        .iter()
-                        .find(|(_, pattern, _)| pattern.matches(pkg_name))
-                        .map(|(_, _, repo)| (*repo).to_string())
-                }
+                Self::match_pinned_package(pkg_name, &config.pins, &glob_pins)
             } else {
                 None
             };
@@ -304,7 +339,7 @@ impl<'a> ResolverEngine<'a> {
                             csize: 0,
                             isize: 0,
                             desc: aur_pkg.description.clone().unwrap_or_default(),
-                            builddate: 0,
+                            builddate: aur_pkg.last_modified.unwrap_or(0),
                             is_aur: true,
                             depends: Vec::new(),
                         });
@@ -347,7 +382,7 @@ impl<'a> ResolverEngine<'a> {
                                 csize: 0,
                                 isize: 0,
                                 desc: aur_pkg.description.clone().unwrap_or_default(),
-                                builddate: 0,
+                                builddate: aur_pkg.last_modified.unwrap_or(0),
                                 is_aur: true,
                                 depends: Vec::new(),
                             });
@@ -407,7 +442,7 @@ impl<'a> ResolverEngine<'a> {
                                 csize: 0,
                                 isize: 0,
                                 desc: aur_pkg.description.clone().unwrap_or_default(),
-                                builddate: 0,
+                                builddate: aur_pkg.last_modified.unwrap_or(0),
                                 is_aur: true,
                                 depends: Vec::new(),
                             });
@@ -488,14 +523,15 @@ impl<'a> ResolverEngine<'a> {
         // Evaluate stability delay buffers
         let mut held_parents = HashMap::new();
         if config.features.stability_delays {
+            let glob_delays = Self::compile_glob_delays(&config.delay);
             for (pkg_name, item) in resolved.iter_mut() {
                 if !item.needs_update || item.candidate.is_none() {
                     continue;
                 }
-                if let Some(req_days) = config.delay.get(pkg_name) {
+                if let Some(req_days) = Self::match_delay_days(pkg_name, &config.delay, &glob_delays) {
                     let cand = item.candidate.as_ref().unwrap();
                     let cand_age = cand.age_days();
-                    let req_days_f = *req_days as f64;
+                    let req_days_f = req_days as f64;
                     if cand_age < req_days_f {
                         item.held = true;
                         let days_left = ((req_days_f - cand_age + 0.99) as u32).max(1);
@@ -589,5 +625,68 @@ mod tests {
         if std::path::Path::new("/var/lib/pacman/local").exists() {
             assert!(!dbs.is_empty());
         }
+    }
+
+    #[test]
+    fn test_candidate_package_age_days() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let cand_recent = CandidatePackage {
+            name: "test-pkg".to_string(),
+            version: "1.0".to_string(),
+            repo: "aur".to_string(),
+            base: "test-pkg".to_string(),
+            csize: 0,
+            isize: 0,
+            desc: "".to_string(),
+            builddate: now - 86400 * 2, // 2 days ago
+            is_aur: true,
+            depends: Vec::new(),
+        };
+        let age = cand_recent.age_days();
+        assert!(age >= 1.9 && age <= 2.1);
+
+        let cand_zero = CandidatePackage {
+            builddate: 0,
+            ..cand_recent
+        };
+        assert_eq!(cand_zero.age_days(), 9999.0);
+    }
+
+    #[test]
+    fn test_match_delay_days_exact_and_glob() {
+        let mut delays = BTreeMap::new();
+        delays.insert("linux".to_string(), 5);
+        delays.insert("linux-*".to_string(), 3);
+        delays.insert("*nvidia*".to_string(), 7);
+
+        let glob_delays = ResolverEngine::compile_glob_delays(&delays);
+
+        // Exact match takes precedence
+        assert_eq!(
+            ResolverEngine::match_delay_days("linux", &delays, &glob_delays),
+            Some(5)
+        );
+        // Glob pattern matches
+        assert_eq!(
+            ResolverEngine::match_delay_days("linux-zen", &delays, &glob_delays),
+            Some(3)
+        );
+        assert_eq!(
+            ResolverEngine::match_delay_days("linux-cachyos-bore", &delays, &glob_delays),
+            Some(3)
+        );
+        assert_eq!(
+            ResolverEngine::match_delay_days("nvidia-utils", &delays, &glob_delays),
+            Some(7)
+        );
+        // Non-matching
+        assert_eq!(
+            ResolverEngine::match_delay_days("mesa", &delays, &glob_delays),
+            None
+        );
     }
 }

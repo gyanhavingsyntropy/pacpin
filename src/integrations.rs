@@ -240,10 +240,7 @@ impl IntegrationProvider for PipxProvider {
             if out.status.success() {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
                     if let Some(venvs) = v.get("venvs").and_then(|v| v.as_object()) {
-                        let agent = ureq::AgentBuilder::new()
-                            .timeout(std::time::Duration::from_secs(2))
-                            .build();
-
+                        let mut targets = Vec::new();
                         for (app_name, info) in venvs {
                             let installed_ver = info.get("metadata")
                                 .and_then(|m| m.get("main_package"))
@@ -251,28 +248,43 @@ impl IntegrationProvider for PipxProvider {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
 
-                            if installed_ver.is_empty() {
-                                continue;
+                            if !installed_ver.is_empty() {
+                                targets.push((app_name.clone(), installed_ver.to_string()));
                             }
+                        }
 
-                            // Query PyPI JSON API for latest release
-                            let pypi_url = format!("https://pypi.org/pypi/{}/json", app_name);
-                            if let Ok(resp) = agent.get(&pypi_url).call() {
-                                if resp.status() == 200 {
-                                    if let Ok(json) = resp.into_json::<serde_json::Value>() {
-                                        if let Some(latest_ver) = json.get("info").and_then(|i| i.get("version")).and_then(|v| v.as_str()) {
-                                            if alpm::vercmp(latest_ver, installed_ver) == std::cmp::Ordering::Greater {
-                                                results.push(ExternalUpdate {
-                                                    runner: "Pipx".to_string(),
-                                                    id: app_name.clone(),
-                                                    name: app_name.clone(),
-                                                    repo: "pypi".to_string(),
-                                                    version: latest_ver.to_string(),
-                                                });
+                        let mut handles = Vec::new();
+                        for (app_name, installed_ver) in targets {
+                            handles.push(std::thread::spawn(move || {
+                                let pypi_url = format!("https://pypi.org/pypi/{}/json", app_name);
+                                if let Ok(resp) = ureq::get(&pypi_url)
+                                    .set("User-Agent", "pacpin/3.1 (GPLv3; +https://github.com/gyanhavingsyntropy/pacpin)")
+                                    .timeout(std::time::Duration::from_secs(3))
+                                    .call()
+                                {
+                                    if resp.status() == 200 {
+                                        if let Ok(json) = resp.into_json::<serde_json::Value>() {
+                                            if let Some(latest_ver) = json.get("info").and_then(|i| i.get("version")).and_then(|v| v.as_str()) {
+                                                if alpm::vercmp(latest_ver, &installed_ver) == std::cmp::Ordering::Greater {
+                                                    return Some(ExternalUpdate {
+                                                        runner: "Pipx".to_string(),
+                                                        id: app_name.clone(),
+                                                        name: app_name,
+                                                        repo: "pypi".to_string(),
+                                                        version: latest_ver.to_string(),
+                                                    });
+                                                }
                                             }
                                         }
                                     }
                                 }
+                                None
+                            }));
+                        }
+
+                        for h in handles {
+                            if let Ok(Some(update)) = h.join() {
+                                results.push(update);
                             }
                         }
                     }

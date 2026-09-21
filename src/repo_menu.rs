@@ -145,8 +145,8 @@ pub fn run_repo_menu(initial_repos: &[String]) -> Option<Vec<String>> {
                     // Navigation Up
                     KeyCode::Up | KeyCode::Char('k') => {
                         status_msg = None;
-                        if modifiers.contains(KeyModifiers::SHIFT) || code == KeyCode::Char('K') {
-                            // Move Up in Priority
+                        if modifiers.contains(KeyModifiers::SHIFT) {
+                            // Move Up in Priority (Shift+Up or Shift+k)
                             if selected > 0 {
                                 repos.swap(selected, selected - 1);
                                 selected -= 1;
@@ -158,8 +158,8 @@ pub fn run_repo_menu(initial_repos: &[String]) -> Option<Vec<String>> {
                     // Navigation Down
                     KeyCode::Down | KeyCode::Char('j') => {
                         status_msg = None;
-                        if modifiers.contains(KeyModifiers::SHIFT) || code == KeyCode::Char('J') {
-                            // Move Down in Priority
+                        if modifiers.contains(KeyModifiers::SHIFT) {
+                            // Move Down in Priority (Shift+Down or Shift+j)
                             if selected + 1 < repos.len() {
                                 repos.swap(selected, selected + 1);
                                 selected += 1;
