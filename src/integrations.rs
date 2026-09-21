@@ -253,38 +253,49 @@ impl IntegrationProvider for PipxProvider {
                             }
                         }
 
+                        let agent = ureq::AgentBuilder::new()
+                            .timeout(std::time::Duration::from_secs(3))
+                            .user_agent("pacpin/3.1 (GPLv3; +https://github.com/gyanhavingsyntropy/pacpin)")
+                            .build();
+
+                        let arc_targets = std::sync::Arc::new(targets);
+                        let num_workers = 4.min(arc_targets.len().max(1));
                         let mut handles = Vec::new();
-                        for (app_name, installed_ver) in targets {
+
+                        for worker_idx in 0..num_workers {
+                            let targets_clone = std::sync::Arc::clone(&arc_targets);
+                            let agent_clone = agent.clone();
                             handles.push(std::thread::spawn(move || {
-                                let pypi_url = format!("https://pypi.org/pypi/{}/json", app_name);
-                                if let Ok(resp) = ureq::get(&pypi_url)
-                                    .set("User-Agent", "pacpin/3.1 (GPLv3; +https://github.com/gyanhavingsyntropy/pacpin)")
-                                    .timeout(std::time::Duration::from_secs(3))
-                                    .call()
-                                {
-                                    if resp.status() == 200 {
-                                        if let Ok(json) = resp.into_json::<serde_json::Value>() {
-                                            if let Some(latest_ver) = json.get("info").and_then(|i| i.get("version")).and_then(|v| v.as_str()) {
-                                                if alpm::vercmp(latest_ver, &installed_ver) == std::cmp::Ordering::Greater {
-                                                    return Some(ExternalUpdate {
-                                                        runner: "Pipx".to_string(),
-                                                        id: app_name.clone(),
-                                                        name: app_name,
-                                                        repo: "pypi".to_string(),
-                                                        version: latest_ver.to_string(),
-                                                    });
+                                let mut worker_results = Vec::new();
+                                for (i, (app_name, installed_ver)) in targets_clone.iter().enumerate() {
+                                    if i % num_workers == worker_idx {
+                                        let pypi_url = format!("https://pypi.org/pypi/{}/json", app_name);
+                                        if let Ok(resp) = agent_clone.get(&pypi_url).call() {
+                                            if resp.status() == 200 {
+                                                if let Ok(json) = resp.into_json::<serde_json::Value>() {
+                                                    if let Some(latest_ver) = json.get("info").and_then(|info| info.get("version")).and_then(|v| v.as_str()) {
+                                                        if alpm::vercmp(latest_ver, installed_ver) == std::cmp::Ordering::Greater {
+                                                            worker_results.push(ExternalUpdate {
+                                                                runner: "Pipx".to_string(),
+                                                                id: app_name.clone(),
+                                                                name: app_name.clone(),
+                                                                repo: "pypi".to_string(),
+                                                                version: latest_ver.to_string(),
+                                                            });
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                                None
+                                worker_results
                             }));
                         }
 
                         for h in handles {
-                            if let Ok(Some(update)) = h.join() {
-                                results.push(update);
+                            if let Ok(updates) = h.join() {
+                                results.extend(updates);
                             }
                         }
                     }
@@ -392,7 +403,8 @@ impl IntegrationsManager {
     pub fn execute_upgrades(
         providers: &[Arc<dyn IntegrationProvider>],
         external_updates: &[ExternalUpdate],
-    ) {
+    ) -> Vec<(String, String, bool)> {
+        let mut outcomes = Vec::new();
         for p in providers {
             let p_updates: Vec<ExternalUpdate> = external_updates
                 .iter()
@@ -404,25 +416,30 @@ impl IntegrationsManager {
                 continue;
             }
 
+            let cmd_str = p.upgrade_command_str(&p_updates);
             println!(
                 "\n{} Upgrading {} ({} packages: {})...",
                 "::".cyan(),
                 p.name().bold(),
                 p_updates.len(),
-                p.upgrade_command_str(&p_updates).dimmed()
+                cmd_str.dimmed()
             );
             match p.execute_upgrade(&p_updates) {
                 Ok(true) => {
                     println!("✔ {} upgrade completed successfully.", p.name().green());
+                    outcomes.push((p.name().to_string(), cmd_str, true));
                 }
                 Ok(false) => {
                     eprintln!("{}", format!("Warning: {} upgrade exited with errors.", p.name()).yellow());
+                    outcomes.push((p.name().to_string(), cmd_str, false));
                 }
                 Err(e) => {
                     eprintln!("{}", format!("Failed to run {} upgrade: {}", p.name(), e).red());
+                    outcomes.push((p.name().to_string(), cmd_str, false));
                 }
             }
         }
+        outcomes
     }
 
     pub fn execute_cleanups(providers: &[Arc<dyn IntegrationProvider>]) {

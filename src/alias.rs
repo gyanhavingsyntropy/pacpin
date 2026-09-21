@@ -84,7 +84,7 @@ impl AliasManager {
                     if let Ok(mut file) = OpenOptions::new().append(true).open(&bashrc) {
                         let prefix = if content.ends_with('\n') { "" } else { "\n" };
                         let snippet = format!(
-                            "{}# Added by pacpin\nalias pin=\"pacpin\"\nalias pacpin=\"pacpin\"\n",
+                            "{}# Added by pacpin\nalias pin=\"pacpin\"\n",
                             prefix
                         );
                         if file.write_all(snippet.as_bytes()).is_ok() {
@@ -103,7 +103,7 @@ impl AliasManager {
                     if let Ok(mut file) = OpenOptions::new().append(true).open(&zshrc) {
                         let prefix = if content.ends_with('\n') { "" } else { "\n" };
                         let snippet = format!(
-                            "{}# Added by pacpin\nalias pin=\"pacpin\"\nalias pacpin=\"pacpin\"\n",
+                            "{}# Added by pacpin\nalias pin=\"pacpin\"\n",
                             prefix
                         );
                         if file.write_all(snippet.as_bytes()).is_ok() {
@@ -122,7 +122,7 @@ impl AliasManager {
                     if let Ok(mut file) = OpenOptions::new().append(true).open(&fish_conf) {
                         let prefix = if content.ends_with('\n') { "" } else { "\n" };
                         let snippet = format!(
-                            "{}# Added by pacpin\nalias pin \"pacpin\"\nalias pacpin \"pacpin\"\n",
+                            "{}# Added by pacpin\nalias pin \"pacpin\"\n",
                             prefix
                         );
                         if file.write_all(snippet.as_bytes()).is_ok() {

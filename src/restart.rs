@@ -234,7 +234,7 @@ impl RestartInspector {
                 ServiceType::SystemdSystem(s) => format!("sys:{}", s),
                 ServiceType::SystemdUser(s) => format!("usr:{}", s),
                 ServiceType::SessionComponent(s) => format!("session:{}", s),
-                ServiceType::Process { name, .. } => format!("proc:{}", name),
+                ServiceType::Process { name, pid } => format!("proc:{}:{}", name, pid),
             };
 
             let entry = map.entry(key).or_insert_with(|| (service_type, BTreeSet::new()));

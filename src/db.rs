@@ -257,10 +257,25 @@ impl AlpmManager {
 
     pub fn get_dependents(&self, target_pkg: &str) -> Vec<String> {
         let mut dependents = HashSet::new();
+        let mut target_names = HashSet::new();
+        target_names.insert(target_pkg.to_string());
+
+        if let Ok(pkg) = self.handle.localdb().pkg(target_pkg) {
+            for prov in pkg.provides() {
+                target_names.insert(prov.name().to_string());
+            }
+        }
+        for db in self.handle.syncdbs() {
+            if let Ok(pkg) = db.pkg(target_pkg) {
+                for prov in pkg.provides() {
+                    target_names.insert(prov.name().to_string());
+                }
+            }
+        }
+
         for pkg in self.handle.localdb().pkgs() {
             for dep in pkg.depends() {
-                if dep.name() == target_pkg {
-
+                if target_names.contains(dep.name()) {
                     dependents.insert(pkg.name().to_string());
                     break;
                 }

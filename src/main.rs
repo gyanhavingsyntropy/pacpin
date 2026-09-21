@@ -134,7 +134,7 @@ fn cmd_check(config: &Config) {
 }
 
 
-fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, autoremove: bool) {
+fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, autoremove: bool, extra_flags: &[String]) {
     check_pacman_lock();
     print_banner();
 
@@ -326,8 +326,30 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
     let mut exit_status = Ok(std::process::ExitStatus::default());
     let mut all_success = true;
 
+    let forwarded_pacman_flags: Vec<&str> = extra_flags
+        .iter()
+        .filter(|f| {
+            let s = f.as_str();
+            s != "-y"
+                && s != "--refresh"
+                && s != "-yy"
+                && s != "-u"
+                && s != "--sysupgrade"
+                && s != "-uu"
+                && s != "-c"
+                && s != "--clean"
+                && s != "--autoremove"
+                && s != "-n"
+                && s != "--dry-run"
+                && s != "--noconfirm"
+                && s != "--needed"
+        })
+        .map(|s| s.as_str())
+        .collect();
+
     if !pacman_targets.is_empty() {
         let mut args = vec!["pacman", "-S", "--needed", "--noconfirm"];
+        args.extend(forwarded_pacman_flags.iter().cloned());
         args.extend(pacman_targets.iter().map(|s| s.as_str()));
         let status = Command::new("sudo").args(&args).status();
         match status {
@@ -339,10 +361,12 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
                         }
                     }
                 }
-                executed_commands.push(format!(
-                    "sudo pacman -S --needed --noconfirm {}",
-                    pacman_targets.join(" ")
-                ));
+                let mut cmd_parts = vec!["sudo", "pacman", "-S", "--needed", "--noconfirm"];
+                cmd_parts.extend(forwarded_pacman_flags.iter().cloned());
+                let mut full_cmd_s = cmd_parts.join(" ");
+                full_cmd_s.push(' ');
+                full_cmd_s.push_str(&pacman_targets.join(" "));
+                executed_commands.push(full_cmd_s);
             }
             Ok(s) => {
                 exit_status = Ok(s);
@@ -358,6 +382,7 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
     if all_success && !aur_targets.is_empty() {
         let helper = &config.options.helper;
         let mut args = vec!["-S", "--needed", "--aur", "--noconfirm"];
+        args.extend(forwarded_pacman_flags.iter().cloned());
         args.extend(aur_targets.iter().map(|s| s.as_str()));
         let status = Command::new(helper).args(&args).status();
         match status {
@@ -369,11 +394,12 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
                         }
                     }
                 }
-                executed_commands.push(format!(
-                    "{} -S --needed --aur --noconfirm {}",
-                    helper,
-                    aur_targets.join(" ")
-                ));
+                let mut cmd_parts = vec![helper.as_str(), "-S", "--needed", "--aur", "--noconfirm"];
+                cmd_parts.extend(forwarded_pacman_flags.iter().cloned());
+                let mut full_cmd_s = cmd_parts.join(" ");
+                full_cmd_s.push(' ');
+                full_cmd_s.push_str(&aur_targets.join(" "));
+                executed_commands.push(full_cmd_s);
             }
             Ok(s) => {
                 exit_status = Ok(s);
@@ -387,15 +413,12 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
     }
 
     if all_success && !external_updates.is_empty() {
-        IntegrationsManager::execute_upgrades(&ext_providers, &external_updates);
-        for p in &ext_providers {
-            let p_updates: Vec<integrations::ExternalUpdate> = external_updates
-                .iter()
-                .filter(|u| u.runner == p.name())
-                .cloned()
-                .collect();
-            if !p_updates.is_empty() {
-                executed_commands.push(p.upgrade_command_str(&p_updates));
+        let outcomes = IntegrationsManager::execute_upgrades(&ext_providers, &external_updates);
+        for (_p_name, cmd_str, success) in outcomes {
+            if success {
+                executed_commands.push(cmd_str);
+            } else {
+                all_success = false;
             }
         }
     }
@@ -470,6 +493,14 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
     if refresh && !dry_run {
         println!(
             "{}",
+            ":: Warning: Installing packages with '-y' (database refresh) without performing a full system upgrade".yellow().bold()
+        );
+        println!(
+            "{}",
+            "   can lead to partial upgrades and dependency breakage on Arch Linux.".yellow()
+        );
+        println!(
+            "{}",
             ":: Refreshing package databases (sudo pacman -Sy)...".cyan()
         );
         let status = Command::new("sudo")
@@ -501,7 +532,7 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
 
     let mut pacman_targets = Vec::new();
     let mut aur_targets = Vec::new();
-    let mut new_pins_added = false;
+    let mut pending_pins: Vec<(String, String)> = Vec::new();
 
     let mut known_repos = manager.repos().to_vec();
     known_repos.push("aur".to_string());
@@ -523,8 +554,7 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
 
             if repo.eq_ignore_ascii_case("aur") {
                 aur_targets.push(pkg.to_string());
-                config.pins.insert(pkg.to_string(), "aur".to_string());
-                new_pins_added = true;
+                pending_pins.push((pkg.to_string(), "aur".to_string()));
             } else {
                 let companions = manager.find_companions(pkg, repo, &config.pins);
                 let mut to_install_repo = vec![pkg.to_string()];
@@ -538,15 +568,29 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
                 }
 
                 for p in to_install_repo {
-                    config.pins.insert(p.clone(), repo.to_string());
+                    pending_pins.push((p.clone(), repo.to_string()));
                     pacman_targets.push(format!("{}/{}", repo, p));
                 }
-                new_pins_added = true;
             }
         } else {
             pacman_targets.push(target.clone());
         }
     }
+
+    let forwarded_flags: Vec<&str> = flags
+        .iter()
+        .filter(|f| {
+            let s = f.as_str();
+            s != "-y"
+                && s != "--refresh"
+                && s != "-yy"
+                && s != "-n"
+                && s != "--dry-run"
+                && s != "--noconfirm"
+                && s != "--needed"
+        })
+        .map(|s| s.as_str())
+        .collect();
 
     let mut command_strs = Vec::new();
     if refresh {
@@ -561,6 +605,7 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
         if noconfirm {
             cmd.push("--noconfirm");
         }
+        cmd.extend(forwarded_flags.iter().cloned());
         let mut s = cmd.join(" ");
         s.push(' ');
         s.push_str(&pacman_targets.join(" "));
@@ -576,6 +621,7 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
         if noconfirm {
             cmd.push("--noconfirm");
         }
+        cmd.extend(forwarded_flags.iter().cloned());
         let mut s = cmd.join(" ");
         s.push(' ');
         s.push_str(&aur_targets.join(" "));
@@ -604,17 +650,24 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
         if noconfirm {
             args.push("--noconfirm");
         }
+        args.extend(forwarded_flags.iter().cloned());
         args.extend(pacman_targets.iter().map(|s| s.as_str()));
         let status = Command::new("sudo").args(&args).status();
         match status {
             Ok(s) if s.success() => {
                 installed_targets.extend(pacman_targets.clone());
-                executed_commands.push(format!(
-                    "sudo pacman -S{}{}{}",
-                    if needed { " --needed" } else { "" },
-                    if noconfirm { " --noconfirm" } else { "" },
-                    format!(" {}", pacman_targets.join(" "))
-                ));
+                let mut cmd_parts = vec!["sudo", "pacman", "-S"];
+                if needed {
+                    cmd_parts.push("--needed");
+                }
+                if noconfirm {
+                    cmd_parts.push("--noconfirm");
+                }
+                cmd_parts.extend(forwarded_flags.iter().cloned());
+                let mut cmd_str = cmd_parts.join(" ");
+                cmd_str.push(' ');
+                cmd_str.push_str(&pacman_targets.join(" "));
+                executed_commands.push(cmd_str);
             }
             Ok(s) => {
                 exit_status = Ok(s);
@@ -636,18 +689,24 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
         if noconfirm {
             args.push("--noconfirm");
         }
+        args.extend(forwarded_flags.iter().cloned());
         args.extend(aur_targets.iter().map(|s| s.as_str()));
         let status = Command::new(helper).args(&args).status();
         match status {
             Ok(s) if s.success() => {
                 installed_targets.extend(aur_targets.clone());
-                executed_commands.push(format!(
-                    "{} -S --aur{}{}{}",
-                    helper,
-                    if needed { " --needed" } else { "" },
-                    if noconfirm { " --noconfirm" } else { "" },
-                    format!(" {}", aur_targets.join(" "))
-                ));
+                let mut cmd_parts = vec![helper.as_str(), "-S", "--aur"];
+                if needed {
+                    cmd_parts.push("--needed");
+                }
+                if noconfirm {
+                    cmd_parts.push("--noconfirm");
+                }
+                cmd_parts.extend(forwarded_flags.iter().cloned());
+                let mut cmd_str = cmd_parts.join(" ");
+                cmd_str.push(' ');
+                cmd_str.push_str(&aur_targets.join(" "));
+                executed_commands.push(cmd_str);
             }
             Ok(s) => {
                 exit_status = Ok(s);
@@ -661,11 +720,22 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
     }
 
     if !installed_targets.is_empty() {
-        if new_pins_added && !dry_run {
+        let mut confirmed_pins_added = false;
+        for (pkg_name, repo_name) in pending_pins {
+            let was_installed = installed_targets.iter().any(|t| {
+                t == &pkg_name || t == &format!("{}/{}", repo_name, pkg_name)
+            });
+            if was_installed {
+                config.pins.insert(pkg_name, repo_name);
+                confirmed_pins_added = true;
+            }
+        }
+
+        if confirmed_pins_added && !dry_run {
             if let Err(e) = save_config(&config) {
                 eprintln!("{}", format!("Warning: Failed to save pins to configuration: {}", e).yellow());
             } else {
-                println!("{}", "✔ Configuration updated with new repository pins.".green());
+                println!("{}", "✔ Configuration updated with confirmed repository pins.".green());
             }
         }
         let tx_packages: Vec<serde_json::Value> = installed_targets
@@ -937,18 +1007,10 @@ fn cmd_pin(mut config: Config, repo: String, patterns: Vec<String>) {
     }
 
     for pattern in &patterns {
-        let is_valid_pattern = !pattern.is_empty()
-            && !pattern.contains('/')
-            && !pattern.contains('\\')
-            && !pattern.contains(';')
-            && !pattern.contains('&')
-            && !pattern.contains('|')
-            && !pattern.contains('`')
-            && !pattern.contains('$');
-        if !is_valid_pattern {
+        if !crate::utils::is_safe_pattern(pattern) || glob::Pattern::new(pattern).is_err() {
             eprintln!(
                 "{}",
-                format!("Error: Invalid package pattern '{}'.", pattern).red().bold()
+                format!("Error: Invalid package pattern '{}'. Patterns must be valid glob expressions without shell metacharacters or whitespace.", pattern).red().bold()
             );
             exit(1);
         }
@@ -1718,6 +1780,77 @@ fn print_version() {
     println!("There is NO WARRANTY, to the extent permitted by law.");
 }
 
+pub fn parse_pacman_cli_args(args: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut targets = Vec::new();
+    let mut flags = Vec::new();
+    let mut after_double_dash = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = &args[i];
+
+        if after_double_dash {
+            targets.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        if arg == "--" {
+            after_double_dash = true;
+            i += 1;
+            continue;
+        }
+
+        let takes_arg = arg == "--ignore"
+            || arg == "--ignoregroup"
+            || arg == "--config"
+            || arg == "--cachedir"
+            || arg == "--root"
+            || arg == "-r"
+            || arg == "--dbpath"
+            || arg == "-b"
+            || arg == "--logfile"
+            || arg == "--gpgdir"
+            || arg == "--hookdir"
+            || arg == "--overwrite"
+            || arg == "--assume-installed"
+            || arg == "--color"
+            || arg == "--arch"
+            || arg == "--print-format";
+
+        if takes_arg {
+            flags.push(arg.clone());
+            if i + 1 < args.len() {
+                flags.push(args[i + 1].clone());
+                i += 1;
+            }
+        } else if arg.starts_with("--ignore=")
+            || arg.starts_with("--ignoregroup=")
+            || arg.starts_with("--config=")
+            || arg.starts_with("--cachedir=")
+            || arg.starts_with("--root=")
+            || arg.starts_with("--dbpath=")
+            || arg.starts_with("--logfile=")
+            || arg.starts_with("--gpgdir=")
+            || arg.starts_with("--hookdir=")
+            || arg.starts_with("--overwrite=")
+            || arg.starts_with("--assume-installed=")
+            || arg.starts_with("--color=")
+            || arg.starts_with("--arch=")
+            || arg.starts_with("--print-format=")
+            || arg.starts_with('-')
+        {
+            flags.push(arg.clone());
+        } else {
+            targets.push(arg.clone());
+        }
+
+        i += 1;
+    }
+
+    (targets, flags)
+}
+
 pub fn is_upgrade_invocation(args: &[String]) -> bool {
     if args.is_empty() {
         return false;
@@ -1730,15 +1863,14 @@ pub fn is_upgrade_invocation(args: &[String]) -> bool {
         return false;
     }
 
-    // Has any non-flag target arguments?
-    let has_targets = args.iter().skip(1).any(|a| !a.starts_with('-'));
-    if has_targets {
+    let (targets, flags_list) = parse_pacman_cli_args(&args[1..]);
+    if !targets.is_empty() {
         return false;
     }
 
-    // Collect all short flag characters across all args that start with '-' (and not '--')
+    // Collect all short flag characters across first arg and flags_list
     let mut flags = std::collections::HashSet::new();
-    for a in args {
+    for a in std::iter::once(first).chain(flags_list.iter()) {
         if a.starts_with('-') && !a.starts_with("--") {
             for c in a[1..].chars() {
                 flags.insert(c);
@@ -1755,7 +1887,7 @@ pub fn is_upgrade_invocation(args: &[String]) -> bool {
         || flags.contains(&'l')
         || flags.contains(&'g')
         || (flags.contains(&'c') && !flags.contains(&'u'))
-        || args.iter().any(|a| {
+        || flags_list.iter().any(|a| {
             a == "--search"
                 || a == "--info"
                 || a == "--downloadonly"
@@ -1771,10 +1903,28 @@ pub fn is_upgrade_invocation(args: &[String]) -> bool {
     // It's an upgrade if flags contains 'u' or 'y' or long options
     flags.contains(&'u')
         || flags.contains(&'y')
-        || args.iter().any(|a| a == "--sysupgrade" || a == "--refresh")
+        || flags_list.iter().any(|a| a == "--sysupgrade" || a == "--refresh")
+}
+
+pub fn pacman_files_needs_sudo(args: &[String]) -> bool {
+    let (_, flags) = parse_pacman_cli_args(args);
+    flags.iter().any(|a| {
+        if a == "--refresh" {
+            true
+        } else if a.starts_with('-') && !a.starts_with("--") {
+            a.contains('y')
+        } else {
+            false
+        }
+    })
 }
 
 fn main() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     if std::env::var_os("NO_COLOR").is_some()
         || (!io::stdout().is_terminal() && std::env::var_os("CLICOLOR_FORCE").is_none())
     {
@@ -1834,6 +1984,7 @@ fn main() {
     } else if cmd == "check" || cmd == "-Qu" {
         cmd_check(&config);
     } else if is_upgrade_invocation(&args) {
+        let (_targets, extra_flags) = parse_pacman_cli_args(&args[1..]);
         let dry_run = args.iter().any(|a| a == "-n" || a == "--dry-run")
             || args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains('n'));
         let refresh = args.iter().any(|a| a == "-y" || a == "--refresh")
@@ -1841,7 +1992,7 @@ fn main() {
         let noconfirm = args.iter().any(|a| a == "--noconfirm");
         let autoremove = args.iter().any(|a| a == "-c" || a == "--clean" || a == "--autoremove")
             || args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains('c'));
-        cmd_upgrade(&config, dry_run, refresh, noconfirm, autoremove);
+        cmd_upgrade(&config, dry_run, refresh, noconfirm, autoremove, &extra_flags);
     } else if cmd == "search"
         || cmd == "-Ss"
         || (cmd.starts_with("-S")
@@ -1955,9 +2106,11 @@ fn main() {
                 exit(1);
             }
         }
-    } else if cmd == "-S" || cmd == "install" || (cmd.starts_with("-S") && args.iter().any(|a| !a.starts_with('-'))) {
-        let mut targets = Vec::new();
-        let mut flags = Vec::new();
+    } else if cmd == "-S" || cmd == "install" || (cmd.starts_with("-S") && {
+        let (t, _) = parse_pacman_cli_args(&args[1..]);
+        !t.is_empty()
+    }) {
+        let (targets, mut flags) = parse_pacman_cli_args(&args[1..]);
         if cmd.len() > 2 && cmd.starts_with("-S") {
             let subflags = &cmd[2..];
             if subflags.contains('y') {
@@ -1965,13 +2118,6 @@ fn main() {
             }
             if subflags.contains('n') {
                 flags.push("-n".to_string());
-            }
-        }
-        for a in &args[1..] {
-            if a.starts_with('-') {
-                flags.push(a.clone());
-            } else {
-                targets.push(a.clone());
             }
         }
         cmd_install(config, &targets, &flags);
@@ -1993,7 +2139,7 @@ fn main() {
             }
         }
     } else if cmd.starts_with("-F") {
-        let needs_sudo = args.iter().any(|a| a.contains('y') || a == "--refresh");
+        let needs_sudo = pacman_files_needs_sudo(&args);
         let status = if needs_sudo {
             check_pacman_lock();
             Command::new("sudo").arg("pacman").args(&args).status()
@@ -2033,47 +2179,79 @@ fn main() {
     } else if cmd == "rollback" {
         let mut tx_id = None;
         let dry_run = args.iter().any(|a| a == "-n" || a == "--dry-run");
+        let allow_partial = args.iter().any(|a| a == "--allow-partial" || a == "--partial" || a == "-f" || a == "--force");
         for a in &args[1..] {
             if let Ok(id) = a.parse::<usize>() {
                 tx_id = Some(id);
             }
         }
-        TransactionJournal::rollback(tx_id, dry_run);
+        TransactionJournal::rollback(tx_id, dry_run, allow_partial);
     } else if cmd == "try" || cmd == "run" {
-        let try_args = &args[1..];
-        let no_sandbox = try_args
-            .iter()
-            .any(|a| a == "--no-sandbox" || a == "--bare" || a == "--unsandboxed");
-        let remaining: Vec<String> = try_args
-            .iter()
-            .filter(|a| *a != "--no-sandbox" && *a != "--bare" && *a != "--unsandboxed")
-            .cloned()
-            .collect();
+        let mut opts = sandbox::TryOptions::default();
+        let mut positional = Vec::new();
+        let mut pass_through = Vec::new();
+        let mut after_delimiter = false;
 
-        if remaining.is_empty() {
+        let mut i = 1;
+        while i < args.len() {
+            let a = &args[i];
+            if after_delimiter {
+                pass_through.push(a.clone());
+                i += 1;
+                continue;
+            }
+            if a == "--" {
+                after_delimiter = true;
+                i += 1;
+                continue;
+            }
+            if a == "--no-sandbox" || a == "--bare" || a == "--unsandboxed" {
+                opts.no_sandbox = true;
+            } else if a == "--net" || a == "--network" || a == "--share-net" {
+                opts.share_net = true;
+            } else if a == "--rw" || a == "--rw-cwd" || a == "--write-cwd" {
+                opts.rw_cwd = true;
+            } else if a == "--gui" {
+                opts.gui = true;
+            } else if a == "--audio" {
+                opts.audio = true;
+            } else if a == "--allow-unverified" {
+                opts.allow_unverified = true;
+            } else if a == "--bin" {
+                if i + 1 < args.len() {
+                    opts.bin = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            } else if a.starts_with("--bin=") {
+                opts.bin = Some(a["--bin=".len()..].to_string());
+            } else if positional.is_empty() && !a.starts_with('-') {
+                positional.push(a.clone());
+            } else {
+                pass_through.push(a.clone());
+            }
+            i += 1;
+        }
+
+        if positional.is_empty() {
             eprintln!("{}", "Error: 'pacpin try' requires a package target.".red().bold());
-            eprintln!("Usage: pacpin try [--no-sandbox] [repo/]package [arguments...]");
+            eprintln!("Usage: pacpin try [options] [repo/]package [arguments...]");
             eprintln!("Options:");
             eprintln!("  --no-sandbox, --bare   Bypass Bubblewrap containerization and run with host environment isolation");
+            eprintln!("  --net, --network       Share host network access (unshared by default)");
+            eprintln!("  --rw, --write-cwd      Mount current working directory read-write (read-only by default)");
+            eprintln!("  --gui                  Grant X11/Wayland and DRI access for graphical applications");
+            eprintln!("  --audio                Grant /dev/snd access for audio playback");
+            eprintln!("  --bin <name>           Specify exact executable binary name if package provides multiple");
+            eprintln!("  --allow-unverified     Proceed even if repository metadata lacks a SHA256 checksum");
             eprintln!("Examples:");
             eprintln!("  pacpin try jq . foo.json");
-            eprintln!("  pacpin try --no-sandbox micro ~/.bashrc");
-            eprintln!("  pacpin try flatpak/org.gnome.Calculator");
-            eprintln!("  pacpin try nix/ripgrep -i 'foo'");
+            eprintln!("  pacpin try --gui flatpak/org.gnome.Calculator");
+            eprintln!("  pacpin try --net nix/ripgrep -i 'foo'");
             exit(1);
         }
 
-        let pkg = &remaining[0];
-        let sub_args = if remaining.len() > 1 {
-            if remaining[1] == "--" {
-                remaining[2..].to_vec()
-            } else {
-                remaining[1..].to_vec()
-            }
-        } else {
-            Vec::new()
-        };
-        sandbox::cmd_try(pkg, &sub_args, no_sandbox);
+        let pkg = &positional[0];
+        sandbox::cmd_try(pkg, &pass_through, &opts);
     } else if cmd == "needrestart" || cmd == "restart-check" {
         restart::RestartInspector::print_restart_advisory(&[]);
         exit(0);
@@ -2384,5 +2562,59 @@ mod tests {
         assert!(!is_upgrade_invocation(&to_vec(&["-Sp", "ripgrep"])));
         assert!(!is_upgrade_invocation(&to_vec(&["check"])));
         assert!(!is_upgrade_invocation(&to_vec(&["-Qu"])));
+
+        // Upgrade with option-consuming flags
+        assert!(is_upgrade_invocation(&to_vec(&["-Syu", "--ignore", "linux"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-Syu", "--ignore=linux"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-S", "-u", "--overwrite", "/usr/*"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-Syu", "--assume-installed", "foo:1.0"])));
+    }
+
+    #[test]
+    fn test_parse_pacman_cli_args() {
+        let to_vec = |slice: &[&str]| slice.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Separates option arguments from targets
+        let (targets, flags) = parse_pacman_cli_args(&to_vec(&["--ignore", "linux", "--noconfirm", "neovim"]));
+        assert_eq!(targets, vec!["neovim"]);
+        assert_eq!(flags, vec!["--ignore", "linux", "--noconfirm"]);
+
+        // Handles --ignore=linux equals syntax
+        let (targets, flags) = parse_pacman_cli_args(&to_vec(&["--ignore=linux", "ripgrep"]));
+        assert_eq!(targets, vec!["ripgrep"]);
+        assert_eq!(flags, vec!["--ignore=linux"]);
+
+        // Handles double dash -- to treat everything after as targets
+        let (targets, flags) = parse_pacman_cli_args(&to_vec(&["-S", "--", "--ignore", "foo"]));
+        assert_eq!(flags, vec!["-S"]);
+        assert_eq!(targets, vec!["--ignore", "foo"]);
+
+        // Handles config, dbpath, root, overwrite flags consuming arguments
+        let (targets, flags) = parse_pacman_cli_args(&to_vec(&[
+            "--config", "/etc/pacman.conf",
+            "-b", "/var/lib/pacman",
+            "--overwrite", "/usr/share/*",
+            "git"
+        ]));
+        assert_eq!(targets, vec!["git"]);
+        assert_eq!(flags, vec!["--config", "/etc/pacman.conf", "-b", "/var/lib/pacman", "--overwrite", "/usr/share/*"]);
+    }
+
+    #[test]
+    fn test_pacman_files_needs_sudo() {
+        let to_vec = |slice: &[&str]| slice.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Read-only queries should NOT require sudo
+        assert!(!pacman_files_needs_sudo(&to_vec(&["-F", "python"])));
+        assert!(!pacman_files_needs_sudo(&to_vec(&["-Fl", "ripgrep"])));
+        assert!(!pacman_files_needs_sudo(&to_vec(&["-Fs", "libssl.so"])));
+        assert!(!pacman_files_needs_sudo(&to_vec(&["-F", "-b", "/var/lib/pacman", "python"])));
+
+        // Sync / refresh actions DO require sudo
+        assert!(pacman_files_needs_sudo(&to_vec(&["-Fy"])));
+        assert!(pacman_files_needs_sudo(&to_vec(&["-Fyy"])));
+        assert!(pacman_files_needs_sudo(&to_vec(&["-F", "-y"])));
+        assert!(pacman_files_needs_sudo(&to_vec(&["-F", "--refresh"])));
+        assert!(pacman_files_needs_sudo(&to_vec(&["-Fy", "python"])));
     }
 }

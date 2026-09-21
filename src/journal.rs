@@ -223,7 +223,7 @@ impl TransactionJournal {
         None
     }
 
-    pub fn rollback(tx_id: Option<usize>, dry_run: bool) {
+    pub fn rollback(tx_id: Option<usize>, dry_run: bool, allow_partial: bool) {
         let txs = Self::list_transactions(100);
         if txs.is_empty() {
             println!("{}", "No transaction history found in history.jsonl.".yellow());
@@ -278,6 +278,19 @@ impl TransactionJournal {
             for (name, ver) in &missing {
                 println!("  • {}", format!("{} {}", name, ver).red());
             }
+
+            if !allow_partial {
+                eprintln!(
+                    "\n{}",
+                    "Error: Rollback aborted to prevent broken dependencies and partial downgrade.".red().bold()
+                );
+                eprintln!(
+                    "  {} package archive(s) are missing from the pacman cache.",
+                    missing.len()
+                );
+                eprintln!("  To force a partial rollback of only available packages, pass --allow-partial.");
+                return;
+            }
         }
 
         if pkgs_to_restore.is_empty() {
@@ -322,6 +335,15 @@ impl TransactionJournal {
         if Path::new("/var/lib/pacman/db.lck").exists() {
             eprintln!("{}", "Error: Pacman database is locked (/var/lib/pacman/db.lck).".red());
             std::process::exit(1);
+        }
+
+        use std::io::{self, Write};
+        print!("\nProceed with rollback? [y/N]: ");
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() || !input.trim().eq_ignore_ascii_case("y") {
+            println!("Rollback cancelled.");
+            return;
         }
 
         println!("\n{} {}", ":: Executing rollback:".cyan(), "sudo pacman -U ...".bold());

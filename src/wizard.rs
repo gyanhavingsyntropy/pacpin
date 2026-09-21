@@ -297,7 +297,7 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
     } else {
         println!("      No external package managers detected (Flatpak/Nix/Pipx).");
     }
-    println!();
+    let enable_aliases = prompt_yn("  • Configure shell alias 'pin' in shell startup files (~/.bashrc / ~/.zshrc)?", false);
 
     let enable_integrations = enable_flatpak || enable_nix || enable_pipx;
 
@@ -308,7 +308,7 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
             smart_orphans: enable_orphans,
             integrations: enable_integrations,
             vendor_stickiness,
-            shell_aliases: true,
+            shell_aliases: enable_aliases,
         },
         options: Options { helper },
         repo_order,

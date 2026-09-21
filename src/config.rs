@@ -222,16 +222,59 @@ pub fn save_config_to_path(config: &Config, path: &Path) -> Result<(), std::io::
     let toml_str = toml::to_string_pretty(config)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-    let temp_path = parent.join(format!(
-        ".config.toml.tmp.{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    fs::write(&temp_path, toml_str)?;
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut temp_path = PathBuf::new();
+    let mut temp_file = None;
+
+    // Retry with random suffix to avoid collisions and prevent symlink following
+    for _ in 0..100 {
+        let mut random_bytes = [0u8; 8];
+        if let Ok(mut f) = fs::File::open("/dev/urandom") {
+            use std::io::Read;
+            let _ = f.read_exact(&mut random_bytes);
+        } else {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            random_bytes = (nanos as u64 ^ (std::process::id() as u64)).to_le_bytes();
+        }
+        let hex = random_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let candidate = parent.join(format!(".config.toml.tmp.{}_{}", std::process::id(), hex));
+
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+
+        if let Ok(f) = opts.open(&candidate) {
+            temp_path = candidate;
+            temp_file = Some(f);
+            break;
+        }
+    }
+
+    let mut file = temp_file.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "Could not create exclusive temporary config file",
+        )
+    })?;
+
+    file.write_all(toml_str.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+
     fs::rename(&temp_path, path)?;
+
+    // Durably sync directory entry on Unix
+    if let Ok(parent_dir) = fs::File::open(parent) {
+        let _ = parent_dir.sync_all();
+    }
+
     Ok(())
 }
 

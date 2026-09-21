@@ -21,7 +21,7 @@ use alpm::vercmp;
 use glob::Pattern;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::process::Command;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -542,16 +542,22 @@ impl<'a> ResolverEngine<'a> {
             }
         }
 
-        // Cascade holds to downstream reverse dependents
-        for parent_name in held_parents.keys() {
-            let dependents = self.manager.get_dependents(parent_name);
+        // Cascade holds to downstream reverse dependents (transitive BFS)
+        let mut queue: VecDeque<String> = held_parents.keys().cloned().collect();
+        let mut visited: HashSet<String> = held_parents.keys().cloned().collect();
+
+        while let Some(current_held) = queue.pop_front() {
+            let dependents = self.manager.get_dependents(&current_held);
             for dep_name in dependents {
                 if let Some(dep_item) = resolved.get_mut(&dep_name) {
-                    if dep_item.needs_update {
+                    if dep_item.needs_update && !dep_item.held {
                         dep_item.held = true;
                         dep_item.hold_reason =
-                            format!("Cascade hold: depends on newer {}", parent_name);
+                            format!("Cascade hold: depends on held {}", current_held);
                     }
+                }
+                if visited.insert(dep_name.clone()) {
+                    queue.push_back(dep_name);
                 }
             }
         }
