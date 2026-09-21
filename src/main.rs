@@ -1753,8 +1753,9 @@ fn print_help() {
     println!("  keep, adopt <pkg...>         Mark package(s) as explicitly installed (silences orphan warnings)");
     println!("  needrestart                  Inspect processes holding outdated libraries or kernel in RAM");
     println!();
-    println!("{}", "Power Tools & Sandboxing:".bold());
-    println!("  try, run [repo/]pkg [args...] Run package in isolated ephemeral sandbox (native, flatpak/, nix/, pipx/)");
+    println!("{}", "Power Tools & Ephemeral Execution:".bold());
+    println!("  run [options] [repo/]pkg     Run package directly on host without installing (like 'nix run')");
+    println!("  try [options] [repo/]pkg     Run package in isolated ephemeral sandbox (air-gapped bwrap)");
     println!("  history [id]                 View transaction history timeline or inspect a transaction");
     println!("  rollback [id] [-n]           Restore previous package versions from cache");
     println!();
@@ -2186,7 +2187,66 @@ fn main() {
             }
         }
         TransactionJournal::rollback(tx_id, dry_run, allow_partial);
-    } else if cmd == "try" || cmd == "run" {
+    } else if cmd == "run" {
+        let mut opts = sandbox::TryOptions::for_run();
+        let mut positional = Vec::new();
+        let mut pass_through = Vec::new();
+        let mut after_delimiter = false;
+
+        let mut i = 1;
+        while i < args.len() {
+            let a = &args[i];
+            if after_delimiter {
+                pass_through.push(a.clone());
+                i += 1;
+                continue;
+            }
+            if a == "--" {
+                after_delimiter = true;
+                i += 1;
+                continue;
+            }
+            if a == "--sandbox" || a == "--sandboxed" {
+                opts.no_sandbox = false;
+                opts.is_run_mode = false;
+            } else if a == "--allow-unverified" {
+                opts.allow_unverified = true;
+            } else if a == "--bin" {
+                if i + 1 < args.len() {
+                    opts.bin = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            } else if a.starts_with("--bin=") {
+                opts.bin = Some(a["--bin=".len()..].to_string());
+            } else if positional.is_empty() && !a.starts_with('-') {
+                positional.push(a.clone());
+            } else {
+                pass_through.push(a.clone());
+            }
+            i += 1;
+        }
+
+        if positional.is_empty() {
+            eprintln!("{}", "Error: 'pacpin run' requires a package target.".red().bold());
+            eprintln!("Usage: pacpin run [options] [repo/]package [arguments...]");
+            eprintln!("Runs an official, AUR, Flatpak, or Nix package directly on host without permanent installation.");
+            eprintln!();
+            eprintln!("Options:");
+            eprintln!("  --sandbox              Run in Bubblewrap container (unsandboxed by default)");
+            eprintln!("  --bin <name>           Specify exact executable binary name if package provides multiple");
+            eprintln!("  --allow-unverified     Proceed even if repository metadata lacks a SHA256 checksum");
+            eprintln!();
+            eprintln!("Examples:");
+            eprintln!("  pacpin run fastfetch");
+            eprintln!("  pacpin run yt-dlp 'https://youtube.com/watch?v=...'");
+            eprintln!("  pacpin run ffmpeg -i screencast.mkv output.mp4");
+            eprintln!("  pacpin run jq . package.json");
+            exit(1);
+        }
+
+        let pkg = &positional[0];
+        sandbox::cmd_try(pkg, &pass_through, &opts);
+    } else if cmd == "try" {
         let mut opts = sandbox::TryOptions::default();
         let mut positional = Vec::new();
         let mut pass_through = Vec::new();
@@ -2235,14 +2295,17 @@ fn main() {
         if positional.is_empty() {
             eprintln!("{}", "Error: 'pacpin try' requires a package target.".red().bold());
             eprintln!("Usage: pacpin try [options] [repo/]package [arguments...]");
+            eprintln!("Runs a package inside an isolated, air-gapped Bubblewrap container.");
+            eprintln!();
             eprintln!("Options:");
-            eprintln!("  --no-sandbox, --bare   Bypass Bubblewrap containerization and run with host environment isolation");
+            eprintln!("  --no-sandbox, --bare   Bypass Bubblewrap containerization and run directly on host");
             eprintln!("  --net, --network       Share host network access (unshared by default)");
             eprintln!("  --rw, --write-cwd      Mount current working directory read-write (read-only by default)");
             eprintln!("  --gui                  Grant X11/Wayland and DRI access for graphical applications");
             eprintln!("  --audio                Grant /dev/snd access for audio playback");
             eprintln!("  --bin <name>           Specify exact executable binary name if package provides multiple");
             eprintln!("  --allow-unverified     Proceed even if repository metadata lacks a SHA256 checksum");
+            eprintln!();
             eprintln!("Examples:");
             eprintln!("  pacpin try jq . foo.json");
             eprintln!("  pacpin try --gui flatpak/org.gnome.Calculator");

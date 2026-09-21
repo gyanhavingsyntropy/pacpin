@@ -60,6 +60,22 @@ pub struct TryOptions {
     pub audio: bool,
     pub bin: Option<String>,
     pub allow_unverified: bool,
+    pub is_run_mode: bool,
+}
+
+impl TryOptions {
+    pub fn for_run() -> Self {
+        Self {
+            no_sandbox: true,
+            share_net: true,
+            rw_cwd: true,
+            gui: false,
+            audio: false,
+            bin: None,
+            allow_unverified: false,
+            is_run_mode: true,
+        }
+    }
 }
 
 pub fn cmd_try(target: &str, args: &[String], options: &TryOptions) {
@@ -251,8 +267,9 @@ fn try_pipx(pkg: &str, args: &[String]) -> Result<i32, String> {
 }
 
 fn create_secure_temp_dir(prefix: &str) -> Result<PathBuf, String> {
+    let sub = if prefix.starts_with("pacpin-run") { "run" } else { "try" };
     let base_dir = if let Ok(xdg_runtime) = env::var("XDG_RUNTIME_DIR") {
-        let p = PathBuf::from(xdg_runtime).join("pacpin").join("try");
+        let p = PathBuf::from(xdg_runtime).join("pacpin").join(sub);
         let _ = fs::create_dir_all(&p);
         if p.is_dir() {
             p
@@ -401,7 +418,8 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
         ));
     }
 
-    let sandbox_dir = create_secure_temp_dir(&format!("pacpin-try-{}", pkg))?;
+    let prefix = if options.is_run_mode { "pacpin-run" } else { "pacpin-try" };
+    let sandbox_dir = create_secure_temp_dir(&format!("{}-{}", prefix, pkg))?;
 
     let mut guard = SandboxGuard {
         sandbox_dir: sandbox_dir.clone(),
@@ -528,11 +546,19 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
     let new_xdg = format!("{}:{}", usr_share.display(), current_xdg);
 
     if options.no_sandbox {
-        println!(
-            "{} Running ephemeral '{}' on host without sandboxing (--no-sandbox; sandbox will be destroyed upon exit)...\n",
-            "::".yellow().bold(),
-            pkg.bold()
-        );
+        if options.is_run_mode {
+            println!(
+                "{} Running ephemeral '{}' on host (will be removed upon exit)...\n",
+                "::".cyan().bold(),
+                pkg.bold()
+            );
+        } else {
+            println!(
+                "{} Running ephemeral '{}' on host without sandboxing (--no-sandbox; will be removed upon exit)...\n",
+                "::".yellow().bold(),
+                pkg.bold()
+            );
+        }
     } else {
         println!(
             "{} Spawning ephemeral sandbox in unshared container (bubblewrap)...",
@@ -992,5 +1018,19 @@ mod tests {
         assert!(!opts.audio);
         assert!(opts.bin.is_none());
         assert!(!opts.allow_unverified);
+        assert!(!opts.is_run_mode);
+    }
+
+    #[test]
+    fn test_try_options_for_run() {
+        let opts = TryOptions::for_run();
+        assert!(opts.no_sandbox);
+        assert!(opts.share_net);
+        assert!(opts.rw_cwd);
+        assert!(!opts.gui);
+        assert!(!opts.audio);
+        assert!(opts.bin.is_none());
+        assert!(!opts.allow_unverified);
+        assert!(opts.is_run_mode);
     }
 }
