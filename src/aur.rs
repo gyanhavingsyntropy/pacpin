@@ -58,119 +58,139 @@ pub struct AurRpcResponse {
     pub error: Option<String>,
 }
 
-pub fn query_aur(pkg_names: &[String]) -> HashMap<String, AurItem> {
+fn query_aur_chunk(chunk: &[String]) -> HashMap<String, AurItem> {
     let mut results = HashMap::new();
-    if pkg_names.is_empty() {
-        return results;
-    }
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(6))
         .user_agent("pacpin/3.1 (GPLv3)")
         .build();
 
-    for chunk in pkg_names.chunks(50) {
-        let params: Vec<String> = chunk
-            .iter()
-            .map(|name| format!("arg[]={}", urlencoding(name)))
-            .collect();
-        let query = params.join("&");
-        let url = format!("https://aur.archlinux.org/rpc/v5/info?{}", query);
+    let params: Vec<String> = chunk
+        .iter()
+        .map(|name| format!("arg[]={}", urlencoding(name)))
+        .collect();
+    let query = params.join("&");
+    let url = format!("https://aur.archlinux.org/rpc/v5/info?{}", query);
 
-        let mut attempts = 0;
-        let max_attempts = 3;
-        let mut success = false;
+    let mut attempts = 0;
+    let max_attempts = 3;
+    let mut success = false;
 
-        while attempts < max_attempts && !success {
-            attempts += 1;
-            if attempts > 1 {
-                std::thread::sleep(std::time::Duration::from_millis(400 * attempts as u64));
+    while attempts < max_attempts && !success {
+        attempts += 1;
+        if attempts > 1 {
+            std::thread::sleep(std::time::Duration::from_millis(400 * attempts as u64));
+        }
+
+        match agent.get(&url).call() {
+            Ok(resp) => {
+                let text = match resp.into_string() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        if attempts == max_attempts {
+                            eprintln!(
+                                "{}",
+                                format!(":: Warning: Failed to read AUR RPC response: {}", e).yellow()
+                            );
+                        }
+                        continue;
+                    }
+                };
+
+                match serde_json::from_str::<AurRpcResponse>(&text) {
+                    Ok(rpc) => {
+                        if let Some(ref err_msg) = rpc.error {
+                            if attempts == max_attempts {
+                                eprintln!(
+                                    "{}",
+                                    format!(":: Warning: AUR RPC returned error: {}", err_msg).yellow()
+                                );
+                            }
+                        } else {
+                            for item in rpc.results {
+                                results.insert(item.name.clone(), item);
+                            }
+                            success = true;
+                        }
+                    }
+                    Err(e) => {
+                        if attempts == max_attempts {
+                            eprintln!(
+                                "{}",
+                                format!(
+                                    ":: Warning: Failed to parse AUR RPC response JSON (attempt {}/{}): {}",
+                                    attempts, max_attempts, e
+                                )
+                                .yellow()
+                            );
+                        }
+                    }
+                }
             }
-
-            match agent.get(&url).call() {
-                Ok(resp) => {
-                    let text = match resp.into_string() {
-                        Ok(t) => t,
-                        Err(e) => {
-                            if attempts == max_attempts {
-                                eprintln!(
-                                    "{}",
-                                    format!(":: Warning: Failed to read AUR RPC response: {}", e).yellow()
-                                );
-                            }
-                            continue;
-                        }
-                    };
-
-                    match serde_json::from_str::<AurRpcResponse>(&text) {
-                        Ok(rpc) => {
-                            if let Some(ref err_msg) = rpc.error {
-                                if attempts == max_attempts {
-                                    eprintln!(
-                                        "{}",
-                                        format!(":: Warning: AUR RPC returned error: {}", err_msg).yellow()
-                                    );
-                                }
-                            } else {
-                                for item in rpc.results {
-                                    results.insert(item.name.clone(), item);
-                                }
-                                success = true;
-                            }
-                        }
-                        Err(e) => {
-                            if attempts == max_attempts {
-                                eprintln!(
-                                    "{}",
-                                    format!(
-                                        ":: Warning: Failed to parse AUR RPC response JSON (attempt {}/{}): {}",
-                                        attempts, max_attempts, e
-                                    )
-                                    .yellow()
-                                );
-                            }
-                        }
-                    }
+            Err(ureq::Error::Status(code, _resp)) => {
+                let desc = match code {
+                    429 => "Rate limited (HTTP 429). Too many requests to AUR RPC",
+                    500 => "Internal server error (HTTP 500)",
+                    502 => "Bad gateway (HTTP 502). AUR RPC server upstream is unreachable",
+                    503 => "Service unavailable (HTTP 503). AUR is temporarily undergoing maintenance",
+                    504 => "Gateway timeout (HTTP 504)",
+                    _ => "HTTP error response",
+                };
+                if attempts == max_attempts {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            ":: Warning: AUR RPC query failed (HTTP {}): {} for {} package(s)",
+                            code, desc, chunk.len()
+                        )
+                        .yellow()
+                    );
                 }
-                Err(ureq::Error::Status(code, _resp)) => {
-                    let desc = match code {
-                        429 => "Rate limited (HTTP 429). Too many requests to AUR RPC",
-                        500 => "Internal server error (HTTP 500)",
-                        502 => "Bad gateway (HTTP 502). AUR RPC server upstream is unreachable",
-                        503 => "Service unavailable (HTTP 503). AUR is temporarily undergoing maintenance",
-                        504 => "Gateway timeout (HTTP 504)",
-                        _ => "HTTP error response",
-                    };
-                    if attempts == max_attempts {
-                        eprintln!(
-                            "{}",
-                            format!(
-                                ":: Warning: AUR RPC query failed (HTTP {}): {} for {} package(s)",
-                                code, desc, chunk.len()
-                            )
-                            .yellow()
-                        );
-                    }
-                    if code == 429 {
-                        // Longer backoff for rate limits
-                        std::thread::sleep(std::time::Duration::from_millis(1500 * attempts as u64));
-                    }
+                if code == 429 {
+                    std::thread::sleep(std::time::Duration::from_millis(1500 * attempts as u64));
                 }
-                Err(ureq::Error::Transport(transport_err)) => {
-                    if attempts == max_attempts {
-                        eprintln!(
-                            "{}",
-                            format!(
-                                ":: Warning: AUR RPC network error after {} attempts: {}",
-                                attempts, transport_err
-                            )
-                            .yellow()
-                        );
-                    }
+            }
+            Err(ureq::Error::Transport(transport_err)) => {
+                if attempts == max_attempts {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            ":: Warning: AUR RPC network error after {} attempts: {}",
+                            attempts, transport_err
+                        )
+                        .yellow()
+                    );
                 }
             }
         }
     }
 
+    results
+}
+
+pub fn query_aur(pkg_names: &[String]) -> HashMap<String, AurItem> {
+    if pkg_names.is_empty() {
+        return HashMap::new();
+    }
+
+    if pkg_names.len() <= 50 {
+        return query_aur_chunk(pkg_names);
+    }
+
+    // Query multiple 50-package chunks concurrently in parallel
+    let chunks: Vec<Vec<String>> = pkg_names.chunks(50).map(|c| c.to_vec()).collect();
+    let mut handles = Vec::new();
+
+    for chunk in chunks {
+        handles.push(std::thread::spawn(move || query_aur_chunk(&chunk)));
+    }
+
+    let mut results = HashMap::new();
+    for h in handles {
+        if let Ok(chunk_res) = h.join() {
+            results.extend(chunk_res);
+        }
+    }
     results
 }
 
