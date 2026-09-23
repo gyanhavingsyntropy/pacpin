@@ -256,6 +256,10 @@ impl<'a> ResolverEngine<'a> {
     }
 
     pub fn resolve_all(&self, config: &Config) -> ResolveResult {
+        self.resolve_with_options(config, false)
+    }
+
+    pub fn resolve_with_options(&self, config: &Config, skip_aur: bool) -> ResolveResult {
         let pins = if config.features.pinning {
             config.pins.clone()
         } else {
@@ -265,54 +269,64 @@ impl<'a> ResolverEngine<'a> {
         let syncdbs: Vec<&alpm::Db> = alpm.syncdbs().into_iter().collect();
         let mut foreign_pkgs_set = HashSet::new();
         let mut foreign_pkgs = Vec::new();
-        for pkg in alpm.localdb().pkgs() {
-            if !syncdbs.iter().any(|db| db.pkg(pkg.name()).is_ok()) {
-                let name = pkg.name().to_string();
-                if foreign_pkgs_set.insert(name.clone()) {
-                    foreign_pkgs.push(name);
-                }
-            }
-        }
-        for (pattern, repo) in &pins {
-            if !repo.eq_ignore_ascii_case("aur") {
-                continue;
-            }
-            if let Ok(glob) = Pattern::new(pattern) {
-                for pkg in alpm.localdb().pkgs() {
-                    if glob.matches(pkg.name()) {
-                        let name = pkg.name().to_string();
-                        if foreign_pkgs_set.insert(name.clone()) {
-                            foreign_pkgs.push(name);
-                        }
+        if !skip_aur {
+            for pkg in alpm.localdb().pkgs() {
+                if !syncdbs.iter().any(|db| db.pkg(pkg.name()).is_ok()) {
+                    let name = pkg.name().to_string();
+                    if foreign_pkgs_set.insert(name.clone()) {
+                        foreign_pkgs.push(name);
                     }
                 }
             }
-            if !pattern.contains('*')
-                && !pattern.contains('?')
-                && !pattern.contains('[')
-                && foreign_pkgs_set.insert(pattern.clone())
-            {
-                foreign_pkgs.push(pattern.clone());
+            for (pattern, repo) in &pins {
+                if !repo.eq_ignore_ascii_case("aur") {
+                    continue;
+                }
+                if let Ok(glob) = Pattern::new(pattern) {
+                    for pkg in alpm.localdb().pkgs() {
+                        if glob.matches(pkg.name()) {
+                            let name = pkg.name().to_string();
+                            if foreign_pkgs_set.insert(name.clone()) {
+                                foreign_pkgs.push(name);
+                            }
+                        }
+                    }
+                }
+                if !pattern.contains('*')
+                    && !pattern.contains('?')
+                    && !pattern.contains('[')
+                    && foreign_pkgs_set.insert(pattern.clone())
+                {
+                    foreign_pkgs.push(pattern.clone());
+                }
             }
         }
 
-        let aur_handle = thread::spawn(move || -> HashMap<String, AurItem> {
-            if !foreign_pkgs.is_empty() {
+        let aur_handle = if !skip_aur && !foreign_pkgs.is_empty() {
+            Some(thread::spawn(move || -> HashMap<String, AurItem> {
                 aur::query_aur(&foreign_pkgs)
-            } else {
-                HashMap::new()
-            }
-        });
+            }))
+        } else {
+            None
+        };
 
-        let installed_dbs_handle = thread::spawn(Self::load_installed_dbs);
+        let installed_dbs_handle = if config.features.vendor_stickiness {
+            Some(thread::spawn(Self::load_installed_dbs))
+        } else {
+            None
+        };
 
         let alpm = self.manager.handle();
         let repos = self.manager.repos();
         let local_pkgs = alpm.localdb().pkgs();
         let installed_count = local_pkgs.len();
 
-        let aur_data = aur_handle.join().unwrap_or_default();
-        let installed_dbs = installed_dbs_handle.join().unwrap_or_default();
+        let installed_dbs = installed_dbs_handle
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
+        let aur_data = aur_handle
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
 
         let syncdbs_list: Vec<&alpm::Db> = alpm.syncdbs().into_iter().collect();
         let syncdb_map: HashMap<&str, &alpm::Db> =
@@ -332,28 +346,33 @@ impl<'a> ResolverEngine<'a> {
             let inst_ver = inst_pkg.version();
             let inst_size = inst_pkg.isize();
 
-            // Determine originating repository
-            let mut installed_db = installed_dbs.get(pkg_name).cloned().unwrap_or_default();
-            if installed_db.is_empty() {
-                let mut fallback_repo = None;
-                for r in repos {
-                    if let Some(&db) = syncdb_map.get(r.as_str()) {
-                        if let Ok(p) = db.pkg(pkg_name) {
-                            if vercmp(p.version().as_str(), inst_ver) == Ordering::Equal {
-                                installed_db = r.clone();
-                                break;
-                            } else if fallback_repo.is_none() {
-                                fallback_repo = Some(r.clone());
+            // Determine originating repository (only needed when vendor stickiness is active)
+            let installed_db = if config.features.vendor_stickiness {
+                let mut db_name = installed_dbs.get(pkg_name).cloned().unwrap_or_default();
+                if db_name.is_empty() {
+                    let mut fallback_repo = None;
+                    for r in repos {
+                        if let Some(&db) = syncdb_map.get(r.as_str()) {
+                            if let Ok(p) = db.pkg(pkg_name) {
+                                if vercmp(p.version().as_str(), inst_ver) == Ordering::Equal {
+                                    db_name = r.clone();
+                                    break;
+                                } else if fallback_repo.is_none() {
+                                    fallback_repo = Some(r.clone());
+                                }
                             }
                         }
                     }
-                }
-                if installed_db.is_empty() {
-                    if let Some(r) = fallback_repo {
-                        installed_db = r;
+                    if db_name.is_empty() {
+                        if let Some(r) = fallback_repo {
+                            db_name = r;
+                        }
                     }
                 }
-            }
+                db_name
+            } else {
+                String::new()
+            };
 
             let pinned_repo = if config.features.pinning {
                 Self::match_pinned_package(pkg_name, &config.pins, &glob_pins)
@@ -367,19 +386,19 @@ impl<'a> ResolverEngine<'a> {
             };
 
             let mut natural_top_repo = None;
-            for r in repos {
-                if let Some(&db) = syncdb_map.get(r.as_str()) {
-                    if db.pkg(pkg_name).is_ok() {
-                        natural_top_repo = Some(r.clone());
-                        break;
-                    }
-                }
-            }
-
             let mut candidate: Option<CandidatePackage> = None;
             let mut is_sticky = false;
 
             if state == "custom" {
+                for r in repos {
+                    if let Some(&db) = syncdb_map.get(r.as_str()) {
+                        if db.pkg(pkg_name).is_ok() {
+                            natural_top_repo = Some(r.clone());
+                            break;
+                        }
+                    }
+                }
+
                 let target_repo = pinned_repo.as_ref().unwrap();
                 if target_repo.eq_ignore_ascii_case("aur") {
                     if let Some(aur_pkg) = aur_data.get(pkg_name) {
@@ -414,6 +433,15 @@ impl<'a> ResolverEngine<'a> {
                     && !(config.features.pinning
                         && Self::is_excluded(pkg_name, &installed_db, &config.exclude))
                 {
+                    for r in repos {
+                        if let Some(&db) = syncdb_map.get(r.as_str()) {
+                            if db.pkg(pkg_name).is_ok() {
+                                natural_top_repo = Some(r.clone());
+                                break;
+                            }
+                        }
+                    }
+
                     if installed_db.eq_ignore_ascii_case("aur") {
                         if let Some(aur_pkg) = aur_data.get(pkg_name) {
                             candidate = Some(CandidatePackage::from_aur(aur_pkg));
@@ -436,35 +464,37 @@ impl<'a> ResolverEngine<'a> {
                             is_sticky = true;
                         }
                     }
-                }
-
-                // If not resolved by vendor stickiness, search repos in priority order
-                if candidate.is_none() {
+                } else {
+                    // Standard resolution: unified single-pass search across repos in priority order
                     for r in repos {
-                        if config.features.pinning
-                            && Self::is_excluded(pkg_name, r, &config.exclude)
-                        {
-                            continue;
-                        }
                         if let Some(&db) = syncdb_map.get(r.as_str()) {
                             if let Ok(p) = db.pkg(pkg_name) {
-                                candidate = Some(CandidatePackage {
-                                    name: p.name().to_string(),
-                                    version: p.version().to_string(),
-                                    repo: r.clone(),
-                                    base: p.base().unwrap_or(p.name()).to_string(),
-                                    csize: p.size(),
-                                    isize: p.isize(),
-                                    desc: p.desc().unwrap_or("").to_string(),
-                                    builddate: p.build_date(),
-                                    is_aur: false,
-                                    depends: p
-                                        .depends()
-                                        .iter()
-                                        .map(|d| d.name().to_string())
-                                        .collect(),
-                                });
-                                break;
+                                if natural_top_repo.is_none() {
+                                    natural_top_repo = Some(r.clone());
+                                }
+                                let is_excl = config.features.pinning
+                                    && Self::is_excluded(pkg_name, r, &config.exclude);
+                                if !is_excl && candidate.is_none() {
+                                    candidate = Some(CandidatePackage {
+                                        name: p.name().to_string(),
+                                        version: p.version().to_string(),
+                                        repo: r.clone(),
+                                        base: p.base().unwrap_or(p.name()).to_string(),
+                                        csize: p.size(),
+                                        isize: p.isize(),
+                                        desc: p.desc().unwrap_or("").to_string(),
+                                        builddate: p.build_date(),
+                                        is_aur: false,
+                                        depends: p
+                                            .depends()
+                                            .iter()
+                                            .map(|d| d.name().to_string())
+                                            .collect(),
+                                    });
+                                }
+                                if natural_top_repo.is_some() && candidate.is_some() {
+                                    break;
+                                }
                             }
                         }
                     }

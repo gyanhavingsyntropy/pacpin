@@ -474,8 +474,13 @@ fn main() {
     if cmd == "repos" || cmd == "repo-order" || cmd == "priority" {
         cmd_repos(config);
         exit(0);
-    } else if cmd == "check" || cmd == "-Qu" {
-        cmd_check(&config);
+    } else if cmd == "check" || cmd == "-Qu" || (cmd.starts_with("-Q") && cmd.contains('u')) {
+        let mut check_args = Vec::new();
+        if cmd.starts_with("-Q") && cmd.contains('q') {
+            check_args.push("-q".to_string());
+        }
+        check_args.extend_from_slice(&args[1..]);
+        cmd_check(&config, &check_args);
     } else if is_upgrade_invocation(&args) {
         let (_targets, extra_flags) = parse_pacman_cli_args(&args[1..]);
         let dry_run = args.iter().any(|a| a == "-n" || a == "--dry-run")
