@@ -49,6 +49,16 @@ pub fn cmd_upgrade(
             "{}",
             ":: Refreshing package databases (sudo pacman -Sy)...".cyan()
         );
+
+        let ext_refresh_providers = ext_providers.clone();
+        let ext_refresh_handle = if !ext_refresh_providers.is_empty() {
+            Some(thread::spawn(move || {
+                IntegrationsManager::refresh_all_parallel(&ext_refresh_providers);
+            }))
+        } else {
+            None
+        };
+
         let status = Command::new("sudo").args(["pacman", "-Sy"]).status();
         match status {
             Ok(s) if s.success() => {}
@@ -69,8 +79,8 @@ pub fn cmd_upgrade(
             }
         }
 
-        if !ext_providers.is_empty() {
-            IntegrationsManager::refresh_all_parallel(&ext_providers);
+        if let Some(h) = ext_refresh_handle {
+            let _ = h.join();
         }
     }
 
