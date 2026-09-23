@@ -37,7 +37,7 @@ use config::{load_config, save_config, Config};
 use db::AlpmManager;
 use integrations::IntegrationsManager;
 use journal::TransactionJournal;
-use orphans::OrphanManager;
+use orphans::{OrphanManager, OrphanPackage};
 use resolver::{ResolvedPackage, ResolverEngine};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -211,7 +211,7 @@ fn cmd_upgrade(
             } else if autoremove {
                 orphans
                     .iter()
-                    .filter(|o| o.optional_for.is_empty())
+                    .filter(|o| o.is_pure())
                     .map(|o| o.name.clone())
                     .collect()
             } else {
@@ -221,15 +221,14 @@ fn cmd_upgrade(
             if !selected_orphans.is_empty() {
                 OrphanManager::execute_removal(&selected_orphans);
             }
-            let remaining: Vec<String> = orphans
+            let remaining: Vec<OrphanPackage> = orphans
                 .iter()
-                .map(|o| o.name.clone())
-                .filter(|name| !selected_orphans.contains(name))
+                .filter(|o| !selected_orphans.contains(&o.name))
+                .cloned()
                 .collect();
             OrphanManager::save_known(&remaining);
         } else if !dry_run && OrphanManager::load_known().is_none() {
-            let all: Vec<String> = orphans.iter().map(|o| o.name.clone()).collect();
-            OrphanManager::save_known(&all);
+            OrphanManager::save_known(&orphans);
         }
         return;
     }
@@ -328,7 +327,7 @@ fn cmd_upgrade(
     } else if autoremove && !orphans.is_empty() {
         selected_orphans = orphans
             .iter()
-            .filter(|o| o.optional_for.is_empty())
+            .filter(|o| o.is_pure())
             .map(|o| o.name.clone())
             .collect();
     }
@@ -469,10 +468,10 @@ fn cmd_upgrade(
         }
 
         // Update known orphans state after transaction & removals
-        let remaining_orphans: Vec<String> = orphans
+        let remaining_orphans: Vec<OrphanPackage> = orphans
             .iter()
-            .map(|o| o.name.clone())
-            .filter(|name| !selected_orphans.contains(name))
+            .filter(|o| !selected_orphans.contains(&o.name))
+            .cloned()
             .collect();
         OrphanManager::save_known(&remaining_orphans);
     } else {
@@ -1112,7 +1111,7 @@ fn cmd_orphans(clean: bool, noconfirm: bool) {
         } else {
             orphans
                 .iter()
-                .filter(|o| o.optional_for.is_empty())
+                .filter(|o| o.is_pure())
                 .map(|o| o.name.clone())
                 .collect()
         };
@@ -1120,15 +1119,14 @@ fn cmd_orphans(clean: bool, noconfirm: bool) {
             check_pacman_lock();
             OrphanManager::execute_removal(&selected);
         }
-        let remaining: Vec<String> = orphans
+        let remaining: Vec<OrphanPackage> = orphans
             .iter()
-            .map(|o| o.name.clone())
-            .filter(|name| !selected.contains(name))
+            .filter(|o| !selected.contains(&o.name))
+            .cloned()
             .collect();
         OrphanManager::save_known(&remaining);
     } else {
-        let all: Vec<String> = orphans.iter().map(|o| o.name.clone()).collect();
-        OrphanManager::save_known(&all);
+        OrphanManager::save_known(&orphans);
         println!(
             "\n{}",
             "Use 'pacpin orphans -c' (or 'pin autoremove') to remove selected unneeded dependencies.".dimmed()

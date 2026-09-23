@@ -35,6 +35,20 @@ pub struct OrphanPackage {
     pub optional_for: Vec<String>,
 }
 
+impl OrphanPackage {
+    #[inline]
+    pub fn is_pure(&self) -> bool {
+        self.optional_for.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KnownOrphan {
+    pub is_pure: bool,
+    #[serde(default)]
+    pub optional_for: Vec<String>,
+}
+
 pub struct OrphanManager;
 
 impl OrphanManager {
@@ -42,17 +56,39 @@ impl OrphanManager {
         TransactionJournal::state_dir().ok().map(|d| d.join("known_orphans.json"))
     }
 
-    pub fn load_known() -> Option<HashSet<String>> {
+    pub fn load_known() -> Option<HashMap<String, KnownOrphan>> {
         let path = Self::state_file()?;
         if !path.exists() {
             return None;
         }
         let content = fs::read_to_string(&path).ok()?;
-        let list: Vec<String> = serde_json::from_str(&content).ok()?;
-        Some(list.into_iter().collect())
+
+        // 1. Modern detailed format: Map of package name -> KnownOrphan
+        if let Ok(map) = serde_json::from_str::<HashMap<String, KnownOrphan>>(&content) {
+            return Some(map);
+        }
+
+        // 2. Backward compatibility: legacy flat array of package name strings
+        if let Ok(list) = serde_json::from_str::<Vec<String>>(&content) {
+            let map = list
+                .into_iter()
+                .map(|name| {
+                    (
+                        name,
+                        KnownOrphan {
+                            is_pure: false, // Default to false so any pure orphan alerts the user
+                            optional_for: Vec::new(),
+                        },
+                    )
+                })
+                .collect();
+            return Some(map);
+        }
+
+        None
     }
 
-    pub fn save_known(orphans: &[String]) {
+    pub fn save_known(orphans: &[OrphanPackage]) {
         let path = match Self::state_file() {
             Some(p) => p,
             None => return,
@@ -60,10 +96,17 @@ impl OrphanManager {
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
-        let mut sorted = orphans.to_vec();
-        sorted.sort();
-        sorted.dedup();
-        if let Ok(json) = serde_json::to_string_pretty(&sorted) {
+        let mut map: std::collections::BTreeMap<String, KnownOrphan> = std::collections::BTreeMap::new();
+        for o in orphans {
+            map.insert(
+                o.name.clone(),
+                KnownOrphan {
+                    is_pure: o.is_pure(),
+                    optional_for: o.optional_for.clone(),
+                },
+            );
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&map) {
             let _ = fs::write(path, json);
         }
     }
@@ -143,7 +186,10 @@ impl OrphanManager {
 
     pub fn has_changed(current: &[OrphanPackage]) -> bool {
         match Self::load_known() {
-            Some(known) => current.iter().any(|o| !known.contains(&o.name)),
+            Some(known) => current.iter().any(|o| match known.get(&o.name) {
+                None => true,
+                Some(record) => record.is_pure != o.is_pure(),
+            }),
             None => !current.is_empty(),
         }
     }
@@ -202,3 +248,125 @@ impl OrphanManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_orphan_is_pure() {
+        let pure = OrphanPackage {
+            name: "pure-pkg".to_string(),
+            version: "1.0".to_string(),
+            isize: 100,
+            desc: "pure orphan".to_string(),
+            is_projected: false,
+            dropped_by: Vec::new(),
+            optional_for: Vec::new(),
+        };
+        assert!(pure.is_pure());
+
+        let opt = OrphanPackage {
+            name: "opt-pkg".to_string(),
+            version: "1.0".to_string(),
+            isize: 200,
+            desc: "optional orphan".to_string(),
+            is_projected: false,
+            dropped_by: Vec::new(),
+            optional_for: vec!["parent-app".to_string()],
+        };
+        assert!(!opt.is_pure());
+    }
+
+    #[test]
+    fn test_has_changed_logic() {
+        let mut known = HashMap::new();
+        known.insert(
+            "ladspa".to_string(),
+            KnownOrphan {
+                is_pure: false,
+                optional_for: vec!["ffmpeg".to_string()],
+            },
+        );
+        known.insert(
+            "meson".to_string(),
+            KnownOrphan {
+                is_pure: true,
+                optional_for: Vec::new(),
+            },
+        );
+
+        // 1. Identical current state -> no change
+        let current_identical = [
+            OrphanPackage {
+                name: "ladspa".to_string(),
+                version: "1.0".to_string(),
+                isize: 100,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: vec!["ffmpeg".to_string()],
+            },
+            OrphanPackage {
+                name: "meson".to_string(),
+                version: "1.0".to_string(),
+                isize: 200,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: Vec::new(),
+            },
+        ];
+        let has_change = current_identical.iter().any(|o| match known.get(&o.name) {
+            None => true,
+            Some(r) => r.is_pure != o.is_pure(),
+        });
+        assert!(!has_change);
+
+        // 2. 'ladspa' converts from optional to pure -> MUST detect change!
+        let current_converted = [
+            OrphanPackage {
+                name: "ladspa".to_string(),
+                version: "1.0".to_string(),
+                isize: 100,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: Vec::new(), // Now pure!
+            },
+            OrphanPackage {
+                name: "meson".to_string(),
+                version: "1.0".to_string(),
+                isize: 200,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: Vec::new(),
+            },
+        ];
+        let has_change_converted = current_converted.iter().any(|o| match known.get(&o.name) {
+            None => true,
+            Some(r) => r.is_pure != o.is_pure(),
+        });
+        assert!(has_change_converted);
+
+        // 3. Brand new orphan appears -> MUST detect change!
+        let current_new_orphan = [
+            OrphanPackage {
+                name: "new-orphan".to_string(),
+                version: "1.0".to_string(),
+                isize: 50,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: Vec::new(),
+            },
+        ];
+        let has_change_new = current_new_orphan.iter().any(|o| match known.get(&o.name) {
+            None => true,
+            Some(r) => r.is_pure != o.is_pure(),
+        });
+        assert!(has_change_new);
+    }
+}
+
