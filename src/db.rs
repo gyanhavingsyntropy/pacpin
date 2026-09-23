@@ -24,6 +24,7 @@ use std::process::Command;
 pub struct DownloadTarget {
     pub name: String,
     pub url: String,
+    pub candidate_urls: Vec<String>,
     pub sha256: Option<String>,
 }
 
@@ -185,17 +186,17 @@ impl AlpmManager {
             })?
         };
 
-        let mut server_cache: HashMap<String, String> = HashMap::new();
-        let mut get_server = |repo_name: &str| -> Result<String, String> {
+        let mut server_cache: HashMap<String, Vec<String>> = HashMap::new();
+        let mut get_servers = |repo_name: &str| -> Result<Vec<String>, String> {
             if let Some(s) = server_cache.get(repo_name) {
                 return Ok(s.clone());
             }
             let servers = Self::get_mirror_servers(repo_name);
-            let s = servers.first().cloned().ok_or_else(|| {
-                format!("No mirror server configured for repository '{}'", repo_name)
-            })?;
-            server_cache.insert(repo_name.to_string(), s.clone());
-            Ok(s)
+            if servers.is_empty() {
+                return Err(format!("No mirror server configured for repository '{}'", repo_name));
+            }
+            server_cache.insert(repo_name.to_string(), servers.clone());
+            Ok(servers)
         };
 
         let local_db = self.handle.localdb();
@@ -211,7 +212,7 @@ impl AlpmManager {
             visited_deps: &mut HashSet<String>,
             visited_pkgs: &mut HashSet<String>,
             ordered_targets: &mut Vec<DownloadTarget>,
-            get_server: &mut dyn FnMut(&str) -> Result<String, String>,
+            get_servers: &mut dyn FnMut(&str) -> Result<Vec<String>, String>,
         ) -> Result<(), String> {
             for dep in pkg.depends() {
                 let dep_name = dep.name();
@@ -248,18 +249,23 @@ impl AlpmManager {
                             visited_deps,
                             visited_pkgs,
                             ordered_targets,
-                            get_server,
+                            get_servers,
                         )?;
 
                         let filename = dep_pkg.filename().ok_or_else(|| {
                             format!("No filename found for package '{}'", real_name)
                         })?;
-                        let server = get_server(&sdb_name)?;
-                        let url = format!("{}/{}", server.trim_end_matches('/'), filename);
+                        let servers = get_servers(&sdb_name)?;
+                        let candidate_urls: Vec<String> = servers
+                            .iter()
+                            .map(|s| format!("{}/{}", s.trim_end_matches('/'), filename))
+                            .collect();
+                        let url = candidate_urls.first().cloned().unwrap_or_default();
                         let sha256 = dep_pkg.sha256sum().map(|s| s.to_string());
                         ordered_targets.push(DownloadTarget {
                             name: real_name,
                             url,
+                            candidate_urls,
                             sha256,
                         });
                     }
@@ -277,22 +283,23 @@ impl AlpmManager {
             &mut visited_deps,
             &mut visited_pkgs,
             &mut ordered_targets,
-            &mut get_server,
+            &mut get_servers,
         )?;
 
         let target_filename = target_pkg
             .filename()
             .ok_or_else(|| format!("No filename found for package '{}'", target_pkg.name()))?;
-        let target_server = get_server(&target_db_name)?;
-        let target_url = format!(
-            "{}/{}",
-            target_server.trim_end_matches('/'),
-            target_filename
-        );
+        let target_servers = get_servers(&target_db_name)?;
+        let target_candidate_urls: Vec<String> = target_servers
+            .iter()
+            .map(|s| format!("{}/{}", s.trim_end_matches('/'), target_filename))
+            .collect();
+        let target_url = target_candidate_urls.first().cloned().unwrap_or_default();
         let target_sha256 = target_pkg.sha256sum().map(|s| s.to_string());
         ordered_targets.push(DownloadTarget {
             name: target_pkg.name().to_string(),
             url: target_url,
+            candidate_urls: target_candidate_urls,
             sha256: target_sha256,
         });
 

@@ -360,6 +360,52 @@ pub fn is_safe_tar_entry(entry: &str) -> bool {
     true
 }
 
+pub fn is_safe_link_destination(src: &str, dst: &str) -> bool {
+    let trimmed_dst = dst.trim();
+    if trimmed_dst.is_empty() {
+        return false;
+    }
+    // No absolute paths or drive letters
+    if trimmed_dst.starts_with('/') || trimmed_dst.starts_with('\\') {
+        return false;
+    }
+    if trimmed_dst.len() >= 2
+        && trimmed_dst.chars().next().unwrap().is_ascii_alphabetic()
+        && trimmed_dst.chars().nth(1) == Some(':')
+    {
+        return false;
+    }
+
+    // Calculate directory depth of the link's source relative to sandbox root
+    let src_trimmed = src.trim().trim_start_matches(['/', '\\']);
+    let parent_components: Vec<&str> = src_trimmed
+        .split(['/', '\\'])
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    let mut depth: isize = if parent_components.is_empty() {
+        0
+    } else {
+        (parent_components.len() - 1) as isize
+    };
+
+    for comp in trimmed_dst.split(['/', '\\']) {
+        if comp.is_empty() || comp == "." {
+            continue;
+        }
+        if comp == ".." {
+            depth -= 1;
+            if depth < 0 {
+                // Link traverses above the archive root!
+                return false;
+            }
+        } else {
+            depth += 1;
+        }
+    }
+
+    true
+}
+
 pub fn is_safe_tar_listing_line(line: &str) -> Result<(String, u64), String> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     if tokens.is_empty() {
@@ -381,7 +427,7 @@ pub fn is_safe_tar_listing_line(line: &str) -> Result<(String, u64), String> {
         if !is_safe_tar_entry(src) {
             return Err(format!("Unsafe symlink source entry: {}", src));
         }
-        if dst.starts_with('/') || dst.starts_with('\\') || !is_safe_tar_entry(dst) {
+        if !is_safe_link_destination(src, dst) {
             return Err(format!("Unsafe symlink destination '{}' points outside sandbox root", dst));
         }
         Ok((src.to_string(), size))
@@ -389,7 +435,7 @@ pub fn is_safe_tar_listing_line(line: &str) -> Result<(String, u64), String> {
         if !is_safe_tar_entry(src) {
             return Err(format!("Unsafe hardlink source entry: {}", src));
         }
-        if dst.starts_with('/') || dst.starts_with('\\') || !is_safe_tar_entry(dst) {
+        if !is_safe_link_destination(src, dst) {
             return Err(format!("Unsafe hardlink destination '{}' points outside sandbox root", dst));
         }
         Ok((src.to_string(), size))
@@ -448,9 +494,14 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
 
     // 1. Download, verify, and safely inspect archives before extraction
     for target in &resolved {
+        let candidate_urls = if target.candidate_urls.is_empty() {
+            vec![target.url.clone()]
+        } else {
+            target.candidate_urls.clone()
+        };
         let tarball_path = get_or_download_package(
             &target.name,
-            &target.url,
+            &candidate_urls,
             target.sha256.as_deref(),
             options.allow_unverified,
             &mut guard,
@@ -696,7 +747,7 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
 
 fn get_or_download_package(
     pkg: &str,
-    url: &str,
+    candidate_urls: &[String],
     expected_sha: Option<&str>,
     allow_unverified: bool,
     guard: &mut SandboxGuard,
@@ -771,57 +822,93 @@ fn get_or_download_package(
         }
     };
 
-    // 3. Download to secure, unguessable temporary file
-    let ext = if url.ends_with(".pkg.tar.xz") {
-        "pkg.tar.xz"
-    } else {
-        "pkg.tar.zst"
-    };
-
-    let temp_download = create_secure_temp_file(&env::temp_dir(), &format!("pacpin-download-{}", pkg), ext)?;
-    guard.downloaded_tarballs.push(temp_download.clone());
-
-    println!("{} Fetching '{}' from {}...", "::".cyan(), pkg, url.dimmed());
-    let curl_status = Command::new("curl")
-        .args(["-sSL", "-o", temp_download.to_str().unwrap(), url])
-        .status()
-        .map_err(|e| format!("Failed to execute curl: {}", e))?;
-
-    if !curl_status.success() {
-        let _ = fs::remove_file(&temp_download);
-        return Err(format!("curl download failed with exit code {:?}", curl_status.code()));
+    if candidate_urls.is_empty() {
+        return Err(format!("No download URLs configured for package '{}'", pkg));
     }
 
-    // 4. Fail-Closed SHA256 integrity check against ALPM database metadata
-    if !expected.is_empty() {
-        let out = Command::new("sha256sum")
-            .arg(&temp_download)
-            .output()
-            .map_err(|e| {
+    // 3. Download with automatic mirror failover and SHA256 integrity verification
+    let mut last_err = String::new();
+    for (i, url) in candidate_urls.iter().enumerate() {
+        if i > 0 {
+            println!(
+                "{} Retrying download from backup mirror {}...",
+                "::".yellow(),
+                url.dimmed()
+            );
+        } else {
+            println!("{} Fetching '{}' from {}...", "::".cyan(), pkg, url.dimmed());
+        }
+
+        let ext = if url.ends_with(".pkg.tar.xz") {
+            "pkg.tar.xz"
+        } else {
+            "pkg.tar.zst"
+        };
+
+        let temp_download = create_secure_temp_file(
+            &env::temp_dir(),
+            &format!("pacpin-download-{}", pkg),
+            ext,
+        )?;
+        guard.downloaded_tarballs.push(temp_download.clone());
+
+        // -f (--fail) ensures curl immediately fails on HTTP 4xx/5xx rather than writing HTML error pages
+        let curl_status = Command::new("curl")
+            .args(["-sSLf", "-o", temp_download.to_str().unwrap(), url])
+            .status();
+
+        match curl_status {
+            Ok(s) if s.success() => {
+                if !expected.is_empty() {
+                    let out = Command::new("sha256sum").arg(&temp_download).output();
+                    match out {
+                        Ok(o) if o.status.success() => {
+                            let stdout = String::from_utf8_lossy(&o.stdout);
+                            let computed = stdout.split_whitespace().next().unwrap_or("");
+                            if computed.eq_ignore_ascii_case(expected) {
+                                return Ok(temp_download);
+                            } else {
+                                last_err = format!(
+                                    "SHA256 checksum mismatch (expected: {}, computed: {})",
+                                    expected, computed
+                                );
+                                let _ = fs::remove_file(&temp_download);
+                                println!(
+                                    "{} Warning: Mirror '{}' returned invalid checksum. Trying next mirror...",
+                                    "::".yellow(),
+                                    url
+                                );
+                            }
+                        }
+                        _ => {
+                            last_err = "Failed to run sha256sum".to_string();
+                            let _ = fs::remove_file(&temp_download);
+                        }
+                    }
+                } else {
+                    return Ok(temp_download);
+                }
+            }
+            Ok(s) => {
+                last_err = format!("curl failed with HTTP error or status {:?}", s.code());
                 let _ = fs::remove_file(&temp_download);
-                format!("Failed to execute sha256sum for integrity verification: {}", e)
-            })?;
-
-        if !out.status.success() {
-            let _ = fs::remove_file(&temp_download);
-            return Err(format!(
-                "sha256sum verification failed with exit code {:?}.",
-                out.status.code()
-            ));
-        }
-
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let computed = stdout.split_whitespace().next().unwrap_or("");
-        if !computed.eq_ignore_ascii_case(expected) {
-            let _ = fs::remove_file(&temp_download);
-            return Err(format!(
-                "SHA256 checksum verification failed for '{}'!\n  Expected: {}\n  Computed: {}\nDownloaded package was discarded for security.",
-                pkg, expected, computed
-            ));
+                println!(
+                    "{} Warning: Mirror '{}' failed (HTTP error). Trying next mirror...",
+                    "::".yellow(),
+                    url
+                );
+            }
+            Err(e) => {
+                last_err = format!("Failed to execute curl: {}", e);
+                let _ = fs::remove_file(&temp_download);
+            }
         }
     }
 
-    Ok(temp_download)
+    Err(format!(
+        "All configured mirrors failed to download verified package '{}': {}",
+        pkg, last_err
+    ))
 }
 
 fn find_executable(sandbox_dir: &Path, pkg: &str, requested_bin: Option<&str>) -> Result<PathBuf, String> {
@@ -999,9 +1086,17 @@ mod tests {
         let bad_symlink = "lrwxrwxrwx 0/0 0 2026-09-01 12:00 usr/bin/bad -> /etc/shadow";
         assert!(is_safe_tar_listing_line(bad_symlink).is_err());
 
-        // Unsafe path traversal symlink
-        let escaping_symlink = "lrwxrwxrwx 0/0 0 2026-09-01 12:00 usr/bin/bad -> ../../etc/passwd";
+        // Unsafe path traversal symlink (exceeds root)
+        let escaping_symlink = "lrwxrwxrwx 0/0 0 2026-09-01 12:00 usr/bin/bad -> ../../../etc/passwd";
         assert!(is_safe_tar_listing_line(escaping_symlink).is_err());
+
+        // Safe deep internal relative symlink (e.g. from official rust package)
+        let deep_internal_symlink = "lrwxrwxrwx 0/0 0 2026-09-01 12:00 usr/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld/ld.lld -> ../../../../../bin/ld.lld";
+        assert!(is_safe_tar_listing_line(deep_internal_symlink).is_ok());
+
+        // Unsafe escaping symlink from deep directory
+        let deep_escaping_symlink = "lrwxrwxrwx 0/0 0 2026-09-01 12:00 usr/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld/ld.lld -> ../../../../../../../etc/shadow";
+        assert!(is_safe_tar_listing_line(deep_escaping_symlink).is_err());
 
         // Unsafe hardlink
         let bad_hardlink = "hrwxr-xr-x 0/0 0 2026-09-01 12:00 usr/bin/bad link to /etc/shadow";
