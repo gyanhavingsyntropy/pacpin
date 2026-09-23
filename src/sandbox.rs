@@ -17,6 +17,7 @@
 use colored::Colorize;
 use std::env;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -452,16 +453,74 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
         return Err(format!("Invalid package name '{}'.", pkg));
     }
 
-    let bwrap_available = crate::is_command_available("bwrap");
+    let mut bwrap_available = crate::is_command_available("bwrap");
 
     if !options.no_sandbox && !bwrap_available {
-        return Err(
-            "Bubblewrap ('bwrap') is not installed on this system.\n  \
-            'pacpin try' defaults to fail-closed container isolation for security.\n  \
-            To run securely in a sandbox container, install bubblewrap:\n    \
-            sudo pacman -S bubblewrap\n  \
-            To bypass sandboxing and run directly on your host (UNSAFE), pass --no-sandbox.".to_string()
-        );
+        let is_interactive = io::stdin().is_terminal();
+        if is_interactive {
+            print!(
+                "\n{} Bubblewrap ('bwrap') is required for sandbox container isolation but is not installed.\n   Would you like pacpin to install 'bubblewrap' now? [Y/n] ",
+                "::".cyan().bold()
+            );
+            let _ = io::stdout().flush();
+            let mut answer = String::new();
+            if io::stdin().read_line(&mut answer).is_ok() {
+                let trimmed = answer.trim().to_lowercase();
+                if trimmed.is_empty() || trimmed == "y" || trimmed == "yes" {
+                    println!("{}", ":: Installing bubblewrap via pacpin...".cyan());
+                    let mut config = crate::config::load_config();
+                    let install_opts = crate::installer::InstallOptions {
+                        needed: true,
+                        noconfirm: false,
+                        refresh: false,
+                        dry_run: false,
+                        forwarded_flags: Vec::new(),
+                    };
+                    match crate::installer::install_packages(
+                        &mut config,
+                        &["bubblewrap".to_string()],
+                        &install_opts,
+                    ) {
+                        Ok(_) => {
+                            bwrap_available = crate::is_command_available("bwrap");
+                            if !bwrap_available {
+                                return Err(
+                                    "Package installation completed but 'bwrap' executable was not found in PATH."
+                                        .to_string(),
+                                );
+                            }
+                            println!(
+                                "{}",
+                                "✔ 'bubblewrap' installed successfully. Resuming sandbox..."
+                                    .green()
+                                    .bold()
+                            );
+                        }
+                        Err(e) => {
+                            return Err(format!("Failed to install 'bubblewrap': {}", e));
+                        }
+                    }
+                } else {
+                    return Err(
+                        "Bubblewrap ('bwrap') is not installed.\n  \
+                        'pacpin try' defaults to fail-closed container isolation for security.\n  \
+                        To bypass sandboxing and run directly on your host (UNSAFE), pass --no-sandbox."
+                            .to_string(),
+                    );
+                }
+            } else {
+                return Err("Failed to read user input. Aborting.".to_string());
+            }
+        } else {
+            return Err(
+                "Bubblewrap ('bwrap') is not installed on this system.\n  \
+                'pacpin try' defaults to fail-closed container isolation for security.\n  \
+                To run securely in a sandbox container, install bubblewrap:\n    \
+                sudo pacman -S bubblewrap\n  \
+                To bypass sandboxing and run directly on your host (UNSAFE), pass --no-sandbox."
+                    .to_string(),
+            );
+        }
     }
 
     let prefix = if options.is_run_mode { "pacpin-run" } else { "pacpin-try" };

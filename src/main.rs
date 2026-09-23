@@ -18,6 +18,7 @@ mod alias;
 mod aur;
 mod config;
 mod db;
+mod installer;
 mod integrations;
 mod journal;
 mod orphans;
@@ -508,128 +509,7 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
     let noconfirm = flags.iter().any(|f| f == "--noconfirm");
     let needed = true;
 
-    if refresh && !dry_run {
-        println!(
-            "{}",
-            ":: Warning: Installing packages with '-y' (database refresh) without performing a full system upgrade".yellow().bold()
-        );
-        println!(
-            "{}",
-            "   can lead to partial upgrades and dependency breakage on Arch Linux.".yellow()
-        );
-        println!(
-            "{}",
-            ":: Refreshing package databases (sudo pacman -Sy)...".cyan()
-        );
-        let status = Command::new("sudo").args(["pacman", "-Sy"]).status();
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "Error: Database refresh failed with exit code {}.",
-                        s.code().unwrap_or(1)
-                    )
-                    .red()
-                );
-                exit(s.code().unwrap_or(1));
-            }
-            Err(e) => {
-                eprintln!("{}", format!("Failed to run sudo pacman: {}", e).red());
-                exit(1);
-            }
-        }
-    }
-
-    let manager = match AlpmManager::with_repo_order(&config.repo_order) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("{}", format!("Error initializing ALPM: {}", e).red());
-            exit(1);
-        }
-    };
-
-    let mut pacman_targets = Vec::new();
-    let mut aur_targets = Vec::new();
-    let mut pending_pins: Vec<(String, String)> = Vec::new();
-
-    let mut known_repos = manager.repos().to_vec();
-    known_repos.push("aur".to_string());
-
-    for target in targets {
-        if target.contains('/') {
-            let parts: Vec<&str> = target.splitn(2, '/').collect();
-            let repo = parts[0];
-            let pkg = parts[1];
-
-            if !known_repos.iter().any(|r| r == repo) {
-                eprintln!(
-                    "{}",
-                    format!("Error: Repository '[{}]' is not recognized.", repo).red()
-                );
-                eprintln!("Configured repositories: {}", known_repos.join(", "));
-                exit(1);
-            }
-
-            if repo.eq_ignore_ascii_case("aur") {
-                let companions = manager.find_companions(pkg, "aur", &config.pins);
-                let mut to_install_repo = vec![pkg.to_string()];
-                if !companions.is_empty() {
-                    let title = format!(
-                        "'{}' has companion packages in [aur] to avoid version mismatches",
-                        pkg
-                    );
-                    let selected = prompt_multiselect(&title, "aur", &companions);
-                    to_install_repo.extend(selected);
-                }
-                for p in to_install_repo {
-                    pending_pins.push((p.clone(), "aur".to_string()));
-                    aur_targets.push(p);
-                }
-            } else {
-                let companions = manager.find_companions(pkg, repo, &config.pins);
-                let mut to_install_repo = vec![pkg.to_string()];
-                if !companions.is_empty() {
-                    let title = format!(
-                        "'{}' has companion packages in [{}] to avoid version mismatches",
-                        pkg, repo
-                    );
-                    let selected = prompt_multiselect(&title, repo, &companions);
-                    to_install_repo.extend(selected);
-                }
-
-                for p in to_install_repo {
-                    pending_pins.push((p.clone(), repo.to_string()));
-                    pacman_targets.push(format!("{}/{}", repo, p));
-                }
-            }
-        } else {
-            let exists_in_sync = manager
-                .handle()
-                .syncdbs()
-                .into_iter()
-                .any(|db| db.pkg(target.as_str()).is_ok());
-            if exists_in_sync {
-                pacman_targets.push(target.clone());
-            } else {
-                // Query the AUR only after ruling out every configured sync
-                // repository, so unqualified AUR packages work like they do in
-                // modern Arch helpers without changing official-package routing.
-                let aur_query = vec![target.clone()];
-                if aur::query_aur(&aur_query).contains_key(target) {
-                    aur_targets.push(target.clone());
-                    pending_pins.push((target.clone(), "aur".to_string()));
-                } else {
-                    // Preserve pacman's normal error reporting for packages
-                    // unknown to both the configured repos and the AUR.
-                    pacman_targets.push(target.clone());
-                }
-            }
-        }
-    }
-
-    let forwarded_flags: Vec<&str> = flags
+    let forwarded_flags: Vec<String> = flags
         .iter()
         .filter(|f| {
             let s = f.as_str();
@@ -641,185 +521,22 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
                 && s != "--noconfirm"
                 && s != "--needed"
         })
-        .map(|s| s.as_str())
+        .cloned()
         .collect();
 
-    let mut command_strs = Vec::new();
-    if refresh {
-        command_strs.push("sudo pacman -Sy".to_string());
-    }
+    let options = installer::InstallOptions {
+        needed,
+        noconfirm,
+        refresh,
+        dry_run,
+        forwarded_flags,
+    };
 
-    if !pacman_targets.is_empty() {
-        let mut cmd = vec!["sudo", "pacman", "-S"];
-        if needed {
-            cmd.push("--needed");
-        }
-        if noconfirm {
-            cmd.push("--noconfirm");
-        }
-        cmd.extend(forwarded_flags.iter().cloned());
-        let mut s = cmd.join(" ");
-        s.push(' ');
-        s.push_str(&pacman_targets.join(" "));
-        command_strs.push(s);
-    }
-
-    if !aur_targets.is_empty() {
-        let helper = &config.options.helper;
-        let mut cmd = vec![helper.as_str(), "-S", "--aur"];
-        if needed {
-            cmd.push("--needed");
-        }
-        if noconfirm {
-            cmd.push("--noconfirm");
-        }
-        cmd.extend(forwarded_flags.iter().cloned());
-        let mut s = cmd.join(" ");
-        s.push(' ');
-        s.push_str(&aur_targets.join(" "));
-        command_strs.push(s);
-    }
-
-    let full_cmd = command_strs.join(" && ");
-
-    if dry_run {
-        println!("\n{}", "Dry-Run: Synthesized Installation Commands:".bold());
-        println!("  ➔ {}", full_cmd.cyan());
-        return;
-    }
-
-    println!("\n{} {}", ":: Executing:".cyan(), full_cmd.bold());
-    let mut installed_targets: Vec<String> = Vec::new();
-    let mut executed_commands: Vec<String> = Vec::new();
-    let mut exit_status = Ok(std::process::ExitStatus::default());
-    let mut all_success = true;
-
-    if !pacman_targets.is_empty() {
-        let mut args = vec!["pacman", "-S"];
-        if needed {
-            args.push("--needed");
-        }
-        if noconfirm {
-            args.push("--noconfirm");
-        }
-        args.extend(forwarded_flags.iter().cloned());
-        args.extend(pacman_targets.iter().map(|s| s.as_str()));
-        let status = Command::new("sudo").args(&args).status();
-        match status {
-            Ok(s) if s.success() => {
-                installed_targets.extend(pacman_targets.clone());
-                let mut cmd_parts = vec!["sudo", "pacman", "-S"];
-                if needed {
-                    cmd_parts.push("--needed");
-                }
-                if noconfirm {
-                    cmd_parts.push("--noconfirm");
-                }
-                cmd_parts.extend(forwarded_flags.iter().cloned());
-                let mut cmd_str = cmd_parts.join(" ");
-                cmd_str.push(' ');
-                cmd_str.push_str(&pacman_targets.join(" "));
-                executed_commands.push(cmd_str);
-            }
-            Ok(s) => {
-                exit_status = Ok(s);
-                all_success = false;
-            }
-            Err(e) => {
-                exit_status = Err(e);
-                all_success = false;
-            }
-        }
-    }
-
-    if all_success && !aur_targets.is_empty() {
-        let helper = &config.options.helper;
-        let mut args = vec!["-S", "--aur"];
-        if needed {
-            args.push("--needed");
-        }
-        if noconfirm {
-            args.push("--noconfirm");
-        }
-        args.extend(forwarded_flags.iter().cloned());
-        args.extend(aur_targets.iter().map(|s| s.as_str()));
-        let status = Command::new(helper).args(&args).status();
-        match status {
-            Ok(s) if s.success() => {
-                installed_targets.extend(aur_targets.clone());
-                let mut cmd_parts = vec![helper.as_str(), "-S", "--aur"];
-                if needed {
-                    cmd_parts.push("--needed");
-                }
-                if noconfirm {
-                    cmd_parts.push("--noconfirm");
-                }
-                cmd_parts.extend(forwarded_flags.iter().cloned());
-                let mut cmd_str = cmd_parts.join(" ");
-                cmd_str.push(' ');
-                cmd_str.push_str(&aur_targets.join(" "));
-                executed_commands.push(cmd_str);
-            }
-            Ok(s) => {
-                exit_status = Ok(s);
-                all_success = false;
-            }
-            Err(e) => {
-                exit_status = Err(e);
-                all_success = false;
-            }
-        }
-    }
-
-    if !installed_targets.is_empty() {
-        let mut confirmed_pins_added = false;
-        for (pkg_name, repo_name) in pending_pins {
-            let was_installed = installed_targets
-                .iter()
-                .any(|t| t == &pkg_name || t == &format!("{}/{}", repo_name, pkg_name));
-            if was_installed {
-                config.pins.insert(pkg_name, repo_name);
-                confirmed_pins_added = true;
-            }
-        }
-
-        if confirmed_pins_added && !dry_run {
-            if let Err(e) = save_config(&config) {
-                eprintln!(
-                    "{}",
-                    format!("Warning: Failed to save pins to configuration: {}", e).yellow()
-                );
-            } else {
-                println!(
-                    "{}",
-                    "✔ Configuration updated with confirmed repository pins.".green()
-                );
-            }
-        }
-        let tx_packages: Vec<serde_json::Value> = installed_targets
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "name": t,
-                    "target": t
-                })
-            })
-            .collect();
-        let cmd_to_record = if executed_commands.is_empty() {
-            full_cmd.clone()
-        } else {
-            executed_commands.join(" && ")
-        };
-        let _ = TransactionJournal::record_transaction("install", tx_packages, &cmd_to_record);
-    }
-
-    if !all_success {
-        match exit_status {
-            Ok(s) => exit(s.code().unwrap_or(1)),
-            Err(e) => {
-                eprintln!("{}", format!("Execution failed: {}", e).red());
-                exit(1);
-            }
+    match installer::install_packages(&mut config, targets, &options) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("{}", format!("Error: {}", e).red());
+            exit(1);
         }
     }
 }
