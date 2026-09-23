@@ -22,7 +22,6 @@ use glob::Pattern;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -43,47 +42,22 @@ pub struct CandidatePackage {
 
 impl CandidatePackage {
     pub fn from_aur(aur_pkg: &crate::aur::AurItem) -> Self {
-        Self::from_aur_with_cache(aur_pkg, None)
-    }
-
-    pub fn from_aur_with_cache(
-        aur_pkg: &crate::aur::AurItem,
-        alpm: Option<&alpm::Alpm>,
-    ) -> Self {
         let cleaned_deps: Vec<String> = aur_pkg
             .depends
             .iter()
             .map(|d| crate::aur::clean_dep_name(d).to_string())
             .collect();
 
-        let base_name = aur_pkg
-            .package_base
-            .clone()
-            .unwrap_or_else(|| aur_pkg.name.clone());
-
-        let mut csize = 0;
-        let mut isize = 0;
-
-        if let Some(archive_path) = find_cached_aur_package(&aur_pkg.name, &aur_pkg.version, &base_name) {
-            if let Ok(meta) = std::fs::metadata(&archive_path) {
-                csize = meta.len() as i64;
-            }
-            if let Some(handle) = alpm {
-                if let Some(path_str) = archive_path.to_str() {
-                    if let Ok(loaded) = handle.pkg_load(path_str, false, alpm::SigLevel::NONE) {
-                        isize = loaded.isize();
-                    }
-                }
-            }
-        }
-
         Self {
             name: aur_pkg.name.clone(),
             version: aur_pkg.version.clone(),
             repo: "aur".to_string(),
-            base: base_name,
-            csize,
-            isize,
+            base: aur_pkg
+                .package_base
+                .clone()
+                .unwrap_or_else(|| aur_pkg.name.clone()),
+            csize: 0,
+            isize: 0,
             desc: aur_pkg.description.clone().unwrap_or_default(),
             builddate: aur_pkg.last_modified.unwrap_or(0),
             is_aur: true,
@@ -110,54 +84,6 @@ impl CandidatePackage {
         let diff = (now - self.builddate).max(0);
         (diff as f64) / 86400.0
     }
-}
-
-pub fn find_cached_aur_package(pkg_name: &str, version: &str, base: &str) -> Option<PathBuf> {
-    use glob::glob;
-    let ver_no_epoch = version.split(':').next_back().unwrap_or(version);
-    if !crate::journal::TransactionJournal::is_safe_pkg_name(pkg_name)
-        || !crate::journal::TransactionJournal::is_safe_version(ver_no_epoch)
-    {
-        return None;
-    }
-
-    let mut search_dirs = Vec::new();
-
-    // Standard pacman cache dirs
-    search_dirs.extend(crate::journal::TransactionJournal::get_cache_dirs());
-
-    // User home AUR helper cache dirs
-    if let Ok(home) = std::env::var("HOME") {
-        let home_p = PathBuf::from(home);
-        // Paru clone cache
-        search_dirs.push(home_p.join(".cache/paru/clone").join(base));
-        if base != pkg_name {
-            search_dirs.push(home_p.join(".cache/paru/clone").join(pkg_name));
-        }
-        // Yay cache
-        search_dirs.push(home_p.join(".cache/yay").join(base));
-        if base != pkg_name {
-            search_dirs.push(home_p.join(".cache/yay").join(pkg_name));
-        }
-    }
-
-    for dir in search_dirs {
-        if !dir.exists() {
-            continue;
-        }
-        for ext in &["zst", "xz", "gz"] {
-            let pattern_str = format!("{}/{}-{}-*.pkg.tar.{}", dir.display(), pkg_name, ver_no_epoch, ext);
-            if let Ok(paths) = glob(&pattern_str) {
-                for entry in paths.flatten() {
-                    let name_str = entry.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if !name_str.ends_with(".sig") {
-                        return Some(entry);
-                    }
-                }
-            }
-        }
-    }
-    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,7 +371,7 @@ impl<'a> ResolverEngine<'a> {
                 let target_repo = pinned_repo.as_ref().unwrap();
                 if target_repo.eq_ignore_ascii_case("aur") {
                     if let Some(aur_pkg) = aur_data.get(pkg_name) {
-                        candidate = Some(CandidatePackage::from_aur_with_cache(aur_pkg, Some(self.manager.handle())));
+                        candidate = Some(CandidatePackage::from_aur(aur_pkg));
                     } else {
                         unresolved_pins.push((pkg_name.to_string(), target_repo.clone()));
                     }
@@ -478,7 +404,7 @@ impl<'a> ResolverEngine<'a> {
                 {
                     if installed_db.eq_ignore_ascii_case("aur") {
                         if let Some(aur_pkg) = aur_data.get(pkg_name) {
-                            candidate = Some(CandidatePackage::from_aur_with_cache(aur_pkg, Some(self.manager.handle())));
+                            candidate = Some(CandidatePackage::from_aur(aur_pkg));
                             is_sticky = true;
                         }
                     } else if let Some(&db) = syncdb_map.get(installed_db.as_str()) {
@@ -533,7 +459,7 @@ impl<'a> ResolverEngine<'a> {
 
                     if candidate.is_none() {
                         if let Some(aur_pkg) = aur_data.get(pkg_name) {
-                            candidate = Some(CandidatePackage::from_aur_with_cache(aur_pkg, Some(self.manager.handle())));
+                            candidate = Some(CandidatePackage::from_aur(aur_pkg));
                         }
                     }
                 }
