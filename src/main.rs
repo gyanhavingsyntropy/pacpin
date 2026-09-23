@@ -541,6 +541,55 @@ fn cmd_upgrade(
     }
 }
 
+pub fn parse_install_flags(flags: &[String]) -> pm::InstallOptions {
+    let dry_run = flags.iter().any(|f| f == "-n" || f == "--dry-run")
+        || flags
+            .iter()
+            .any(|f| f.starts_with('-') && !f.starts_with("--") && f[1..].contains('n'));
+    let refresh = flags.iter().any(|f| f == "-y" || f == "--refresh" || f == "-yy")
+        || flags
+            .iter()
+            .any(|f| f.starts_with('-') && !f.starts_with("--") && f[1..].contains('y'));
+    let sysupgrade = flags.iter().any(|f| f == "-u" || f == "--sysupgrade" || f == "-uu")
+        || flags
+            .iter()
+            .any(|f| f.starts_with('-') && !f.starts_with("--") && f[1..].contains('u'));
+    let noconfirm = flags.iter().any(|f| f == "--noconfirm");
+    let needed = true;
+
+    let forwarded_flags: Vec<String> = flags
+        .iter()
+        .filter(|f| {
+            let s = f.as_str();
+            if s == "--refresh"
+                || s == "--sysupgrade"
+                || s == "--dry-run"
+                || s == "--noconfirm"
+                || s == "--needed"
+            {
+                return false;
+            }
+            if s.starts_with('-') && !s.starts_with("--") {
+                let chars = s[1..].chars();
+                if chars.clone().all(|c| c == 'y' || c == 'u' || c == 'n') {
+                    return false;
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect();
+
+    pm::InstallOptions {
+        needed,
+        noconfirm,
+        refresh,
+        sysupgrade,
+        dry_run,
+        forwarded_flags,
+    }
+}
+
 fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
     if targets.is_empty() {
         eprintln!("{}", "Error: No package targets specified.".red());
@@ -551,38 +600,7 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
     check_pacman_lock();
     print_banner();
 
-    let dry_run = flags.iter().any(|f| f == "-n" || f == "--dry-run");
-    let refresh = flags.iter().any(|f| f == "-y" || f == "--refresh" || f == "-yy");
-    let sysupgrade = flags.iter().any(|f| f == "-u" || f == "--sysupgrade" || f == "-uu");
-    let noconfirm = flags.iter().any(|f| f == "--noconfirm");
-    let needed = true;
-
-    let forwarded_flags: Vec<String> = flags
-        .iter()
-        .filter(|f| {
-            let s = f.as_str();
-            s != "-y"
-                && s != "--refresh"
-                && s != "-yy"
-                && s != "-u"
-                && s != "--sysupgrade"
-                && s != "-uu"
-                && s != "-n"
-                && s != "--dry-run"
-                && s != "--noconfirm"
-                && s != "--needed"
-        })
-        .cloned()
-        .collect();
-
-    let options = pm::InstallOptions {
-        needed,
-        noconfirm,
-        refresh,
-        sysupgrade,
-        dry_run,
-        forwarded_flags,
-    };
+    let options = parse_install_flags(flags);
 
     match pm::install(&mut config, targets, &options) {
         Ok(_) => {}
@@ -2673,5 +2691,47 @@ mod tests {
 
         let res_none = find_matching_pin("ripgrep", &pins);
         assert_eq!(res_none, None);
+    }
+
+    #[test]
+    fn test_parse_install_flags() {
+        let to_vec = |slice: &[&str]| slice.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Standalone -y (refresh without sysupgrade)
+        let opts = parse_install_flags(&to_vec(&["-y"]));
+        assert!(opts.refresh);
+        assert!(!opts.sysupgrade);
+        assert!(!opts.dry_run);
+        assert!(opts.forwarded_flags.is_empty());
+
+        // Standalone -u (sysupgrade without refresh)
+        let opts = parse_install_flags(&to_vec(&["-u"]));
+        assert!(!opts.refresh);
+        assert!(opts.sysupgrade);
+        assert!(opts.forwarded_flags.is_empty());
+
+        // Combined -yu and -uy (refresh and sysupgrade)
+        let opts = parse_install_flags(&to_vec(&["-yu"]));
+        assert!(opts.refresh);
+        assert!(opts.sysupgrade);
+        assert!(opts.forwarded_flags.is_empty());
+
+        let opts = parse_install_flags(&to_vec(&["-uy"]));
+        assert!(opts.refresh);
+        assert!(opts.sysupgrade);
+        assert!(opts.forwarded_flags.is_empty());
+
+        // Long options
+        let opts = parse_install_flags(&to_vec(&["--refresh", "--sysupgrade", "--noconfirm"]));
+        assert!(opts.refresh);
+        assert!(opts.sysupgrade);
+        assert!(opts.noconfirm);
+        assert!(opts.forwarded_flags.is_empty());
+
+        // Forwarding unrecognized flags while consuming internal ones
+        let opts = parse_install_flags(&to_vec(&["-yu", "--overwrite", "*", "--cachedir=/tmp"]));
+        assert!(opts.refresh);
+        assert!(opts.sysupgrade);
+        assert_eq!(opts.forwarded_flags, vec!["--overwrite", "*", "--cachedir=/tmp"]);
     }
 }

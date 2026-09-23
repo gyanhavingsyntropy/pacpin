@@ -41,6 +41,67 @@ impl Default for InstallOptions {
     }
 }
 
+pub fn build_install_commands(
+    pacman_targets: &[String],
+    aur_targets: &[String],
+    helper: &str,
+    options: &InstallOptions,
+    sysupgrade: bool,
+) -> (Vec<String>, &'static str, &'static str) {
+    let pacman_op = match (options.refresh, sysupgrade) {
+        (true, true) => "-Syu",
+        (false, true) => "-Su",
+        _ => "-S",
+    };
+
+    let mut command_strs = Vec::new();
+    if options.dry_run && options.refresh && !sysupgrade {
+        command_strs.push("sudo pacman -Sy".to_string());
+    }
+
+    if !pacman_targets.is_empty() {
+        let mut cmd = vec!["sudo", "pacman", pacman_op];
+        if options.needed {
+            cmd.push("--needed");
+        }
+        if options.noconfirm {
+            cmd.push("--noconfirm");
+        }
+        for f in &options.forwarded_flags {
+            cmd.push(f.as_str());
+        }
+        let mut s = cmd.join(" ");
+        s.push(' ');
+        s.push_str(&pacman_targets.join(" "));
+        command_strs.push(s);
+    }
+
+    let aur_op = if sysupgrade && pacman_targets.is_empty() {
+        if options.refresh { "-Syu" } else { "-Su" }
+    } else {
+        "-S"
+    };
+
+    if !aur_targets.is_empty() {
+        let mut cmd = vec![helper, aur_op, "--aur"];
+        if options.needed {
+            cmd.push("--needed");
+        }
+        if options.noconfirm {
+            cmd.push("--noconfirm");
+        }
+        for f in &options.forwarded_flags {
+            cmd.push(f.as_str());
+        }
+        let mut s = cmd.join(" ");
+        s.push(' ');
+        s.push_str(&aur_targets.join(" "));
+        command_strs.push(s);
+    }
+
+    (command_strs, pacman_op, aur_op)
+}
+
 /// Installs packages with repository resolution, companion cascading, and delay tree verification.
 pub fn install(
     config: &mut Config,
@@ -76,14 +137,71 @@ pub fn install(
         check_lock()?;
     }
 
-    if options.refresh && !options.sysupgrade && !options.dry_run {
+    let mut sysupgrade = options.sysupgrade;
+
+    if options.refresh && !sysupgrade && !options.dry_run {
         println!(
             "{}",
             ":: Warning: Installing packages with '-y' (database refresh) without performing a full system upgrade".yellow().bold()
         );
         println!(
             "{}",
-            "   can lead to partial upgrades and dependency breakage on Arch Linux.".yellow()
+            "   causes a partial upgrade and can break your system (dependency and ABI mismatches).".yellow()
+        );
+
+        if io::stdin().is_terminal() && !options.noconfirm {
+            print!(
+                "{}",
+                ":: Would you like to perform a full system upgrade (-Syu) instead? [Y/n] ".bold()
+            );
+            io::stdout().flush().ok();
+            let mut input = String::new();
+            if io::stdin().read_line(&mut input).is_ok() {
+                let trimmed = input.trim().to_lowercase();
+                if trimmed.is_empty() || trimmed == "y" || trimmed == "yes" {
+                    sysupgrade = true;
+                    println!("{}", ":: Elevating to full system upgrade (-Syu)...".cyan());
+                } else {
+                    print!(
+                        "{}",
+                        ":: Proceed with unsupported partial upgrade? [y/N] ".red().bold()
+                    );
+                    io::stdout().flush().ok();
+                    let mut confirm = String::new();
+                    if io::stdin().read_line(&mut confirm).is_ok() {
+                        let c_trimmed = confirm.trim().to_lowercase();
+                        if c_trimmed != "y" && c_trimmed != "yes" {
+                            return Err("Aborted partial upgrade to prevent system breakage.".to_string());
+                        }
+                        println!(
+                            "{}",
+                            ":: Warning: Proceeding with partial upgrade at user request.".yellow()
+                        );
+                    } else {
+                        return Err("Aborted.".to_string());
+                    }
+                }
+            } else {
+                return Err("Aborted.".to_string());
+            }
+        } else if !io::stdin().is_terminal() && !options.noconfirm {
+            return Err(
+                "Error: Partial upgrade requested ('-Sy' with targets) in non-interactive environment without --noconfirm. Use '-Syu' for a full safe upgrade, or provide --noconfirm.".to_string()
+            );
+        } else {
+            println!(
+                "{}",
+                ":: Warning: Proceeding with partial upgrade due to --noconfirm.".yellow()
+            );
+        }
+    } else if options.refresh && !sysupgrade && options.dry_run {
+        println!(
+            "{}",
+            ":: Warning: Installing packages with '-y' (database refresh) without performing a full system upgrade".yellow().bold()
+        );
+        println!(
+            "{}",
+            "   causes a partial upgrade and can break your system (dependency and ABI mismatches).".yellow()
         );
     }
 
@@ -246,57 +364,13 @@ pub fn install(
         }
     }
 
-    let pacman_op = match (options.refresh, options.sysupgrade) {
-        (true, true) => "-Syu",
-        (false, true) => "-Su",
-        _ => "-S",
-    };
-
-    let mut command_strs = Vec::new();
-    if options.refresh && !options.sysupgrade {
-        command_strs.push("sudo pacman -Sy".to_string());
-    }
-
-    if !pacman_targets.is_empty() {
-        let mut cmd = vec!["sudo", "pacman", pacman_op];
-        if options.needed {
-            cmd.push("--needed");
-        }
-        if options.noconfirm {
-            cmd.push("--noconfirm");
-        }
-        for f in &options.forwarded_flags {
-            cmd.push(f.as_str());
-        }
-        let mut s = cmd.join(" ");
-        s.push(' ');
-        s.push_str(&pacman_targets.join(" "));
-        command_strs.push(s);
-    }
-
-    let aur_op = if options.sysupgrade && pacman_targets.is_empty() {
-        if options.refresh { "-Syu" } else { "-Su" }
-    } else {
-        "-S"
-    };
-
-    if !aur_targets.is_empty() {
-        let helper = &config.options.helper;
-        let mut cmd = vec![helper.as_str(), aur_op, "--aur"];
-        if options.needed {
-            cmd.push("--needed");
-        }
-        if options.noconfirm {
-            cmd.push("--noconfirm");
-        }
-        for f in &options.forwarded_flags {
-            cmd.push(f.as_str());
-        }
-        let mut s = cmd.join(" ");
-        s.push(' ');
-        s.push_str(&aur_targets.join(" "));
-        command_strs.push(s);
-    }
+    let (command_strs, pacman_op, aur_op) = build_install_commands(
+        &pacman_targets,
+        &aur_targets,
+        &config.options.helper,
+        options,
+        sysupgrade,
+    );
 
     let full_cmd = command_strs.join(" && ");
 
@@ -1129,5 +1203,76 @@ mod tests {
                 }
             });
         assert_eq!(secs2, Some(15));
+    }
+
+    #[test]
+    fn test_build_install_commands() {
+        let targets = vec!["ollama".to_string()];
+        let no_aur = Vec::new();
+
+        // 1. Dry run with refresh only (-Sy): includes sudo pacman -Sy and sudo pacman -S
+        let opts_dry_sy = InstallOptions {
+            needed: true,
+            noconfirm: false,
+            refresh: true,
+            sysupgrade: false,
+            dry_run: true,
+            forwarded_flags: Vec::new(),
+        };
+        let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", &opts_dry_sy, false);
+        assert_eq!(op, "-S");
+        assert_eq!(
+            cmds,
+            vec![
+                "sudo pacman -Sy".to_string(),
+                "sudo pacman -S --needed ollama".to_string()
+            ]
+        );
+
+        // 2. Real execution with refresh only (sysupgrade false, dry_run false):
+        // Does NOT duplicate "sudo pacman -Sy" in execution string!
+        let opts_sy = InstallOptions {
+            needed: true,
+            noconfirm: false,
+            refresh: true,
+            sysupgrade: false,
+            dry_run: false,
+            forwarded_flags: Vec::new(),
+        };
+        let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", &opts_sy, false);
+        assert_eq!(op, "-S");
+        assert_eq!(cmds, vec!["sudo pacman -S --needed ollama".to_string()]);
+
+        // 3. Sysupgrade (-Syu): atomic full upgrade, no duplicate -Sy
+        let opts_syu = InstallOptions {
+            needed: true,
+            noconfirm: false,
+            refresh: true,
+            sysupgrade: true,
+            dry_run: false,
+            forwarded_flags: Vec::new(),
+        };
+        let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", &opts_syu, true);
+        assert_eq!(op, "-Syu");
+        assert_eq!(cmds, vec!["sudo pacman -Syu --needed ollama".to_string()]);
+
+        // 4. Sysupgrade without refresh (-Su):
+        let opts_su = InstallOptions {
+            needed: true,
+            noconfirm: false,
+            refresh: false,
+            sysupgrade: true,
+            dry_run: false,
+            forwarded_flags: Vec::new(),
+        };
+        let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", &opts_su, true);
+        assert_eq!(op, "-Su");
+        assert_eq!(cmds, vec!["sudo pacman -Su --needed ollama".to_string()]);
+
+        // 5. AUR targets with sysupgrade when no repo targets:
+        let aur_targets = vec!["google-chrome".to_string()];
+        let (cmds, _op, aur_op) = build_install_commands(&[], &aur_targets, "paru", &opts_syu, true);
+        assert_eq!(aur_op, "-Syu");
+        assert_eq!(cmds, vec!["paru -Syu --aur --needed google-chrome".to_string()]);
     }
 }
