@@ -228,7 +228,7 @@ impl TransactionJournal {
         None
     }
 
-    pub fn rollback(tx_id: Option<usize>, dry_run: bool, allow_partial: bool) {
+    pub fn rollback(tx_id: Option<usize>, dry_run: bool, allow_partial: bool, noconfirm: bool) {
         let txs = Self::list_transactions(100);
         if txs.is_empty() {
             println!(
@@ -341,26 +341,28 @@ impl TransactionJournal {
             return;
         }
 
-        let db_lock_path = crate::db::AlpmManager::get_dbpath().join("db.lck");
-        if db_lock_path.exists() {
-            eprintln!(
-                "{}",
-                format!(
-                    "Error: Pacman database is locked ({}).",
-                    db_lock_path.display()
-                )
-                .red()
-            );
+        if let Err(e) = crate::pm::check_lock() {
+            eprintln!("{}", format!("Error: {}", e).red());
             std::process::exit(1);
         }
 
-        use std::io::{self, Write};
-        print!("\nProceed with rollback? [y/N]: ");
-        let _ = io::stdout().flush();
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() || !input.trim().eq_ignore_ascii_case("y") {
-            println!("Rollback cancelled.");
-            return;
+        use std::io::{self, IsTerminal, Write};
+        if !noconfirm {
+            if !io::stdin().is_terminal() {
+                eprintln!(
+                    "{}",
+                    "Error: Cannot prompt for confirmation in non-interactive environment. Use --noconfirm to proceed with rollback."
+                        .red()
+                );
+                std::process::exit(1);
+            }
+            print!("\nProceed with rollback? [y/N]: ");
+            let _ = io::stdout().flush();
+            let mut input = String::new();
+            if io::stdin().read_line(&mut input).is_err() || !input.trim().eq_ignore_ascii_case("y") {
+                println!("Rollback cancelled.");
+                return;
+            }
         }
 
         println!(
@@ -369,6 +371,9 @@ impl TransactionJournal {
             "sudo pacman -U ...".bold()
         );
         let mut child_args = vec!["pacman", "-U"];
+        if noconfirm {
+            child_args.push("--noconfirm");
+        }
         let path_strs: Vec<String> = pkgs_to_restore
             .iter()
             .map(|(_, _, p)| p.display().to_string())

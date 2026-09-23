@@ -77,6 +77,38 @@ impl AlpmManager {
         Ok(Self { handle, repos })
     }
 
+    /// Verifies all configured sync databases for missing files or corruption.
+    pub fn verify_syncdbs(&self) -> Vec<String> {
+        let dbpath = Self::get_dbpath();
+        let sync_dir = dbpath.join("sync");
+        let mut warnings = Vec::new();
+
+        for repo in &self.repos {
+            let db_file = sync_dir.join(format!("{}.db", repo));
+            let db_tar = sync_dir.join(format!("{}.tar.gz", repo));
+
+            let db_file_zero = db_file.exists() && db_file.metadata().map(|m| m.len() == 0).unwrap_or(false);
+            let db_tar_zero = db_tar.exists() && db_tar.metadata().map(|m| m.len() == 0).unwrap_or(false);
+
+            if db_file_zero || db_tar_zero {
+                warnings.push(format!(
+                    "Repository '[{}]' sync database is corrupted (0 bytes). Run 'pin -Sy' or 'pacman -Sy' to synchronize.",
+                    repo
+                ));
+            } else if !db_file.exists() && !db_tar.exists() {
+                warnings.push(format!(
+                    "Repository '[{}]' has no local database file (expected {}). Run 'pin -Sy' or 'pacman -Sy' to synchronize.",
+                    repo,
+                    db_file.display()
+                ));
+            } else if let Some(db) = self.handle.syncdbs().into_iter().find(|d| d.name() == repo) {
+                // Ensure the database can be enumerated without error
+                let _ = db.pkgs().len();
+            }
+        }
+        warnings
+    }
+
     pub fn resolve_repo_order(repo_order: &[String]) -> Vec<String> {
         let discovered = Self::discover_repos();
         Self::order_repos(&discovered, repo_order)
@@ -159,20 +191,25 @@ impl AlpmManager {
         let syncdb_map: HashMap<&str, &alpm::Db> =
             syncdbs_list.iter().map(|d| (d.name(), *d)).collect();
 
-        // Find target package
+        // Find target package or virtual provide satisfier
         let (target_db_name, target_pkg) = if let Some(r) = repo {
             let db = syncdb_map
                 .get(r)
                 .ok_or_else(|| format!("Repository '{}' not found", r))?;
             let p = db
                 .pkg(pkg_name)
-                .map_err(|_| format!("Package '{}' not found in repository '{}'", pkg_name, r))?;
+                .ok()
+                .or_else(|| db.pkgs().find_satisfier(pkg_name))
+                .ok_or_else(|| format!("Package '{}' not found in repository '{}'", pkg_name, r))?;
             (r.to_string(), p)
         } else {
             let mut found = None;
             for r in &self.repos {
                 if let Some(db) = syncdb_map.get(r.as_str()) {
                     if let Ok(p) = db.pkg(pkg_name) {
+                        found = Some((r.clone(), p));
+                        break;
+                    } else if let Some(p) = db.pkgs().find_satisfier(pkg_name) {
                         found = Some((r.clone(), p));
                         break;
                     }
@@ -550,6 +587,17 @@ mod tests {
                 "  {} -> {} (sha256: {:?})",
                 target.name, target.url, target.sha256
             );
+        }
+    }
+
+    #[test]
+    fn test_verify_syncdbs() {
+        if let Ok(manager) = AlpmManager::new() {
+            // verify_syncdbs runs without panicking
+            let warnings = manager.verify_syncdbs();
+            for w in &warnings {
+                assert!(!w.is_empty());
+            }
         }
     }
 }

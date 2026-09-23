@@ -23,6 +23,7 @@ pub struct InstallOptions {
     pub needed: bool,
     pub noconfirm: bool,
     pub refresh: bool,
+    pub sysupgrade: bool,
     pub dry_run: bool,
     pub forwarded_flags: Vec<String>,
 }
@@ -33,6 +34,7 @@ impl Default for InstallOptions {
             needed: true,
             noconfirm: false,
             refresh: false,
+            sysupgrade: false,
             dry_run: false,
             forwarded_flags: Vec::new(),
         }
@@ -49,9 +51,32 @@ pub fn install(
         return Err("No package targets specified.".to_string());
     }
 
-    check_lock()?;
+    let wait_secs = options
+        .forwarded_flags
+        .iter()
+        .enumerate()
+        .find_map(|(idx, f)| {
+            if f.starts_with("--wait=") {
+                f.strip_prefix("--wait=").and_then(|s| s.parse::<u64>().ok())
+            } else if f == "--wait" {
+                if let Some(next) = options.forwarded_flags.get(idx + 1) {
+                    if let Ok(secs) = next.parse::<u64>() {
+                        return Some(secs);
+                    }
+                }
+                Some(600)
+            } else {
+                None
+            }
+        });
 
-    if options.refresh && !options.dry_run {
+    if let Some(secs) = wait_secs {
+        wait_for_lock(secs)?;
+    } else {
+        check_lock()?;
+    }
+
+    if options.refresh && !options.sysupgrade && !options.dry_run {
         println!(
             "{}",
             ":: Warning: Installing packages with '-y' (database refresh) without performing a full system upgrade".yellow().bold()
@@ -60,6 +85,9 @@ pub fn install(
             "{}",
             "   can lead to partial upgrades and dependency breakage on Arch Linux.".yellow()
         );
+    }
+
+    if options.refresh && !options.dry_run {
         println!(
             "{}",
             ":: Refreshing package databases (sudo pacman -Sy)...".cyan()
@@ -166,11 +194,10 @@ pub fn install(
                 }
             }
         } else {
-            let exists_in_sync = manager
-                .handle()
-                .syncdbs()
-                .into_iter()
-                .any(|db| db.pkg(target.as_str()).is_ok());
+            let exists_in_sync = manager.handle().syncdbs().into_iter().any(|db| {
+                db.pkg(target.as_str()).is_ok()
+                    || db.pkgs().find_satisfier(target.as_str()).is_some()
+            });
 
             if exists_in_sync {
                 verify_target_and_dependencies_delay(
@@ -206,13 +233,32 @@ pub fn install(
         }
     }
 
+    // Inspect candidate packages against installed packages for potential conflicts
+    let conflicts = check_package_conflicts(&manager, &pacman_targets);
+    if !conflicts.is_empty() {
+        println!("{}", ":: Note: Potential package conflict(s) detected:".yellow().bold());
+        for (cand, inst) in &conflicts {
+            println!(
+                "   - '{}' conflicts with installed package '{}' (may require replacement)",
+                cand.cyan(),
+                inst.yellow()
+            );
+        }
+    }
+
+    let pacman_op = match (options.refresh, options.sysupgrade) {
+        (true, true) => "-Syu",
+        (false, true) => "-Su",
+        _ => "-S",
+    };
+
     let mut command_strs = Vec::new();
-    if options.refresh {
+    if options.refresh && !options.sysupgrade {
         command_strs.push("sudo pacman -Sy".to_string());
     }
 
     if !pacman_targets.is_empty() {
-        let mut cmd = vec!["sudo", "pacman", "-S"];
+        let mut cmd = vec!["sudo", "pacman", pacman_op];
         if options.needed {
             cmd.push("--needed");
         }
@@ -228,9 +274,15 @@ pub fn install(
         command_strs.push(s);
     }
 
+    let aur_op = if options.sysupgrade && pacman_targets.is_empty() {
+        if options.refresh { "-Syu" } else { "-Su" }
+    } else {
+        "-S"
+    };
+
     if !aur_targets.is_empty() {
         let helper = &config.options.helper;
-        let mut cmd = vec![helper.as_str(), "-S", "--aur"];
+        let mut cmd = vec![helper.as_str(), aur_op, "--aur"];
         if options.needed {
             cmd.push("--needed");
         }
@@ -261,7 +313,7 @@ pub fn install(
     let mut all_success = true;
 
     if !pacman_targets.is_empty() {
-        let mut args = vec!["pacman", "-S"];
+        let mut args = vec!["pacman", pacman_op];
         if options.needed {
             args.push("--needed");
         }
@@ -276,7 +328,7 @@ pub fn install(
         match status {
             Ok(s) if s.success() => {
                 installed_targets.extend(pacman_targets.clone());
-                let mut cmd_parts = vec!["sudo", "pacman", "-S"];
+                let mut cmd_parts = vec!["sudo", "pacman", pacman_op];
                 if options.needed {
                     cmd_parts.push("--needed");
                 }
@@ -304,7 +356,7 @@ pub fn install(
 
     if all_success && !aur_targets.is_empty() {
         let helper = &config.options.helper;
-        let mut args = vec!["-S", "--aur"];
+        let mut args = vec![aur_op, "--aur"];
         if options.needed {
             args.push("--needed");
         }
@@ -319,7 +371,7 @@ pub fn install(
         match status {
             Ok(s) if s.success() => {
                 installed_targets.extend(aur_targets.clone());
-                let mut cmd_parts = vec![helper.as_str(), "-S", "--aur"];
+                let mut cmd_parts = vec![helper.as_str(), aur_op, "--aur"];
                 if options.needed {
                     cmd_parts.push("--needed");
                 }
@@ -407,7 +459,29 @@ pub fn remove(config: &mut Config, targets: &[String], flags: &[String]) -> Resu
         return Err("No package targets specified for removal.".to_string());
     }
 
-    check_lock()?;
+    let wait_secs = flags
+        .iter()
+        .enumerate()
+        .find_map(|(idx, f)| {
+            if f.starts_with("--wait=") {
+                f.strip_prefix("--wait=").and_then(|s| s.parse::<u64>().ok())
+            } else if f == "--wait" {
+                if let Some(next) = flags.get(idx + 1) {
+                    if let Ok(secs) = next.parse::<u64>() {
+                        return Some(secs);
+                    }
+                }
+                Some(600)
+            } else {
+                None
+            }
+        });
+
+    if let Some(secs) = wait_secs {
+        wait_for_lock(secs)?;
+    } else {
+        check_lock()?;
+    }
 
     let mut cmd_args = Vec::new();
     cmd_args.extend(flags.iter().map(|s| s.as_str()));
@@ -529,16 +603,245 @@ pub fn forward_pacman(args: &[String], needs_sudo: bool) -> Result<i32, String> 
     }
 }
 
+/// Information regarding the pacman database lock.
+#[derive(Debug, Clone)]
+pub struct LockInfo {
+    pub path: std::path::PathBuf,
+    pub pid: Option<i32>,
+    pub process_name: Option<String>,
+    pub is_alive: bool,
+}
+
+/// Inspects the pacman database lock file and the process holding it (if any).
+pub fn get_lock_info() -> Option<LockInfo> {
+    let lock_path = AlpmManager::get_dbpath().join("db.lck");
+    if !lock_path.exists() {
+        return None;
+    }
+
+    let mut pid_opt = None;
+    if let Ok(content) = std::fs::read_to_string(&lock_path) {
+        if let Some(token) = content.split_whitespace().next() {
+            if let Ok(pid) = token.parse::<i32>() {
+                if pid > 0 {
+                    pid_opt = Some(pid);
+                }
+            }
+        }
+    }
+
+    let (is_alive, process_name) = if let Some(pid) = pid_opt {
+        #[cfg(unix)]
+        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        #[cfg(not(unix))]
+        let alive = true;
+
+        let name = if alive {
+            std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                .ok()
+                .map(|s| s.trim().to_string())
+        } else {
+            None
+        };
+        (alive, name)
+    } else {
+        // Pacman creates db.lck with mode 0000 and 0 bytes without writing a PID.
+        // On Linux, scan /proc for active package manager processes.
+        let mut active_pm_found = None;
+        let my_pid = std::process::id() as i32;
+
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if let Ok(pid) = name.parse::<i32>() {
+                        if pid == my_pid {
+                            continue;
+                        }
+                        if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
+                            let trimmed = comm.trim();
+                            if matches!(
+                                trimmed,
+                                "pacman"
+                                    | "paru"
+                                    | "yay"
+                                    | "pamac-daemon"
+                                    | "packagekitd"
+                                    | "pamac"
+                                    | "pacpin"
+                                    | "pin"
+                            ) {
+                                active_pm_found = Some((pid, trimmed.to_string()));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((pid, name)) = active_pm_found {
+            pid_opt = Some(pid);
+            (true, Some(name))
+        } else {
+            // db.lck exists, but no package manager process is running on the system!
+            // It is definitively a stale lock.
+            (false, None)
+        }
+    };
+
+    Some(LockInfo {
+        path: lock_path,
+        pid: pid_opt,
+        process_name,
+        is_alive,
+    })
+}
+
 /// Checks if pacman database is currently locked.
 pub fn check_lock() -> Result<(), String> {
-    let lock_path = AlpmManager::get_dbpath().join("db.lck");
-    if lock_path.exists() {
+    if let Some(info) = get_lock_info() {
+        if !info.is_alive {
+            if let Some(pid) = info.pid {
+                return Err(format!(
+                    "Pacman database lock exists ({}), but process PID {} is no longer running (stale lock).\n\
+                    If no other package manager is active, remove it with: sudo rm {}",
+                    info.path.display(),
+                    pid,
+                    info.path.display()
+                ));
+            } else {
+                return Err(format!(
+                    "Pacman database lock exists ({}), but no active package manager process (pacman, paru, yay) is running (stale lock).\n\
+                    If no other package manager is active, remove it with: sudo rm {}",
+                    info.path.display(),
+                    info.path.display()
+                ));
+            }
+        }
+
+        if let Some(ref name) = info.process_name {
+            if let Some(pid) = info.pid {
+                return Err(format!(
+                    "Pacman database is locked ({}). Process '{}' (PID {}) is currently running.",
+                    info.path.display(),
+                    name,
+                    pid
+                ));
+            } else {
+                return Err(format!(
+                    "Pacman database is locked ({}). Process '{}' is currently running.",
+                    info.path.display(),
+                    name
+                ));
+            }
+        }
+
+        if let Some(pid) = info.pid {
+            return Err(format!(
+                "Pacman database is locked ({}). Process PID {} is currently running.",
+                info.path.display(),
+                pid
+            ));
+        }
+
         return Err(format!(
             "Pacman database is locked ({}). Another package management process is currently running.",
-            lock_path.display()
+            info.path.display()
         ));
     }
     Ok(())
+}
+
+/// Waits for pacman database lock to be released, or times out.
+pub fn wait_for_lock(max_wait_secs: u64) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(max_wait_secs);
+    let mut warned = false;
+
+    loop {
+        match check_lock() {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // If it's a STALE lock, waiting won't help; fail immediately!
+                if let Some(info) = get_lock_info() {
+                    if !info.is_alive {
+                        return Err(e);
+                    }
+                }
+                if start.elapsed() >= timeout {
+                    return Err(format!(
+                        "Timed out waiting for pacman database lock after {}s: {}",
+                        max_wait_secs, e
+                    ));
+                }
+                if !warned {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            ":: Waiting for pacman database lock to be released (timeout: {}s)...",
+                            max_wait_secs
+                        )
+                        .yellow()
+                    );
+                    warned = true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+/// Inspects candidate packages against installed packages to identify potential conflicts.
+pub fn check_package_conflicts(manager: &AlpmManager, targets: &[String]) -> Vec<(String, String)> {
+    let local_db = manager.handle().localdb();
+    let mut conflicts = Vec::new();
+
+    for target in targets {
+        let pkg_clean = if let Some((_, p)) = target.split_once('/') {
+            p
+        } else {
+            target.as_str()
+        };
+
+        let pkg_opt = manager.handle().syncdbs().into_iter().find_map(|db| {
+            db.pkg(pkg_clean)
+                .ok()
+                .or_else(|| db.pkgs().find_satisfier(pkg_clean))
+        });
+
+        if let Some(pkg) = pkg_opt {
+            let pkg_name = pkg.name();
+            for conflict_dep in pkg.conflicts() {
+                if let Some(inst) = local_db.pkgs().find_satisfier(conflict_dep.name()) {
+                    if inst.name() != pkg_name
+                        && !conflicts
+                            .iter()
+                            .any(|(c, i)| c == pkg_name && i == inst.name())
+                    {
+                        conflicts.push((pkg_name.to_string(), inst.name().to_string()));
+                    }
+                }
+            }
+            for inst in local_db.pkgs() {
+                for conflict_dep in inst.conflicts() {
+                    let conflicts_target = conflict_dep.name() == pkg_name
+                        || pkg
+                            .provides()
+                            .iter()
+                            .any(|pr| pr.name() == conflict_dep.name());
+                    if conflicts_target
+                        && inst.name() != pkg_name
+                        && !conflicts
+                            .iter()
+                            .any(|(c, i)| c == pkg_name && i == inst.name())
+                    {
+                        conflicts.push((pkg_name.to_string(), inst.name().to_string()));
+                    }
+                }
+            }
+        }
+    }
+    conflicts
 }
 
 /// Verifies stability delay for the target package and its uninstalled dependency graph.
@@ -579,7 +882,11 @@ fn verify_target_and_dependencies_delay(
                 }
             }
         } else if let Some(db) = manager.handle().syncdbs().iter().find(|d| d.name() == r) {
-            if let Ok(pkg) = db.pkg(target_pkg) {
+            let pkg_obj = db
+                .pkg(target_pkg)
+                .ok()
+                .or_else(|| db.pkgs().find_satisfier(target_pkg));
+            if let Some(pkg) = pkg_obj {
                 for d in pkg.depends() {
                     direct_deps.push(d.name().to_string());
                 }
@@ -587,7 +894,11 @@ fn verify_target_and_dependencies_delay(
         }
     } else {
         for db in manager.handle().syncdbs() {
-            if let Ok(pkg) = db.pkg(target_pkg) {
+            let pkg_obj = db
+                .pkg(target_pkg)
+                .ok()
+                .or_else(|| db.pkgs().find_satisfier(target_pkg));
+            if let Some(pkg) = pkg_obj {
                 for d in pkg.depends() {
                     direct_deps.push(d.name().to_string());
                 }
@@ -638,8 +949,9 @@ fn check_single_pkg_delay(
     now_epoch: i64,
     options: &InstallOptions,
 ) -> Result<(), String> {
-    // If already installed locally, skip
-    if manager.handle().localdb().pkg(pkg).is_ok() {
+    // If already installed locally or satisfied by virtual provide, skip
+    let local_db = manager.handle().localdb();
+    if local_db.pkg(pkg).is_ok() || local_db.pkgs().find_satisfier(pkg).is_some() {
         return Ok(());
     }
 
@@ -733,6 +1045,7 @@ mod tests {
         assert!(opts.needed);
         assert!(!opts.noconfirm);
         assert!(!opts.refresh);
+        assert!(!opts.sysupgrade);
         assert!(!opts.dry_run);
         assert!(opts.forwarded_flags.is_empty());
     }
@@ -748,10 +1061,73 @@ mod tests {
 
     #[test]
     fn test_unknown_repo_rejected() {
+        let lock_path = AlpmManager::get_dbpath().join("db.lck");
         let mut config = Config::default();
         let opts = InstallOptions::default();
         let res = install(&mut config, &["nonexistent_repo/foobar".to_string()], &opts);
         assert!(res.is_err());
-        assert!(res.unwrap_err().contains("Repository '[nonexistent_repo]' is not recognized"));
+        if !lock_path.exists() {
+            assert!(res.unwrap_err().contains("Repository '[nonexistent_repo]' is not recognized"));
+        }
+    }
+
+    #[test]
+    fn test_check_lock_when_no_lock() {
+        let lock_path = AlpmManager::get_dbpath().join("db.lck");
+        if !lock_path.exists() {
+            assert!(check_lock().is_ok());
+            assert!(get_lock_info().is_none());
+        }
+    }
+
+    #[test]
+    fn test_wait_for_lock_succeeds_when_unlocked() {
+        let lock_path = AlpmManager::get_dbpath().join("db.lck");
+        if !lock_path.exists() {
+            assert!(wait_for_lock(1).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_wait_flag_parsing() {
+        let flags1 = ["--wait".to_string(), "42".to_string()];
+        let secs1 = flags1
+            .iter()
+            .enumerate()
+            .find_map(|(idx, f)| {
+                if f.starts_with("--wait=") {
+                    f.strip_prefix("--wait=").and_then(|s| s.parse::<u64>().ok())
+                } else if f == "--wait" {
+                    if let Some(next) = flags1.get(idx + 1) {
+                        if let Ok(secs) = next.parse::<u64>() {
+                            return Some(secs);
+                        }
+                    }
+                    Some(600)
+                } else {
+                    None
+                }
+            });
+        assert_eq!(secs1, Some(42));
+
+        let flags2 = ["--wait=15".to_string()];
+        let secs2 = flags2
+            .iter()
+            .enumerate()
+            .find_map(|(idx, f)| {
+                if f.starts_with("--wait=") {
+                    f.strip_prefix("--wait=").and_then(|s| s.parse::<u64>().ok())
+                } else if f == "--wait" {
+                    if let Some(next) = flags2.get(idx + 1) {
+                        if let Ok(secs) = next.parse::<u64>() {
+                            return Some(secs);
+                        }
+                    }
+                    Some(600)
+                } else {
+                    None
+                }
+            });
+        assert_eq!(secs2, Some(15));
     }
 }

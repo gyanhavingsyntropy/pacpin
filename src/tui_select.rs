@@ -112,7 +112,7 @@ pub fn run_checkbox_menu(
         let (term_width, term_height) = terminal_size::terminal_size()
             .map(|(w, h)| (w.0 as usize, h.0 as usize))
             .unwrap_or((80, 24));
-        let box_width = term_width.clamp(64, 88);
+        let box_width = term_width.clamp(72, 100).min(term_width);
         let max_visible = (term_height.saturating_sub(13)).clamp(5, 18);
 
         // Adjust viewport offset
@@ -262,7 +262,7 @@ pub fn run_checkbox_menu(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_checkbox_ui<W: Write>(
+pub(crate) fn render_checkbox_ui<W: Write>(
     out: &mut W,
     title: &str,
     subtitle: &str,
@@ -277,77 +277,120 @@ fn render_checkbox_ui<W: Write>(
 ) {
     let inner_width = box_width.saturating_sub(2);
     let border_color = |s: &str| s.cyan().bold();
+    let b_vert = border_color("│");
+    let has_purity = items.iter().any(|i| !i.is_pure) || title.to_lowercase().contains("orphan");
 
     // Top border
-    let top = format!("┌{}┐\r\n", "─".repeat(inner_width));
-    let _ = queue!(out, Print(border_color(&top)));
+    let top = format!("{}\r\n", border_color(&format!("┌{}┐", "─".repeat(inner_width))));
+    let _ = queue!(out, Print(top));
 
     // Header Title
-    let title_pad = inner_width.saturating_sub(title.len()) / 2;
+    let title_w = crate::ui::str_width(title);
+    let title_pad = inner_width.saturating_sub(title_w) / 2;
+    let title_right_pad = inner_width.saturating_sub(title_pad + title_w);
     let title_line = format!(
-        "│{}{}{}│\r\n",
+        "{}{}{}{}{}\r\n",
+        b_vert,
         " ".repeat(title_pad),
         title.bold().yellow(),
-        " ".repeat(inner_width.saturating_sub(title_pad + title.len()))
+        " ".repeat(title_right_pad),
+        b_vert
     );
     let _ = queue!(out, Print(title_line));
 
     // Subtitle
-    let sub_pad = inner_width.saturating_sub(subtitle.len()) / 2;
+    let sub_disp = if crate::ui::str_width(subtitle) > inner_width {
+        crate::ui::truncate_str(subtitle, inner_width)
+    } else {
+        subtitle.to_string()
+    };
+    let sub_w = crate::ui::str_width(&sub_disp);
+    let sub_pad = inner_width.saturating_sub(sub_w) / 2;
+    let sub_right_pad = inner_width.saturating_sub(sub_pad + sub_w);
     let sub_line = format!(
-        "│{}{}{}│\r\n",
+        "{}{}{}{}{}\r\n",
+        b_vert,
         " ".repeat(sub_pad),
-        subtitle.dimmed(),
-        " ".repeat(inner_width.saturating_sub(sub_pad + subtitle.len()))
+        sub_disp.dimmed(),
+        " ".repeat(sub_right_pad),
+        b_vert
     );
     let _ = queue!(out, Print(sub_line));
 
     // Divider
-    let div = format!("├{}┤\r\n", "─".repeat(inner_width));
-    let _ = queue!(out, Print(border_color(&div)));
+    let div = format!("{}\r\n", border_color(&format!("├{}┤", "─".repeat(inner_width))));
+    let _ = queue!(out, Print(div.clone()));
 
     // Shortcuts Bar
-    let bar1 = " [Space] Toggle    [a] All     [n] None    [p] Pure Only  [i] Invert";
-    let bar1_pad = inner_width.saturating_sub(bar1.len());
+    let bar1 = if has_purity {
+        " [Space] Toggle    [a] All     [n] None    [p] Pure Only  [i] Invert"
+    } else {
+        " [Space] Toggle    [a] All     [n] None    [i] Invert"
+    };
+    let bar1_disp = if crate::ui::str_width(bar1) > inner_width {
+        crate::ui::truncate_str(bar1, inner_width)
+    } else {
+        bar1.to_string()
+    };
+    let bar1_w = crate::ui::str_width(&bar1_disp);
+    let bar1_pad = inner_width.saturating_sub(bar1_w);
     let _ = queue!(
         out,
         Print(format!(
-            "│{}{}{}│\r\n",
-            bar1.cyan(),
+            "{}{}{}{}\r\n",
+            b_vert,
+            bar1_disp.cyan(),
             " ".repeat(bar1_pad),
-            ""
+            b_vert
         ))
     );
 
     let bar2 = " [↑/↓] Navigate    [PgUp/Dn] Scroll        [/] Search     [Enter] Confirm";
-    let bar2_pad = inner_width.saturating_sub(bar2.len());
+    let bar2_disp = if crate::ui::str_width(bar2) > inner_width {
+        crate::ui::truncate_str(bar2, inner_width)
+    } else {
+        bar2.to_string()
+    };
+    let bar2_w = crate::ui::str_width(&bar2_disp);
+    let bar2_pad = inner_width.saturating_sub(bar2_w);
     let _ = queue!(
         out,
         Print(format!(
-            "│{}{}{}│\r\n",
-            bar2.dimmed(),
+            "{}{}{}{}\r\n",
+            b_vert,
+            bar2_disp.dimmed(),
             " ".repeat(bar2_pad),
-            ""
+            b_vert
         ))
     );
 
-    let _ = queue!(out, Print(border_color(&div)));
+    let _ = queue!(out, Print(div.clone()));
 
     // Top Scroll Indicator
     if viewport_offset > 0 {
         let more_top = format!("   ▲ {} more items above...", viewport_offset);
-        let more_pad = inner_width.saturating_sub(more_top.len());
+        let more_w = crate::ui::str_width(&more_top);
+        let more_pad = inner_width.saturating_sub(more_w);
         let _ = queue!(
             out,
             Print(format!(
-                "│{}{}{}│\r\n",
+                "{}{}{}{}\r\n",
+                b_vert,
                 more_top.yellow().bold(),
                 " ".repeat(more_pad),
-                ""
+                b_vert
             ))
         );
     } else {
-        let _ = queue!(out, Print(format!("│{}│\r\n", " ".repeat(inner_width))));
+        let _ = queue!(
+            out,
+            Print(format!(
+                "{}{}{}\r\n",
+                b_vert,
+                " ".repeat(inner_width),
+                b_vert
+            ))
+        );
     }
 
     // Visible Items
@@ -358,56 +401,77 @@ fn render_checkbox_ui<W: Write>(
         let item = &items[real_idx];
 
         let pointer = if is_cursor { " ▶ " } else { "   " };
-        let box_glyph = if item.checked {
-            "[x]".green().bold().to_string()
+        let box_raw = if item.checked { "[x] " } else { "[ ] " };
+        let box_colored = if item.checked {
+            "[x] ".green().bold()
         } else {
-            "[ ]".dimmed().to_string()
+            "[ ] ".dimmed()
         };
-        let tag = if is_cursor { " ◄" } else { "" };
-        let num = format!("{:>2}.", viewport_offset + rel_i + 1);
+        let tag_raw = if is_cursor { " ◄" } else { "" };
+        let num_raw = format!("{:>2}. ", viewport_offset + rel_i + 1);
 
-        // Label and description with truncation if needed
+        // Label with truncation or padding to fixed column width
         let label_width = 24;
-        let label_str = if item.label.chars().count() > label_width {
+        let item_label_w = crate::ui::str_width(&item.label);
+        let label_str = if item_label_w > label_width {
             crate::ui::truncate_str(&item.label, label_width)
         } else {
-            format!("{:<width$}", item.label, width = label_width)
+            format!("{}{}", item.label, " ".repeat(label_width - item_label_w))
+        };
+
+        // Purity badge: [pure] in green bold, [opt] in yellow bold
+        let (badge_raw, badge_colored) = if has_purity {
+            if item.is_pure {
+                ("[pure] ", "[pure] ".green().bold())
+            } else {
+                ("[opt]  ", "[opt]  ".yellow().bold())
+            }
+        } else {
+            ("", "".normal())
         };
 
         // Calculate available description width
-        // pointer (3) + box_glyph (3) + 1 + num (3) + 1 + label_width (24) + 1 + tag (2) = 38
-        let desc_max = inner_width.saturating_sub(42);
-        let desc_str = if item.description.chars().count() > desc_max && desc_max > 3 {
+        let prefix_w = 3 + 4 + 4 + (if has_purity { 7 } else { 0 }) + label_width + (if is_cursor { 2 } else { 0 });
+        let desc_max = inner_width.saturating_sub(prefix_w + 1);
+        let desc_str = if crate::ui::str_width(&item.description) > desc_max && desc_max > 3 {
             crate::ui::truncate_str(&item.description, desc_max)
         } else {
             item.description.clone()
         };
 
-        let raw_len = 3 + 3 + 1 + num.len() + 1 + label_str.len() + 1 + desc_str.len() + tag.len();
-        let pad_len = inner_width.saturating_sub(raw_len.min(inner_width));
+        let content_raw = format!(
+            "{pointer}{box_raw}{num_raw}{badge_raw}{label_str}{desc_str}{tag_raw}"
+        );
+        let used_w = crate::ui::str_width(&content_raw);
+        let pad_len = inner_width.saturating_sub(used_w);
+        let pad_spaces = " ".repeat(pad_len);
 
         let formatted_line = if is_cursor {
             format!(
-                "│{}{}{} {} {} {} {}{}│\r\n",
+                "{}{}{}{}{}{}{}{}{}{}\r\n",
+                b_vert,
                 pointer.cyan().bold(),
-                box_glyph,
-                num.bold(),
+                box_colored,
+                num_raw.bold(),
+                badge_colored,
                 label_str.yellow().bold(),
                 desc_str.cyan(),
-                tag.cyan().bold(),
-                " ".repeat(pad_len),
-                ""
+                tag_raw.cyan().bold(),
+                pad_spaces,
+                b_vert
             )
         } else {
             format!(
-                "│{}{}{} {} {} {}{}│\r\n",
+                "{}{}{}{}{}{}{}{}{}\r\n",
+                b_vert,
                 pointer,
-                box_glyph,
-                num.dimmed(),
+                box_colored,
+                num_raw.dimmed(),
+                badge_colored,
                 label_str.white(),
                 desc_str.dimmed(),
-                " ".repeat(pad_len),
-                ""
+                pad_spaces,
+                b_vert
             )
         };
 
@@ -418,7 +482,15 @@ fn render_checkbox_ui<W: Write>(
     let rendered_count = visible_indices.len();
     if rendered_count < max_visible {
         for _ in 0..(max_visible - rendered_count) {
-            let _ = queue!(out, Print(format!("│{}│\r\n", " ".repeat(inner_width))));
+            let _ = queue!(
+                out,
+                Print(format!(
+                    "{}{}{}\r\n",
+                    b_vert,
+                    " ".repeat(inner_width),
+                    b_vert
+                ))
+            );
         }
     }
 
@@ -437,34 +509,39 @@ fn render_checkbox_ui<W: Write>(
     } else {
         format!("   (Selected: {}/{} items)", checked_count, items.len())
     };
-    let status_pad = inner_width.saturating_sub(status_str.len());
+    let status_w = crate::ui::str_width(&status_str);
+    let status_pad = inner_width.saturating_sub(status_w);
+    let status_colored = if remaining_below > 0 {
+        status_str.yellow().bold()
+    } else {
+        status_str.dimmed()
+    };
     let _ = queue!(
         out,
         Print(format!(
-            "│{}{}{}│\r\n",
-            if remaining_below > 0 {
-                status_str.yellow().bold()
-            } else {
-                status_str.dimmed()
-            },
+            "{}{}{}{}\r\n",
+            b_vert,
+            status_colored,
             " ".repeat(status_pad),
-            ""
+            b_vert
         ))
     );
 
-    let _ = queue!(out, Print(border_color(&div)));
+    let _ = queue!(out, Print(div));
 
     // Search bar or Footer
     if search_mode {
         let search_text = format!(" Search: {}█ (Enter to lock, Esc to clear)", search_query);
-        let s_pad = inner_width.saturating_sub(search_text.len());
+        let s_w = crate::ui::str_width(&search_text);
+        let s_pad = inner_width.saturating_sub(s_w);
         let _ = queue!(
             out,
             Print(format!(
-                "│{}{}{}│\r\n",
+                "{}{}{}{}\r\n",
+                b_vert,
                 search_text.yellow().bold(),
                 " ".repeat(s_pad),
-                ""
+                b_vert
             ))
         );
     } else if !search_query.is_empty() {
@@ -472,33 +549,37 @@ fn render_checkbox_ui<W: Write>(
             " Filter active: '{}' ({} matches) - press [/] to edit",
             search_query, total_matched
         );
-        let s_pad = inner_width.saturating_sub(search_text.len());
+        let s_w = crate::ui::str_width(&search_text);
+        let s_pad = inner_width.saturating_sub(s_w);
         let _ = queue!(
             out,
             Print(format!(
-                "│{}{}{}│\r\n",
+                "{}{}{}{}\r\n",
+                b_vert,
                 search_text.cyan(),
                 " ".repeat(s_pad),
-                ""
+                b_vert
             ))
         );
     } else {
         let footer = " [Enter] Confirm Selection    [Esc/q] Cancel / Abort";
-        let f_pad = inner_width.saturating_sub(footer.len());
+        let f_w = crate::ui::str_width(footer);
+        let f_pad = inner_width.saturating_sub(f_w);
         let _ = queue!(
             out,
             Print(format!(
-                "│{}{}{}│\r\n",
+                "{}{}{}{}\r\n",
+                b_vert,
                 footer.dimmed(),
                 " ".repeat(f_pad),
-                ""
+                b_vert
             ))
         );
     }
 
     // Bottom border
-    let bottom = format!("└{}┘\r\n", "─".repeat(inner_width));
-    let _ = queue!(out, Print(border_color(&bottom)));
+    let bottom = format!("{}\r\n", border_color(&format!("└{}┘", "─".repeat(inner_width))));
+    let _ = queue!(out, Print(bottom));
 }
 
 #[cfg(test)]
@@ -556,11 +637,65 @@ mod tests {
         let label = "🚀🦀日本語ラベル";
         let truncated = crate::ui::truncate_str(label, 5);
         assert!(truncated.ends_with('…'));
-        assert_eq!(truncated.chars().count(), 5);
+        assert!(crate::ui::str_width(&truncated) <= 5);
 
         let desc = "这是一个很长的描述字符串用于测试中文字符截断边界";
         let desc_trunc = crate::ui::truncate_str(desc, 10);
         assert!(desc_trunc.ends_with('…'));
-        assert_eq!(desc_trunc.chars().count(), 10);
+        assert!(crate::ui::str_width(&desc_trunc) <= 10);
+    }
+
+    #[test]
+    fn test_render_checkbox_ui_box_alignment() {
+        let items = vec![
+            CheckboxItem::new("libyaml", "libyaml", "0.8 MiB — YAML 1.1 parser", true, true),
+            CheckboxItem::new(
+                "python-pillow",
+                "python-pillow",
+                "1.2 MiB (for: gimp, krita) — Python Imaging Library",
+                false,
+                false,
+            ),
+            CheckboxItem::new(
+                "unicode-test",
+                "unicode-🚀-pkg",
+                "4.5 MiB — 测试中文与EM-DASH—符号",
+                true,
+                false,
+            ),
+        ];
+
+        for box_width in [72, 80, 88, 100] {
+            let mut buf = Vec::new();
+            let matching = vec![0, 1, 2];
+            render_checkbox_ui(
+                &mut buf,
+                "SELECT ORPHANED PACKAGES TO REMOVE",
+                "Pure orphans are pre-selected ([x]). Optional plugins are unchecked ([ ]).",
+                &items,
+                &matching,
+                0,
+                0,
+                5,
+                box_width,
+                false,
+                "",
+            );
+
+            let output = String::from_utf8(buf).expect("valid utf8");
+            if box_width == 88 {
+                println!("\n--- RENDERED CHECKBOX UI (WIDTH 88) ---\n{}", output);
+            }
+            let lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
+            assert!(!lines.is_empty());
+            for line in lines {
+                let w = crate::ui::str_width(line);
+                assert_eq!(
+                    w, box_width,
+                    "Line '{}' has display width {} instead of expected {} for box_width {}",
+                    line, w, box_width, box_width
+                );
+            }
+        }
     }
 }

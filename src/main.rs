@@ -47,7 +47,33 @@ use std::process::{exit, Command};
 use ui::{print_banner, prompt_multiselect, render_transaction_view};
 
 fn check_pacman_lock() {
-    if let Err(e) = pm::check_lock() {
+    let args: Vec<String> = env::args().collect();
+    let mut wait_secs = None;
+    for (i, a) in args.iter().enumerate() {
+        if a == "--wait" {
+            if let Some(next) = args.get(i + 1) {
+                if let Ok(s) = next.parse::<u64>() {
+                    wait_secs = Some(s);
+                    break;
+                }
+            }
+            wait_secs = Some(600);
+            break;
+        } else if let Some(rest) = a.strip_prefix("--wait=") {
+            if let Ok(s) = rest.parse::<u64>() {
+                wait_secs = Some(s);
+                break;
+            }
+        }
+    }
+
+    let res = if let Some(s) = wait_secs {
+        pm::wait_for_lock(s)
+    } else {
+        pm::check_lock()
+    };
+
+    if let Err(e) = res {
         eprintln!("{}", format!("Error: {}", e).red());
         exit(1);
     }
@@ -62,6 +88,9 @@ fn cmd_check(config: &Config) {
             exit(1);
         }
     };
+    for warn in manager.verify_syncdbs() {
+        eprintln!("{}", format!(":: Warning: {}", warn).yellow());
+    }
     let resolver = ResolverEngine::new(&manager);
 
     let alpm = manager.handle();
@@ -184,6 +213,9 @@ fn cmd_upgrade(
             exit(1);
         }
     };
+    for warn in manager.verify_syncdbs() {
+        eprintln!("{}", format!(":: Warning: {}", warn).yellow());
+    }
     let resolver = ResolverEngine::new(&manager);
     let res = resolver.resolve_all(config);
     let external_updates = IntegrationsManager::check_updates_parallel(&ext_providers);
@@ -251,22 +283,46 @@ fn cmd_upgrade(
         }
     }
 
+    let forwarded_pacman_flags: Vec<&str> = extra_flags
+        .iter()
+        .filter(|f| {
+            let s = f.as_str();
+            s != "-y"
+                && s != "--refresh"
+                && s != "-yy"
+                && s != "-u"
+                && s != "--sysupgrade"
+                && s != "-uu"
+                && s != "-c"
+                && s != "--clean"
+                && s != "--autoremove"
+                && s != "-n"
+                && s != "--dry-run"
+                && s != "--noconfirm"
+                && s != "--needed"
+        })
+        .map(|s| s.as_str())
+        .collect();
+
     let mut command_strs = Vec::new();
 
     if !pacman_targets.is_empty() {
-        command_strs.push(format!(
-            "sudo pacman -S --needed --noconfirm {}",
-            pacman_targets.join(" ")
-        ));
+        let mut p_cmd = vec!["sudo", "pacman", "-S", "--needed", "--noconfirm"];
+        p_cmd.extend(forwarded_pacman_flags.iter().copied());
+        let mut s = p_cmd.join(" ");
+        s.push(' ');
+        s.push_str(&pacman_targets.join(" "));
+        command_strs.push(s);
     }
 
     if !aur_targets.is_empty() {
         let helper = &config.options.helper;
-        command_strs.push(format!(
-            "{} -S --needed --aur --noconfirm {}",
-            helper,
-            aur_targets.join(" ")
-        ));
+        let mut a_cmd = vec![helper.as_str(), "-S", "--needed", "--aur", "--noconfirm"];
+        a_cmd.extend(forwarded_pacman_flags.iter().copied());
+        let mut s = a_cmd.join(" ");
+        s.push(' ');
+        s.push_str(&aur_targets.join(" "));
+        command_strs.push(s);
     }
 
     for p in &ext_providers {
@@ -302,12 +358,33 @@ fn cmd_upgrade(
         return;
     }
 
+    let conflicts = pm::check_package_conflicts(&manager, &pacman_targets);
+    if !conflicts.is_empty() {
+        println!("{}", ":: Note: Potential package conflict(s) detected:".yellow().bold());
+        for (cand, inst) in &conflicts {
+            println!(
+                "   - '{}' conflicts with installed package '{}' (may require replacement)",
+                cand.cyan(),
+                inst.yellow()
+            );
+        }
+        println!();
+    }
+
     println!("{}", ":: Synthesized Upgrade Command:".cyan());
     println!("  {}\n", full_cmd.bold());
 
     let mut selected_orphans = Vec::new();
 
     if !noconfirm {
+        if !io::stdin().is_terminal() {
+            eprintln!(
+                "{}",
+                "Error: Cannot prompt for confirmation in non-interactive environment. Use --noconfirm to proceed."
+                    .red()
+            );
+            exit(1);
+        }
         print!("{}", "Proceed with installation? [Y/n] ".bold());
         io::stdout().flush().unwrap();
         let mut resp = String::new();
@@ -336,27 +413,6 @@ fn cmd_upgrade(
     let mut executed_commands: Vec<String> = Vec::new();
     let mut exit_status = Ok(std::process::ExitStatus::default());
     let mut all_success = true;
-
-    let forwarded_pacman_flags: Vec<&str> = extra_flags
-        .iter()
-        .filter(|f| {
-            let s = f.as_str();
-            s != "-y"
-                && s != "--refresh"
-                && s != "-yy"
-                && s != "-u"
-                && s != "--sysupgrade"
-                && s != "-uu"
-                && s != "-c"
-                && s != "--clean"
-                && s != "--autoremove"
-                && s != "-n"
-                && s != "--dry-run"
-                && s != "--noconfirm"
-                && s != "--needed"
-        })
-        .map(|s| s.as_str())
-        .collect();
 
     if !pacman_targets.is_empty() {
         let mut args = vec!["pacman", "-S", "--needed", "--noconfirm"];
@@ -496,7 +552,8 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
     print_banner();
 
     let dry_run = flags.iter().any(|f| f == "-n" || f == "--dry-run");
-    let refresh = flags.iter().any(|f| f == "-y" || f == "--refresh");
+    let refresh = flags.iter().any(|f| f == "-y" || f == "--refresh" || f == "-yy");
+    let sysupgrade = flags.iter().any(|f| f == "-u" || f == "--sysupgrade" || f == "-uu");
     let noconfirm = flags.iter().any(|f| f == "--noconfirm");
     let needed = true;
 
@@ -507,6 +564,9 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
             s != "-y"
                 && s != "--refresh"
                 && s != "-yy"
+                && s != "-u"
+                && s != "--sysupgrade"
+                && s != "-uu"
                 && s != "-n"
                 && s != "--dry-run"
                 && s != "--noconfirm"
@@ -519,6 +579,7 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
         needed,
         noconfirm,
         refresh,
+        sysupgrade,
         dry_run,
         forwarded_flags,
     };
@@ -1321,14 +1382,22 @@ fn cmd_remove(mut config: Config, args: &[String], is_friendly: bool) {
     }
 }
 
-fn cmd_reset(force: bool) {
+fn cmd_reset(force: bool, noconfirm: bool) {
     let path = config::get_config_path();
     if !path.exists() {
         println!("{}", "No configuration file found to reset.".yellow());
         return;
     }
 
-    if !force {
+    if !force && !noconfirm {
+        if !io::stdin().is_terminal() {
+            eprintln!(
+                "{}",
+                "Error: Cannot prompt for confirmation in non-interactive environment. Use --noconfirm or -f/--force."
+                    .red()
+            );
+            exit(1);
+        }
         print!(
             "{}",
             "Are you sure you want to reset all configurations and pins to default? [y/N] ".bold()
@@ -1422,6 +1491,16 @@ fn cmd_sync_list(config: &Config, repos: &[String]) {
     let local_db = alpm.localdb();
 
     let filter_repos: std::collections::HashSet<&str> = repos.iter().map(|s| s.as_str()).collect();
+
+    if !repos.is_empty() {
+        for r in repos {
+            if !alpm.syncdbs().iter().any(|d| d.name() == r) {
+                eprintln!("error: repository '{}' was not found", r);
+                exit(1);
+            }
+        }
+    }
+
     let mut stdout = io::stdout().lock();
 
     for db in alpm.syncdbs() {
@@ -1617,7 +1696,13 @@ pub fn parse_pacman_cli_args(args: &[String]) -> (Vec<String>, Vec<String>) {
             || arg == "--arch"
             || arg == "--print-format";
 
-        if takes_arg {
+        if arg == "--wait" {
+            flags.push(arg.clone());
+            if i + 1 < args.len() && args[i + 1].parse::<u64>().is_ok() {
+                flags.push(args[i + 1].clone());
+                i += 1;
+            }
+        } else if takes_arg {
             flags.push(arg.clone());
             if i + 1 < args.len() {
                 flags.push(args[i + 1].clone());
@@ -1637,6 +1722,7 @@ pub fn parse_pacman_cli_args(args: &[String]) -> (Vec<String>, Vec<String>) {
             || arg.starts_with("--color=")
             || arg.starts_with("--arch=")
             || arg.starts_with("--print-format=")
+            || arg.starts_with("--wait=")
             || arg.starts_with('-')
         {
             flags.push(arg.clone());
@@ -1726,6 +1812,9 @@ fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
+    sandbox::init_signal_handlers();
+    sandbox::clean_stale_sandboxes();
+
     if std::env::var_os("NO_COLOR").is_some()
         || (!io::stdout().is_terminal() && std::env::var_os("CLICOLOR_FORCE").is_none())
     {
@@ -1761,7 +1850,8 @@ fn main() {
         let force = args
             .iter()
             .any(|a| a == "-f" || a == "--force" || a == "-y");
-        cmd_reset(force);
+        let noconfirm = args.iter().any(|a| a == "--noconfirm");
+        cmd_reset(force, noconfirm);
         exit(0);
     }
 
@@ -1901,36 +1991,21 @@ fn main() {
                 .iter()
                 .any(|a| a == "-p" || a == "--print-uris" || a == "--print"))
     {
-        let targets: Vec<String> = args
-            .iter()
-            .skip(1)
-            .filter(|a| !a.starts_with('-'))
-            .cloned()
-            .collect();
+        let (targets, _) = parse_pacman_cli_args(&args[1..]);
         cmd_print_uris(&config, &targets);
         exit(0);
     } else if cmd == "-Sl"
         || (cmd.starts_with("-S") && cmd.contains('l'))
         || (cmd.starts_with("-S") && args.iter().any(|a| a == "-l" || a == "--list"))
     {
-        let repos: Vec<String> = args
-            .iter()
-            .skip(1)
-            .filter(|a| !a.starts_with('-'))
-            .cloned()
-            .collect();
+        let (repos, _) = parse_pacman_cli_args(&args[1..]);
         cmd_sync_list(&config, &repos);
         exit(0);
     } else if cmd == "-Sg"
         || (cmd.starts_with("-S") && cmd.contains('g'))
         || (cmd.starts_with("-S") && args.iter().any(|a| a == "-g" || a == "--groups"))
     {
-        let groups: Vec<String> = args
-            .iter()
-            .skip(1)
-            .filter(|a| !a.starts_with('-'))
-            .cloned()
-            .collect();
+        let (groups, _) = parse_pacman_cli_args(&args[1..]);
         cmd_sync_groups(&config, &groups);
         exit(0);
     } else if cmd.starts_with("-T") {
@@ -1951,8 +2026,15 @@ fn main() {
         let (targets, mut flags) = parse_pacman_cli_args(&args[1..]);
         if cmd.len() > 2 && cmd.starts_with("-S") {
             let subflags = &cmd[2..];
-            if subflags.contains('y') {
+            if subflags.contains("yy") {
+                flags.push("-yy".to_string());
+            } else if subflags.contains('y') {
                 flags.push("-y".to_string());
+            }
+            if subflags.contains("uu") {
+                flags.push("-uu".to_string());
+            } else if subflags.contains('u') {
+                flags.push("-u".to_string());
             }
             if subflags.contains('n') {
                 flags.push("-n".to_string());
@@ -2001,12 +2083,13 @@ fn main() {
         let allow_partial = args
             .iter()
             .any(|a| a == "--allow-partial" || a == "--partial" || a == "-f" || a == "--force");
+        let noconfirm = args.iter().any(|a| a == "--noconfirm");
         for a in &args[1..] {
             if let Ok(id) = a.parse::<usize>() {
                 tx_id = Some(id);
             }
         }
-        TransactionJournal::rollback(tx_id, dry_run, allow_partial);
+        TransactionJournal::rollback(tx_id, dry_run, allow_partial, noconfirm);
     } else if cmd == "run" {
         let mut opts = sandbox::TryOptions::for_run();
         let mut positional = Vec::new();
@@ -2031,6 +2114,8 @@ fn main() {
                 opts.is_run_mode = false;
             } else if a == "--allow-unverified" {
                 opts.allow_unverified = true;
+            } else if a == "--noconfirm" || a == "-y" {
+                opts.noconfirm = true;
             } else if a == "--bin" {
                 if i + 1 < args.len() {
                     opts.bin = Some(args[i + 1].clone());
@@ -2104,6 +2189,8 @@ fn main() {
                 opts.audio = true;
             } else if a == "--allow-unverified" {
                 opts.allow_unverified = true;
+            } else if a == "--noconfirm" || a == "-y" {
+                opts.noconfirm = true;
             } else if a == "--bin" {
                 if i + 1 < args.len() {
                     opts.bin = Some(args[i + 1].clone());

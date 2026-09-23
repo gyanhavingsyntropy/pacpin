@@ -115,6 +115,38 @@ impl OrphanManager {
         let local = alpm.localdb();
         let mut orphans = Vec::new();
 
+        // 1. Identify all packages that are reachable from explicitly installed packages.
+        // Packages installed as dependencies that cannot be reached from any explicit package
+        // are orphaned (including cyclic required dependency clusters).
+        let mut reachable_from_explicit: HashSet<String> = HashSet::new();
+        let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+
+        for pkg in local.pkgs() {
+            if pkg.reason() == alpm::PackageReason::Explicit {
+                let name = pkg.name().to_string();
+                if reachable_from_explicit.insert(name.clone()) {
+                    queue.push_back(name);
+                }
+            }
+        }
+
+        while let Some(pkg_name) = queue.pop_front() {
+            if let Ok(pkg) = local.pkg(pkg_name.as_str()) {
+                for dep in pkg.depends() {
+                    let satisfier = local
+                        .pkg(dep.name())
+                        .ok()
+                        .or_else(|| local.pkgs().find_satisfier(dep.name()));
+                    if let Some(sat) = satisfier {
+                        let sat_name = sat.name().to_string();
+                        if reachable_from_explicit.insert(sat_name.clone()) {
+                            queue.push_back(sat_name);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut update_cand_deps: HashMap<String, HashSet<String>> = HashMap::new();
         for u in updates {
             if let Some(ref cand) = u.candidate {
@@ -133,7 +165,8 @@ impl OrphanManager {
                 pkg.required_by().iter().map(|s| s.to_string()).collect();
             let opt_for: Vec<String> = pkg.optional_for().iter().map(|s| s.to_string()).collect();
 
-            if current_parents.is_empty() {
+            if !reachable_from_explicit.contains(name) {
+                // Not reachable by any explicitly installed package -> genuine orphan
                 orphans.push(OrphanPackage {
                     name: name.to_string(),
                     version: pkg.version().to_string(),
@@ -149,7 +182,11 @@ impl OrphanManager {
 
                 for parent in &current_parents {
                     if let Some(new_deps) = update_cand_deps.get(parent) {
-                        if new_deps.contains(name) {
+                        let provides_matched = pkg
+                            .provides()
+                            .iter()
+                            .any(|p| new_deps.contains(p.name()));
+                        if new_deps.contains(name) || provides_matched {
                             all_dropping = false;
                             break;
                         } else {
@@ -175,6 +212,8 @@ impl OrphanManager {
             }
         }
 
+        Self::prune_orphan_cycles(&mut orphans);
+
         orphans.sort_by(|a, b| {
             let a_opt = !a.optional_for.is_empty();
             let b_opt = !b.optional_for.is_empty();
@@ -182,6 +221,47 @@ impl OrphanManager {
         });
 
         orphans
+    }
+
+    /// Prunes optional parent references that are part of isolated cycles or dead references.
+    /// Preserves transitive chains to active, non-orphan packages while breaking mutual
+    /// cyclic optional dependencies (e.g. A <-> B or A -> B -> C -> A) so that orphans
+    /// without active non-orphan parents become pure orphans.
+    pub fn prune_orphan_cycles(orphans: &mut [OrphanPackage]) {
+        let orphan_names: HashSet<String> = orphans.iter().map(|o| o.name.clone()).collect();
+        let mut active_packages: HashSet<String> = HashSet::new();
+
+        // 1. Any package listed in optional_for that is NOT in the orphan set is an active parent.
+        for o in orphans.iter() {
+            for p in &o.optional_for {
+                if !orphan_names.contains(p) {
+                    active_packages.insert(p.clone());
+                }
+            }
+        }
+
+        // 2. Transitively propagate active status through the orphan graph.
+        // If orphan A is optional for orphan B, and B has an active parent path, A also has an active parent path.
+        loop {
+            let mut added = false;
+            for o in orphans.iter() {
+                if !active_packages.contains(&o.name)
+                    && o.optional_for.iter().any(|p| active_packages.contains(p))
+                {
+                    active_packages.insert(o.name.clone());
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+
+        // 3. Retain only parents that reach an active package.
+        // Isolated cycles and dependencies on dead packages are pruned away.
+        for o in orphans.iter_mut() {
+            o.optional_for.retain(|p| active_packages.contains(p));
+        }
     }
 
     pub fn has_changed(current: &[OrphanPackage]) -> bool {
@@ -367,6 +447,185 @@ mod tests {
             Some(r) => r.is_pure != o.is_pure(),
         });
         assert!(has_change_new);
+    }
+
+    #[test]
+    fn test_cyclic_optional_orphans() {
+        // Mutual dependency: pkg A is optional for B, and pkg B is optional for A.
+        // Both are orphans with no active parent, so both must be resolved to pure orphans.
+        let mut orphans = vec![
+            OrphanPackage {
+                name: "pkg-a".to_string(),
+                version: "1.0".to_string(),
+                isize: 100,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: vec!["pkg-b".to_string()],
+            },
+            OrphanPackage {
+                name: "pkg-b".to_string(),
+                version: "1.0".to_string(),
+                isize: 100,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: vec!["pkg-a".to_string()],
+            },
+        ];
+
+        assert!(!orphans[0].is_pure());
+        assert!(!orphans[1].is_pure());
+
+        OrphanManager::prune_orphan_cycles(&mut orphans);
+
+        assert!(orphans[0].is_pure());
+        assert!(orphans[1].is_pure());
+        assert!(orphans[0].optional_for.is_empty());
+        assert!(orphans[1].optional_for.is_empty());
+    }
+
+    #[test]
+    fn test_multi_parent_optional_retention() {
+        // Package X is optional for ParentA and ParentB.
+        // If ParentA is uninstalled or orphaned, but ParentB is a live installed package,
+        // X must retain ParentB and must NOT be falsely promoted to pure.
+        let mut orphans = vec![
+            OrphanPackage {
+                name: "plugin-x".to_string(),
+                version: "1.0".to_string(),
+                isize: 100,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: vec!["parent-b".to_string()],
+            },
+        ];
+
+        OrphanManager::prune_orphan_cycles(&mut orphans);
+
+        assert!(!orphans[0].is_pure());
+        assert_eq!(orphans[0].optional_for, vec!["parent-b".to_string()]);
+    }
+
+    #[test]
+    fn test_3_node_cyclic_optional_orphans() {
+        // 3-node cycle: A -> B -> C -> A with no active parent outside the cycle.
+        // All 3 must be detected and pruned into pure orphans.
+        let mut orphans = vec![
+            OrphanPackage {
+                name: "pkg-a".to_string(),
+                version: "1.0".to_string(),
+                isize: 100,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: vec!["pkg-b".to_string()],
+            },
+            OrphanPackage {
+                name: "pkg-b".to_string(),
+                version: "1.0".to_string(),
+                isize: 100,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: vec!["pkg-c".to_string()],
+            },
+            OrphanPackage {
+                name: "pkg-c".to_string(),
+                version: "1.0".to_string(),
+                isize: 100,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: vec!["pkg-a".to_string()],
+            },
+        ];
+
+        OrphanManager::prune_orphan_cycles(&mut orphans);
+
+        assert!(orphans[0].is_pure());
+        assert!(orphans[1].is_pure());
+        assert!(orphans[2].is_pure());
+        assert!(orphans[0].optional_for.is_empty());
+        assert!(orphans[1].optional_for.is_empty());
+        assert!(orphans[2].optional_for.is_empty());
+    }
+
+    #[test]
+    fn test_transitive_active_optional_retention() {
+        // Transitive chain: C is optional for B, and B is optional for active non-orphan A.
+        // Both B and C are in the orphan set, but B is kept for A, and C is kept for B.
+        // Neither must be falsely promoted to pure orphan!
+        let mut orphans = vec![
+            OrphanPackage {
+                name: "plugin-b".to_string(),
+                version: "1.0".to_string(),
+                isize: 100,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: vec!["active-app-a".to_string()],
+            },
+            OrphanPackage {
+                name: "plugin-c".to_string(),
+                version: "1.0".to_string(),
+                isize: 100,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: vec!["plugin-b".to_string()],
+            },
+        ];
+
+        OrphanManager::prune_orphan_cycles(&mut orphans);
+
+        assert!(!orphans[0].is_pure());
+        assert!(!orphans[1].is_pure());
+        assert_eq!(orphans[0].optional_for, vec!["active-app-a".to_string()]);
+        assert_eq!(orphans[1].optional_for, vec!["plugin-b".to_string()]);
+    }
+
+    #[test]
+    fn test_multi_parent_with_dead_cycle_and_live_parent() {
+        // Package X is optional for dead cycle node 'cycle-a' AND live installed app 'vlc'.
+        // 'cycle-a' should be pruned, while 'vlc' is retained.
+        let mut orphans = vec![
+            OrphanPackage {
+                name: "cycle-a".to_string(),
+                version: "1.0".to_string(),
+                isize: 100,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: vec!["cycle-b".to_string()],
+            },
+            OrphanPackage {
+                name: "cycle-b".to_string(),
+                version: "1.0".to_string(),
+                isize: 100,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: vec!["cycle-a".to_string()],
+            },
+            OrphanPackage {
+                name: "plugin-x".to_string(),
+                version: "1.0".to_string(),
+                isize: 100,
+                desc: "".to_string(),
+                is_projected: false,
+                dropped_by: Vec::new(),
+                optional_for: vec!["cycle-a".to_string(), "vlc".to_string()],
+            },
+        ];
+
+        OrphanManager::prune_orphan_cycles(&mut orphans);
+
+        assert!(orphans[0].is_pure());
+        assert!(orphans[1].is_pure());
+        assert!(!orphans[2].is_pure());
+        assert_eq!(orphans[2].optional_for, vec!["vlc".to_string()]);
     }
 }
 

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -155,7 +156,7 @@ pub fn is_safe_tar_listing_line(line: &str) -> Result<(String, u64), String> {
         if !is_safe_tar_entry(src) {
             return Err(format!("Unsafe hardlink source entry: {}", src));
         }
-        if !is_safe_link_destination(src, dst) {
+        if !is_safe_tar_entry(dst) || dst.starts_with('/') || dst.starts_with('\\') {
             return Err(format!("Unsafe hardlink destination '{}' points outside sandbox root", dst));
         }
         Ok((src.to_string(), size))
@@ -164,6 +165,23 @@ pub fn is_safe_tar_listing_line(line: &str) -> Result<(String, u64), String> {
             return Err(format!("Unsafe path traversal entry: {}", full_path));
         }
         Ok((full_path, size))
+    }
+}
+
+/// Parses the package name from an Arch Linux package archive filename.
+/// Follows standard format: `<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.<ext>`.
+pub fn parse_pkgname_from_filename(filename: &str) -> Option<&str> {
+    let stem = filename
+        .strip_suffix(".pkg.tar.zst")
+        .or_else(|| filename.strip_suffix(".pkg.tar.xz"))
+        .or_else(|| filename.strip_suffix(".pkg.tar.gz"))
+        .or_else(|| filename.strip_suffix(".pkg.tar.bz2"))
+        .unwrap_or(filename);
+    let parts: Vec<&str> = stem.rsplitn(4, '-').collect();
+    if parts.len() == 4 {
+        Some(parts[3])
+    } else {
+        None
     }
 }
 
@@ -184,8 +202,10 @@ pub fn fetch_package_archive(
                 .filter(|e| {
                     let file_name = e.file_name();
                     let name_str = file_name.to_string_lossy();
-                    (name_str.ends_with(".pkg.tar.zst") || name_str.ends_with(".pkg.tar.xz"))
-                        && (name_str.starts_with(&format!("{}-", pkg)))
+                    (name_str.ends_with(".pkg.tar.zst")
+                        || name_str.ends_with(".pkg.tar.xz")
+                        || name_str.ends_with(".pkg.tar.gz"))
+                        && parse_pkgname_from_filename(&name_str) == Some(pkg)
                 })
                 .map(|e| e.path())
                 .collect();
@@ -396,7 +416,144 @@ pub fn extract_archive(archive_path: &Path, target_dir: &Path) -> Result<(), Str
         return Err(format!("Failed to extract package archive '{}'", archive_path.display()));
     }
 
+    // Verify uncompressed size on disk does not exceed safety limit (decompression bomb protection)
+    fn verify_disk_size(dir: &Path, current_total: &mut u64, limit: u64) -> Result<(), String> {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
+        for entry in entries.flatten() {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_file() {
+                let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                *current_total = current_total.saturating_add(sz);
+                if *current_total > limit {
+                    return Err(format!(
+                        "Security violation: extracted package size exceeds safety limit of 5 GB ({} bytes). Extraction aborted.",
+                        limit
+                    ));
+                }
+            } else if ft.is_dir() {
+                verify_disk_size(&entry.path(), current_total, limit)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut disk_size = 0u64;
+    verify_disk_size(target_dir, &mut disk_size, MAX_UNPACKED_BYTES)?;
+
+    validate_symlink_traversal(target_dir, 32)?;
+
     Ok(())
+}
+
+/// Traverses all symlinks in the extracted root to verify they do not escape the sandbox
+/// root and do not contain circular loops or exceed maximum link depth.
+pub fn validate_symlink_traversal(root: &Path, max_depth: usize) -> Result<(), String> {
+    fn walk_dir(current_dir: &Path, root: &Path, max_depth: usize) -> Result<(), String> {
+        let entries = match fs::read_dir(current_dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
+
+        let root_components: Vec<_> = root
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+
+            if file_type.is_symlink() {
+                let mut current = path.clone();
+                let mut visited = HashSet::new();
+                let mut depth = 0;
+
+                while let Ok(target) = fs::read_link(&current) {
+                    depth += 1;
+                    if depth > max_depth {
+                        return Err(format!(
+                            "Security violation: Symlink '{}' exceeds maximum link depth of {} (circular loop detected).",
+                            path.display(),
+                            max_depth
+                        ));
+                    }
+
+                    let mut norm_components = if target.is_absolute() {
+                        root_components.clone()
+                    } else {
+                        current
+                            .parent()
+                            .unwrap_or(root)
+                            .components()
+                            .filter_map(|c| match c {
+                                std::path::Component::Normal(n) => Some(n),
+                                _ => None,
+                            })
+                            .collect()
+                    };
+
+                    let mut escaped = false;
+                    for comp in target.components() {
+                        match comp {
+                            std::path::Component::ParentDir => {
+                                if norm_components.len() <= root_components.len() {
+                                    escaped = true;
+                                    break;
+                                }
+                                norm_components.pop();
+                            }
+                            std::path::Component::Normal(c) => {
+                                norm_components.push(c);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if escaped || !norm_components.starts_with(&root_components) {
+                        return Err(format!(
+                            "Security violation: Symlink '{}' resolves to path outside sandbox root.",
+                            path.display()
+                        ));
+                    }
+
+                    let mut resolved = PathBuf::from("/");
+                    for c in &norm_components {
+                        resolved.push(c);
+                    }
+
+                    if !visited.insert(resolved.clone()) {
+                        return Err(format!(
+                            "Security violation: Circular symlink loop detected involving '{}'.",
+                            path.display()
+                        ));
+                    }
+
+                    if resolved.is_symlink() {
+                        current = resolved;
+                    } else {
+                        break;
+                    }
+                }
+            } else if file_type.is_dir() {
+                walk_dir(&path, root, max_depth)?;
+            }
+        }
+        Ok(())
+    }
+
+    walk_dir(root, root, max_depth)
 }
 
 #[cfg(test)]
@@ -418,5 +575,103 @@ mod tests {
         assert!(is_safe_link_destination("usr/bin/foo", "../lib/libfoo.so"));
         assert!(!is_safe_link_destination("usr/bin/foo", "../../../etc/shadow"));
         assert!(!is_safe_link_destination("usr/bin/foo", "/etc/shadow"));
+    }
+
+    #[test]
+    fn test_validate_symlink_traversal_safe() {
+        let temp_dir = std::env::temp_dir().join(format!("pacpin-test-symlink-safe-{}", std::process::id()));
+        let _ = fs::create_dir_all(temp_dir.join("usr/bin"));
+        let _ = fs::create_dir_all(temp_dir.join("usr/lib"));
+
+        let real_file = temp_dir.join("usr/bin/target_bin");
+        let _ = fs::write(&real_file, b"content");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = temp_dir.join("usr/bin/link_bin");
+            let _ = symlink("target_bin", &link);
+            assert!(validate_symlink_traversal(&temp_dir, 32).is_ok());
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_validate_symlink_traversal_cycle_rejected() {
+        let temp_dir = std::env::temp_dir().join(format!("pacpin-test-symlink-cycle-{}", std::process::id()));
+        let _ = fs::create_dir_all(temp_dir.join("usr/bin"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link_a = temp_dir.join("usr/bin/loop_a");
+            let link_b = temp_dir.join("usr/bin/loop_b");
+            let _ = symlink("loop_b", &link_a);
+            let _ = symlink("loop_a", &link_b);
+
+            let res = validate_symlink_traversal(&temp_dir, 32);
+            assert!(res.is_err());
+            assert!(res.unwrap_err().contains("Circular symlink loop"));
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_validate_symlink_traversal_escaping_rejected() {
+        let temp_dir = std::env::temp_dir().join(format!("pacpin-test-symlink-escape-{}", std::process::id()));
+        let _ = fs::create_dir_all(temp_dir.join("usr/bin"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = temp_dir.join("usr/bin/bad_link");
+            let _ = symlink("../../../../../../../../../etc/passwd", &link);
+
+            let res = validate_symlink_traversal(&temp_dir, 32);
+            assert!(res.is_err());
+            assert!(res.unwrap_err().contains("outside sandbox root"));
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_parse_pkgname_from_filename() {
+        assert_eq!(
+            parse_pkgname_from_filename("gcc-14.2.1-1-x86_64.pkg.tar.zst"),
+            Some("gcc")
+        );
+        assert_eq!(
+            parse_pkgname_from_filename("gcc-libs-14.2.1-1-x86_64.pkg.tar.zst"),
+            Some("gcc-libs")
+        );
+        assert_eq!(
+            parse_pkgname_from_filename("linux-headers-6.10.1.arch1-1-x86_64.pkg.tar.zst"),
+            Some("linux-headers")
+        );
+        assert_eq!(
+            parse_pkgname_from_filename("linux-6.10.1.arch1-1-x86_64.pkg.tar.xz"),
+            Some("linux")
+        );
+        assert_eq!(
+            parse_pkgname_from_filename("python-pip-24.0-1-any.pkg.tar.gz"),
+            Some("python-pip")
+        );
+        assert_eq!(parse_pkgname_from_filename("malformed"), None);
+    }
+
+    #[test]
+    fn test_hardlink_escape_rejected() {
+        // In tar files, hardlink destinations with .. or leading / escape the root
+        let bad_hl = "hrw-r--r-- 0/0 0 1970-01-01 05:30 usr/bin/bad link to ../etc/shadow";
+        assert!(is_safe_tar_listing_line(bad_hl).is_err());
+
+        let bad_hl_abs = "hrw-r--r-- 0/0 0 1970-01-01 05:30 usr/bin/bad link to /etc/shadow";
+        assert!(is_safe_tar_listing_line(bad_hl_abs).is_err());
+
+        let good_hl = "hrw-r--r-- 0/0 0 1970-01-01 05:30 usr/bin/good link to usr/bin/orig";
+        assert!(is_safe_tar_listing_line(good_hl).is_ok());
     }
 }

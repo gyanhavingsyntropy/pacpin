@@ -20,19 +20,116 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static CLEANUP_TARGETS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+pub fn register_cleanup_target(path: PathBuf) {
+    if let Ok(mut lock) = CLEANUP_TARGETS.lock() {
+        if !lock.contains(&path) {
+            lock.push(path);
+        }
+    }
+}
+
+pub fn unregister_cleanup_target(path: &Path) {
+    if let Ok(mut lock) = CLEANUP_TARGETS.lock() {
+        lock.retain(|p| p != path);
+    }
+}
+
+pub fn cleanup_active_targets() {
+    if let Ok(mut lock) = CLEANUP_TARGETS.try_lock() {
+        for path in lock.drain(..) {
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(&path);
+            } else if path.is_file() {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+pub fn clean_stale_sandboxes() {
+    if let Ok(xdg_runtime) = env::var("XDG_RUNTIME_DIR") {
+        for sub in &["run", "try"] {
+            let dir = PathBuf::from(&xdg_runtime).join("pacpin").join(sub);
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        let _ = fs::remove_dir_all(&p);
+                    }
+                }
+            }
+        }
+    }
+
+    // Also clean any fallback temp directories created in env::temp_dir()
+    if let Ok(entries) = fs::read_dir(env::temp_dir()) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if (name.starts_with("pacpin-run-") || name.starts_with("pacpin-try-")) && p.is_dir() {
+                    let _ = fs::remove_dir_all(&p);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+extern "C" fn sig_handler(sig: libc::c_int) {
+    cleanup_active_targets();
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+pub fn init_signal_handlers() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        #[cfg(unix)]
+        unsafe {
+            libc::signal(libc::SIGINT, sig_handler as *const () as usize);
+            libc::signal(libc::SIGTERM, sig_handler as *const () as usize);
+        }
+    });
+}
 
 struct SandboxGuard {
     sandbox_dir: PathBuf,
     downloaded_tarballs: Vec<PathBuf>,
 }
 
+impl SandboxGuard {
+    pub fn new(sandbox_dir: PathBuf) -> Self {
+        register_cleanup_target(sandbox_dir.clone());
+        Self {
+            sandbox_dir,
+            downloaded_tarballs: Vec::new(),
+        }
+    }
+
+    pub fn register_tarball(&mut self, tarball: &Path) {
+        let p = tarball.to_path_buf();
+        register_cleanup_target(p.clone());
+        if !self.downloaded_tarballs.contains(&p) {
+            self.downloaded_tarballs.push(p);
+        }
+    }
+}
+
 impl Drop for SandboxGuard {
     fn drop(&mut self) {
+        unregister_cleanup_target(&self.sandbox_dir);
         if self.sandbox_dir.exists() {
             let _ = fs::remove_dir_all(&self.sandbox_dir);
         }
         for tarball in &self.downloaded_tarballs {
+            unregister_cleanup_target(tarball);
             if tarball.exists() {
                 let _ = fs::remove_file(tarball);
             }
@@ -62,6 +159,7 @@ pub struct TryOptions {
     pub bin: Option<String>,
     pub allow_unverified: bool,
     pub is_run_mode: bool,
+    pub noconfirm: bool,
 }
 
 impl TryOptions {
@@ -75,6 +173,7 @@ impl TryOptions {
             bin: None,
             allow_unverified: false,
             is_run_mode: true,
+            noconfirm: false,
         }
     }
 }
@@ -317,88 +416,123 @@ pub use crate::download::{
     is_safe_tar_entry, is_safe_tar_listing_line, MAX_ARCHIVE_ENTRIES, MAX_UNPACKED_BYTES,
 };
 
+/// Checks if bubblewrap is installed and functional with unprivileged user namespaces.
+pub fn check_bwrap_capability() -> Result<(), String> {
+    if !crate::is_command_available("bwrap") {
+        return Err("Bubblewrap ('bwrap') is not installed.".to_string());
+    }
+
+    let test_res = Command::new("bwrap")
+        .args(["--unshare-user", "--ro-bind", "/usr", "/usr", "--", "/bin/true"])
+        .output();
+
+    match test_res {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let msg = if stderr.contains("Setting up uid map")
+                || stderr.contains("No permissions")
+                || stderr.contains("Permission denied")
+                || stderr.contains("unprivileged_userns_clone")
+            {
+                "Bubblewrap is installed, but kernel unprivileged user namespaces appear restricted or disabled by your system.\n  \
+                (e.g., sysctl kernel.unprivileged_userns_clone = 0 or AppArmor restrictions).\n  \
+                To run without sandbox container isolation, pass --no-sandbox."
+            } else {
+                "Bubblewrap container execution test failed.\n  \
+                To bypass sandbox container isolation, pass --no-sandbox."
+            };
+            Err(msg.to_string())
+        }
+        Err(e) => Err(format!("Failed to execute 'bwrap': {}", e)),
+    }
+}
+
 fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptions) -> Result<i32, String> {
     if pkg.is_empty() || !crate::journal::TransactionJournal::is_safe_pkg_name(pkg) {
         return Err(format!("Invalid package name '{}'.", pkg));
     }
 
-    let mut bwrap_available = crate::is_command_available("bwrap");
+    init_signal_handlers();
 
-    if !options.no_sandbox && !bwrap_available {
-        let is_interactive = io::stdin().is_terminal();
-        if is_interactive {
-            print!(
-                "\n{} Bubblewrap ('bwrap') is required for sandbox container isolation but is not installed.\n   Would you like pacpin to install 'bubblewrap' now? [Y/n] ",
-                "::".cyan().bold()
-            );
-            let _ = io::stdout().flush();
-            let mut answer = String::new();
-            if io::stdin().read_line(&mut answer).is_ok() {
-                let trimmed = answer.trim().to_lowercase();
-                if trimmed.is_empty() || trimmed == "y" || trimmed == "yes" {
-                    println!("{}", ":: Installing bubblewrap via pacpin...".cyan());
-                    let mut config = crate::config::load_config();
-                    let install_opts = crate::pm::InstallOptions {
-                        needed: true,
-                        noconfirm: false,
-                        refresh: false,
-                        dry_run: false,
-                        forwarded_flags: Vec::new(),
-                    };
-                    match crate::pm::install(
-                        &mut config,
-                        &["bubblewrap".to_string()],
-                        &install_opts,
-                    ) {
-                        Ok(_) => {
-                            bwrap_available = crate::is_command_available("bwrap");
-                            if !bwrap_available {
-                                return Err(
-                                    "Package installation completed but 'bwrap' executable was not found in PATH."
-                                        .to_string(),
-                                );
+    if !options.no_sandbox {
+        if let Err(err_reason) = check_bwrap_capability() {
+            if !crate::is_command_available("bwrap") {
+                let is_interactive = io::stdin().is_terminal() && !options.noconfirm;
+                if is_interactive {
+                    print!(
+                        "\n{} Bubblewrap ('bwrap') is required for sandbox container isolation but is not installed.\n   Would you like pacpin to install 'bubblewrap' now? [Y/n] ",
+                        "::".cyan().bold()
+                    );
+                    let _ = io::stdout().flush();
+                    let mut answer = String::new();
+                    if io::stdin().read_line(&mut answer).is_ok() {
+                        let trimmed = answer.trim().to_lowercase();
+                        if trimmed.is_empty() || trimmed == "y" || trimmed == "yes" {
+                            println!("{}", ":: Installing bubblewrap via pacpin...".cyan());
+                            let mut config = crate::config::load_config();
+                            let install_opts = crate::pm::InstallOptions {
+                                needed: true,
+                                noconfirm: false,
+                                refresh: false,
+                                sysupgrade: false,
+                                dry_run: false,
+                                forwarded_flags: Vec::new(),
+                            };
+                            match crate::pm::install(
+                                &mut config,
+                                &["bubblewrap".to_string()],
+                                &install_opts,
+                            ) {
+                                Ok(_) => {
+                                    if let Err(e) = check_bwrap_capability() {
+                                        return Err(format!(
+                                            "Bubblewrap installed but container isolation capability check failed: {}",
+                                            e
+                                        ));
+                                    }
+                                    println!(
+                                        "{}",
+                                        "✔ 'bubblewrap' installed and container isolation verified. Resuming sandbox..."
+                                            .green()
+                                            .bold()
+                                    );
+                                }
+                                Err(e) => {
+                                    return Err(format!("Failed to install 'bubblewrap': {}", e));
+                                }
                             }
-                            println!(
-                                "{}",
-                                "✔ 'bubblewrap' installed successfully. Resuming sandbox..."
-                                    .green()
-                                    .bold()
+                        } else {
+                            return Err(
+                                "Bubblewrap ('bwrap') is not installed.\n  \
+                                'pacpin try' defaults to fail-closed container isolation for security.\n  \
+                                To bypass sandboxing and run directly on your host (UNSAFE), pass --no-sandbox."
+                                    .to_string(),
                             );
                         }
-                        Err(e) => {
-                            return Err(format!("Failed to install 'bubblewrap': {}", e));
-                        }
+                    } else {
+                        return Err("Failed to read user input. Aborting.".to_string());
                     }
                 } else {
                     return Err(
-                        "Bubblewrap ('bwrap') is not installed.\n  \
+                        "Bubblewrap ('bwrap') is not installed on this system.\n  \
                         'pacpin try' defaults to fail-closed container isolation for security.\n  \
+                        To run securely in a sandbox container, install bubblewrap:\n    \
+                        sudo pacman -S bubblewrap\n  \
                         To bypass sandboxing and run directly on your host (UNSAFE), pass --no-sandbox."
                             .to_string(),
                     );
                 }
             } else {
-                return Err("Failed to read user input. Aborting.".to_string());
+                return Err(err_reason);
             }
-        } else {
-            return Err(
-                "Bubblewrap ('bwrap') is not installed on this system.\n  \
-                'pacpin try' defaults to fail-closed container isolation for security.\n  \
-                To run securely in a sandbox container, install bubblewrap:\n    \
-                sudo pacman -S bubblewrap\n  \
-                To bypass sandboxing and run directly on your host (UNSAFE), pass --no-sandbox."
-                    .to_string(),
-            );
         }
     }
 
     let prefix = if options.is_run_mode { "pacpin-run" } else { "pacpin-try" };
     let sandbox_dir = create_secure_temp_dir(&format!("{}-{}", prefix, pkg))?;
 
-    let mut guard = SandboxGuard {
-        sandbox_dir: sandbox_dir.clone(),
-        downloaded_tarballs: Vec::new(),
-    };
+    let mut guard = SandboxGuard::new(sandbox_dir.clone());
 
     let cfg = crate::config::load_config();
     let manager = crate::db::AlpmManager::with_repo_order(&cfg.repo_order)
@@ -489,7 +623,7 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
         );
     }
 
-    let child_status = if !options.no_sandbox && bwrap_available {
+    let child_status = if !options.no_sandbox {
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         let user = env::var("USER").unwrap_or_else(|_| "sandbox".to_string());
@@ -614,13 +748,15 @@ fn get_or_download_package(
     allow_unverified: bool,
     guard: &mut SandboxGuard,
 ) -> Result<PathBuf, String> {
-    crate::download::fetch_package_archive(
+    let p = crate::download::fetch_package_archive(
         pkg,
         candidate_urls,
         expected_sha,
         allow_unverified,
         &mut guard.downloaded_tarballs,
-    )
+    )?;
+    guard.register_tarball(&p);
+    Ok(p)
 }
 
 fn find_executable(sandbox_dir: &Path, pkg: &str, requested_bin: Option<&str>) -> Result<PathBuf, String> {
@@ -839,5 +975,24 @@ mod tests {
         assert!(opts.bin.is_none());
         assert!(!opts.allow_unverified);
         assert!(opts.is_run_mode);
+        assert!(!opts.noconfirm);
+    }
+
+    #[test]
+    fn test_cleanup_registry() {
+        let temp_dir = std::env::temp_dir().join(format!("pacpin-test-cleanup-reg-{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+        assert!(temp_dir.exists());
+
+        register_cleanup_target(temp_dir.clone());
+        cleanup_active_targets();
+
+        assert!(!temp_dir.exists());
+    }
+
+    #[test]
+    fn test_check_bwrap_capability_runs() {
+        // Must execute cleanly without panic
+        let _ = check_bwrap_capability();
     }
 }

@@ -43,9 +43,19 @@ pub fn clean_dep_name(dep: &str) -> &str {
     dep.split(['>', '<', '=', ':']).next().unwrap_or(dep).trim()
 }
 
-#[derive(Debug, Deserialize)]
-struct AurResponse {
-    results: Vec<AurItem>,
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct AurRpcResponse {
+    #[serde(rename = "version", default)]
+    pub version: Option<u32>,
+    #[serde(rename = "type", default)]
+    pub response_type: Option<String>,
+    #[serde(rename = "resultcount", default)]
+    pub resultcount: Option<u32>,
+    #[serde(default)]
+    pub results: Vec<AurItem>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 pub fn query_aur(pkg_names: &[String]) -> HashMap<String, AurItem> {
@@ -77,31 +87,81 @@ pub fn query_aur(pkg_names: &[String]) -> HashMap<String, AurItem> {
             }
 
             match agent.get(&url).call() {
-                Ok(resp) => match resp.into_json::<AurResponse>() {
-                    Ok(data) => {
-                        for item in data.results {
-                            results.insert(item.name.clone(), item);
+                Ok(resp) => {
+                    let text = match resp.into_string() {
+                        Ok(t) => t,
+                        Err(e) => {
+                            if attempts == max_attempts {
+                                eprintln!(
+                                    "{}",
+                                    format!(":: Warning: Failed to read AUR RPC response: {}", e).yellow()
+                                );
+                            }
+                            continue;
                         }
-                        success = true;
-                    }
-                    Err(e) => {
-                        if attempts == max_attempts {
-                            eprintln!(
-                                "{}",
-                                format!(":: Warning: Failed to parse AUR RPC response after {} attempts: {}", attempts, e).yellow()
-                            );
+                    };
+
+                    match serde_json::from_str::<AurRpcResponse>(&text) {
+                        Ok(rpc) => {
+                            if let Some(ref err_msg) = rpc.error {
+                                if attempts == max_attempts {
+                                    eprintln!(
+                                        "{}",
+                                        format!(":: Warning: AUR RPC returned error: {}", err_msg).yellow()
+                                    );
+                                }
+                            } else {
+                                for item in rpc.results {
+                                    results.insert(item.name.clone(), item);
+                                }
+                                success = true;
+                            }
+                        }
+                        Err(e) => {
+                            if attempts == max_attempts {
+                                eprintln!(
+                                    "{}",
+                                    format!(
+                                        ":: Warning: Failed to parse AUR RPC response JSON (attempt {}/{}): {}",
+                                        attempts, max_attempts, e
+                                    )
+                                    .yellow()
+                                );
+                            }
                         }
                     }
-                },
-                Err(e) => {
+                }
+                Err(ureq::Error::Status(code, _resp)) => {
+                    let desc = match code {
+                        429 => "Rate limited (HTTP 429). Too many requests to AUR RPC",
+                        500 => "Internal server error (HTTP 500)",
+                        502 => "Bad gateway (HTTP 502). AUR RPC server upstream is unreachable",
+                        503 => "Service unavailable (HTTP 503). AUR is temporarily undergoing maintenance",
+                        504 => "Gateway timeout (HTTP 504)",
+                        _ => "HTTP error response",
+                    };
                     if attempts == max_attempts {
                         eprintln!(
                             "{}",
                             format!(
-                                ":: Warning: AUR RPC query failed for {} package(s) after {} attempts: {}",
-                                chunk.len(),
-                                attempts,
-                                e
+                                ":: Warning: AUR RPC query failed (HTTP {}): {} for {} package(s)",
+                                code, desc, chunk.len()
+                            )
+                            .yellow()
+                        );
+                    }
+                    if code == 429 {
+                        // Longer backoff for rate limits
+                        std::thread::sleep(std::time::Duration::from_millis(1500 * attempts as u64));
+                    }
+                }
+                Err(ureq::Error::Transport(transport_err)) => {
+                    if attempts == max_attempts {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                ":: Warning: AUR RPC network error after {} attempts: {}",
+                                attempts, transport_err
                             )
                             .yellow()
                         );
@@ -161,5 +221,33 @@ mod tests {
         assert_eq!(item.depends, vec!["mcpelauncher-linux", "qt6-base>=6.5"]);
         assert_eq!(item.make_depends, vec!["cmake"]);
         assert_eq!(item.conflicts, vec!["mcpelauncher-git"]);
+    }
+
+    #[test]
+    fn test_aur_error_response_deserialize() {
+        let json = r#"{
+            "version": 5,
+            "type": "error",
+            "error": "Rate limit exceeded"
+        }"#;
+        let rpc: AurRpcResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(rpc.response_type.as_deref(), Some("error"));
+        assert_eq!(rpc.error.as_deref(), Some("Rate limit exceeded"));
+        assert!(rpc.results.is_empty());
+    }
+
+    #[test]
+    fn test_aur_multiinfo_empty_deserialize() {
+        let json = r#"{
+            "version": 5,
+            "type": "multiinfo",
+            "resultcount": 0,
+            "results": []
+        }"#;
+        let rpc: AurRpcResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(rpc.response_type.as_deref(), Some("multiinfo"));
+        assert_eq!(rpc.resultcount, Some(0));
+        assert!(rpc.results.is_empty());
+        assert!(rpc.error.is_none());
     }
 }

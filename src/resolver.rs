@@ -802,4 +802,34 @@ mod tests {
         };
         assert_eq!(missing_meta_cand.compute_net_delta(1024), None);
     }
+
+    #[test]
+    fn test_complex_versioning_and_epochs() {
+        use alpm::vercmp;
+        use std::cmp::Ordering;
+
+        // 1. Epoch superiority: 1:2.0 is newer than 2.1 (epoch 1 > epoch 0)
+        assert_eq!(vercmp("1:2.0", "2.1"), Ordering::Greater);
+        assert_eq!(vercmp("2:1.0", "1:9.9"), Ordering::Greater);
+        assert_eq!(vercmp("1:1.0", "1:1.0"), Ordering::Equal);
+        assert_eq!(vercmp("0:2.0", "2.0"), Ordering::Equal);
+        assert_eq!(vercmp("1:0.1", "9.9"), Ordering::Greater);
+
+        // 2. Pkgrel bumps
+        assert_eq!(vercmp("1.2.3-2", "1.2.3-1"), Ordering::Greater);
+        assert_eq!(vercmp("1.2.3-1.1", "1.2.3-1"), Ordering::Greater);
+        assert_eq!(vercmp("1.2.3-10", "1.2.3-2"), Ordering::Greater);
+
+        // 3. VCS Git tags and revisions
+        assert_eq!(
+            vercmp("0.1.r123.g456-1", "0.1.r120.g123-1"),
+            Ordering::Greater
+        );
+        assert_eq!(vercmp("1.0.0.r5.ga1b2c3d-1", "1.0.0-1"), Ordering::Greater);
+
+        // 4. Pre-releases and alphabetic ordering
+        assert_eq!(vercmp("2.0.0", "2.0.0rc1"), Ordering::Greater);
+        assert_eq!(vercmp("2.0.0beta2", "2.0.0beta1"), Ordering::Greater);
+        assert_eq!(vercmp("2.0.0alpha", "2.0.0beta"), Ordering::Less);
+    }
 }

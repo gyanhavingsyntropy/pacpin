@@ -37,7 +37,7 @@ pub fn get_terminal_width() -> usize {
 }
 
 pub fn truncate_str(s: &str, max_w: usize) -> String {
-    if s.chars().count() <= max_w {
+    if str_width(s) <= max_w {
         return s.to_string();
     }
     if max_w == 0 {
@@ -46,7 +46,17 @@ pub fn truncate_str(s: &str, max_w: usize) -> String {
     if max_w == 1 {
         return "…".to_string();
     }
-    let mut res: String = s.chars().take(max_w - 1).collect();
+    let target_w = max_w.saturating_sub(1);
+    let mut res = String::new();
+    let mut current_w = 0;
+    for ch in s.chars() {
+        let cw = char_width(ch);
+        if current_w + cw > target_w {
+            break;
+        }
+        res.push(ch);
+        current_w += cw;
+    }
     res.push('…');
     res
 }
@@ -420,14 +430,21 @@ pub fn prompt_orphan_selection(
         let checkbox_items: Vec<crate::tui_select::CheckboxItem> = orphans
             .iter()
             .map(|o| {
-                let is_pure = o.optional_for.is_empty();
+                let is_pure = o.is_pure();
                 let size_str = format_size(o.isize);
-                let desc = if !is_pure {
-                    format!("{} (opt for: {})", size_str, o.optional_for.join(", "))
-                } else if !o.desc.is_empty() {
-                    format!("{} — {}", size_str, o.desc)
+                let note = if o.is_projected && !o.dropped_by.is_empty() {
+                    format!("(dropped by: {})", o.dropped_by.join(", "))
+                } else if !is_pure {
+                    format!("(for: {})", o.optional_for.join(", "))
                 } else {
-                    format!("{} [Pure Orphan]", size_str)
+                    String::new()
+                };
+
+                let desc = match (!note.is_empty(), !o.desc.is_empty()) {
+                    (true, true) => format!("{} {} — {}", size_str, note, o.desc),
+                    (true, false) => format!("{} {}", size_str, note),
+                    (false, true) => format!("{} — {}", size_str, o.desc),
+                    (false, false) => size_str,
                 };
                 crate::tui_select::CheckboxItem::new(
                     o.name.clone(),
