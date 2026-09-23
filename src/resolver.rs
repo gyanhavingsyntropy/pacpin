@@ -41,6 +41,29 @@ pub struct CandidatePackage {
 }
 
 impl CandidatePackage {
+    pub fn from_aur(aur_pkg: &crate::aur::AurItem) -> Self {
+        let cleaned_deps: Vec<String> = aur_pkg
+            .depends
+            .iter()
+            .map(|d| crate::aur::clean_dep_name(d).to_string())
+            .collect();
+        Self {
+            name: aur_pkg.name.clone(),
+            version: aur_pkg.version.clone(),
+            repo: "aur".to_string(),
+            base: aur_pkg
+                .package_base
+                .clone()
+                .unwrap_or_else(|| aur_pkg.name.clone()),
+            csize: 0,
+            isize: 0,
+            desc: aur_pkg.description.clone().unwrap_or_default(),
+            builddate: aur_pkg.last_modified.unwrap_or(0),
+            is_aur: true,
+            depends: cleaned_deps,
+        }
+    }
+
     pub fn age_days(&self) -> f64 {
         if self.builddate <= 0 {
             return 9999.0;
@@ -339,18 +362,7 @@ impl<'a> ResolverEngine<'a> {
                 let target_repo = pinned_repo.as_ref().unwrap();
                 if target_repo.eq_ignore_ascii_case("aur") {
                     if let Some(aur_pkg) = aur_data.get(pkg_name) {
-                        candidate = Some(CandidatePackage {
-                            name: aur_pkg.name.clone(),
-                            version: aur_pkg.version.clone(),
-                            repo: "aur".to_string(),
-                            base: aur_pkg.name.clone(),
-                            csize: 0,
-                            isize: 0,
-                            desc: aur_pkg.description.clone().unwrap_or_default(),
-                            builddate: aur_pkg.last_modified.unwrap_or(0),
-                            is_aur: true,
-                            depends: Vec::new(),
-                        });
+                        candidate = Some(CandidatePackage::from_aur(aur_pkg));
                     } else {
                         unresolved_pins.push((pkg_name.to_string(), target_repo.clone()));
                     }
@@ -383,18 +395,7 @@ impl<'a> ResolverEngine<'a> {
                 {
                     if installed_db.eq_ignore_ascii_case("aur") {
                         if let Some(aur_pkg) = aur_data.get(pkg_name) {
-                            candidate = Some(CandidatePackage {
-                                name: aur_pkg.name.clone(),
-                                version: aur_pkg.version.clone(),
-                                repo: "aur".to_string(),
-                                base: aur_pkg.name.clone(),
-                                csize: 0,
-                                isize: 0,
-                                desc: aur_pkg.description.clone().unwrap_or_default(),
-                                builddate: aur_pkg.last_modified.unwrap_or(0),
-                                is_aur: true,
-                                depends: Vec::new(),
-                            });
+                            candidate = Some(CandidatePackage::from_aur(aur_pkg));
                             is_sticky = true;
                         }
                     } else if let Some(&db) = syncdb_map.get(installed_db.as_str()) {
@@ -449,18 +450,7 @@ impl<'a> ResolverEngine<'a> {
 
                     if candidate.is_none() {
                         if let Some(aur_pkg) = aur_data.get(pkg_name) {
-                            candidate = Some(CandidatePackage {
-                                name: aur_pkg.name.clone(),
-                                version: aur_pkg.version.clone(),
-                                repo: "aur".to_string(),
-                                base: aur_pkg.name.clone(),
-                                csize: 0,
-                                isize: 0,
-                                desc: aur_pkg.description.clone().unwrap_or_default(),
-                                builddate: aur_pkg.last_modified.unwrap_or(0),
-                                is_aur: true,
-                                depends: Vec::new(),
-                            });
+                            candidate = Some(CandidatePackage::from_aur(aur_pkg));
                         }
                     }
                 }
@@ -724,5 +714,28 @@ mod tests {
             ResolverEngine::match_delay_days("mesa", &delays, &glob_delays),
             None
         );
+    }
+
+    #[test]
+    fn test_candidate_package_from_aur() {
+        let aur_item = crate::aur::AurItem {
+            name: "mcpelauncher-ui".to_string(),
+            package_base: Some("mcpelauncher".to_string()),
+            version: "1.0.0-1".to_string(),
+            description: Some("Launcher UI".to_string()),
+            last_modified: Some(1700000000),
+            depends: vec![
+                "mcpelauncher-linux".to_string(),
+                "qt6-base>=6.5".to_string(),
+            ],
+            make_depends: vec!["cmake".to_string()],
+            conflicts: vec![],
+        };
+        let cand = CandidatePackage::from_aur(&aur_item);
+        assert_eq!(cand.name, "mcpelauncher-ui");
+        assert_eq!(cand.base, "mcpelauncher");
+        assert_eq!(cand.repo, "aur");
+        assert_eq!(cand.depends, vec!["mcpelauncher-linux", "qt6-base"]);
+        assert!(cand.is_aur);
     }
 }

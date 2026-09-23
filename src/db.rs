@@ -347,6 +347,42 @@ impl AlpmManager {
         repo: &str,
         pins: &BTreeMap<String, String>,
     ) -> Vec<String> {
+        if repo.eq_ignore_ascii_case("aur") {
+            let aur_map = crate::aur::query_aur(&[pkg_name.to_string()]);
+            if let Some(target_aur) = aur_map.get(pkg_name) {
+                let target_base = target_aur.package_base.as_deref().unwrap_or(pkg_name);
+                let direct_deps: HashSet<String> = target_aur
+                    .depends
+                    .iter()
+                    .map(|d| crate::aur::clean_dep_name(d).to_string())
+                    .collect();
+                let local_db = self.handle.localdb();
+                let prefix = format!("{}-", pkg_name);
+                let base_prefix = format!("{}-", target_base);
+                let mut companions = HashSet::new();
+
+                for pkg in local_db.pkgs() {
+                    let name = pkg.name();
+                    if name == pkg_name {
+                        continue;
+                    }
+                    if pins.get(name).map(|r| r.as_str()) == Some("aur") {
+                        continue;
+                    }
+                    if direct_deps.contains(name)
+                        || name.starts_with(&prefix)
+                        || name.starts_with(&base_prefix)
+                    {
+                        companions.insert(name.to_string());
+                    }
+                }
+                let mut sorted: Vec<String> = companions.into_iter().collect();
+                sorted.sort();
+                return sorted;
+            }
+            return Vec::new();
+        }
+
         let sync_db = match self.handle.syncdbs().into_iter().find(|d| d.name() == repo) {
             Some(db) => db,
             None => return Vec::new(),

@@ -573,8 +573,20 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
             }
 
             if repo.eq_ignore_ascii_case("aur") {
-                aur_targets.push(pkg.to_string());
-                pending_pins.push((pkg.to_string(), "aur".to_string()));
+                let companions = manager.find_companions(pkg, "aur", &config.pins);
+                let mut to_install_repo = vec![pkg.to_string()];
+                if !companions.is_empty() {
+                    let title = format!(
+                        "'{}' has companion packages in [aur] to avoid version mismatches",
+                        pkg
+                    );
+                    let selected = prompt_multiselect(&title, "aur", &companions);
+                    to_install_repo.extend(selected);
+                }
+                for p in to_install_repo {
+                    pending_pins.push((p.clone(), "aur".to_string()));
+                    aur_targets.push(p);
+                }
             } else {
                 let companions = manager.find_companions(pkg, repo, &config.pins);
                 let mut to_install_repo = vec![pkg.to_string()];
