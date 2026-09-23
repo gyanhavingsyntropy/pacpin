@@ -64,6 +64,14 @@ impl CandidatePackage {
         }
     }
 
+    pub fn compute_net_delta(&self, installed_size: i64) -> Option<i64> {
+        if self.is_aur || (self.isize == 0 && self.csize == 0) {
+            None
+        } else {
+            Some(self.isize - installed_size)
+        }
+    }
+
     pub fn age_days(&self) -> f64 {
         if self.builddate <= 0 {
             return 9999.0;
@@ -91,7 +99,7 @@ pub struct ResolvedPackage {
     pub needs_update: bool,
     pub update_type: String,
     pub is_downgrade: bool,
-    pub net_delta: i64,
+    pub net_delta: Option<i64>,
     pub held: bool,
     pub hold_reason: String,
 }
@@ -483,11 +491,9 @@ impl<'a> ResolverEngine<'a> {
                 }
             }
 
-            let net_delta = if let Some(ref cand) = candidate {
-                cand.isize - inst_size
-            } else {
-                0
-            };
+            let net_delta = candidate
+                .as_ref()
+                .and_then(|cand| cand.compute_net_delta(inst_size));
 
             let final_state = if state == "custom" {
                 "custom".to_string()
@@ -737,5 +743,63 @@ mod tests {
         assert_eq!(cand.repo, "aur");
         assert_eq!(cand.depends, vec!["mcpelauncher-linux", "qt6-base"]);
         assert!(cand.is_aur);
+    }
+
+    #[test]
+    fn test_compute_net_delta() {
+        // AUR candidate: size is unbuilt/unknown, must never falsely report -installed_size
+        let aur_cand = CandidatePackage {
+            name: "antigravity".to_string(),
+            version: "2.15.0-1".to_string(),
+            repo: "aur".to_string(),
+            base: "antigravity".to_string(),
+            csize: 0,
+            isize: 0,
+            desc: "Google Antigravity".to_string(),
+            builddate: 1000,
+            is_aur: true,
+            depends: Vec::new(),
+        };
+        let antigravity_inst_size = 507 * 1024 * 1024;
+        assert_eq!(aur_cand.compute_net_delta(antigravity_inst_size), None);
+
+        // Repo candidate: size increases
+        let repo_cand_growth = CandidatePackage {
+            name: "glibc".to_string(),
+            version: "2.40-1".to_string(),
+            repo: "core".to_string(),
+            base: "glibc".to_string(),
+            csize: 10 * 1024 * 1024,
+            isize: 50 * 1024 * 1024,
+            desc: "GNU C Library".to_string(),
+            builddate: 1000,
+            is_aur: false,
+            depends: Vec::new(),
+        };
+        assert_eq!(
+            repo_cand_growth.compute_net_delta(45 * 1024 * 1024),
+            Some(5 * 1024 * 1024)
+        );
+
+        // Repo candidate: size decreases
+        assert_eq!(
+            repo_cand_growth.compute_net_delta(55 * 1024 * 1024),
+            Some(-5 * 1024 * 1024)
+        );
+
+        // Missing metadata candidate (both csize and isize are 0)
+        let missing_meta_cand = CandidatePackage {
+            name: "empty-meta".to_string(),
+            version: "1.0-1".to_string(),
+            repo: "extra".to_string(),
+            base: "empty-meta".to_string(),
+            csize: 0,
+            isize: 0,
+            desc: "".to_string(),
+            builddate: 1000,
+            is_aur: false,
+            depends: Vec::new(),
+        };
+        assert_eq!(missing_meta_cand.compute_net_delta(1024), None);
     }
 }

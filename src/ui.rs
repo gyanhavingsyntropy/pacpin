@@ -582,6 +582,7 @@ pub fn render_transaction_view(
     let mut tot_csize: i64 = 0;
     let mut tot_isize: i64 = 0;
     let mut tot_delta: i64 = 0;
+    let mut has_known_delta = false;
     let mut custom_count = 0;
     let mut sticky_count = 0;
     let mut default_count = 0;
@@ -762,16 +763,31 @@ pub fn render_transaction_view(
             } else {
                 "-".to_string()
             };
-            let (delta_raw, delta_color) = format_delta_text(p.net_delta);
+            let (delta_raw, delta_color) = if let Some(delta) = p.net_delta {
+                format_delta_text(delta)
+            } else {
+                ("-".to_string(), colored::Color::BrightBlack)
+            };
 
             let csize_padded = format!("{:>10}", csize_str).dimmed();
             let isize_padded = format!("{:>10}", isize_str).dimmed();
-            let delta_11 = format!("{:>11}", delta_raw).color(delta_color);
-            let delta_10 = format!("{:>10}", delta_raw).color(delta_color);
+            let delta_11 = if p.net_delta.is_some() {
+                format!("{:>11}", delta_raw).color(delta_color)
+            } else {
+                format!("{:>11}", delta_raw).dimmed()
+            };
+            let delta_10 = if p.net_delta.is_some() {
+                format!("{:>10}", delta_raw).color(delta_color)
+            } else {
+                format!("{:>10}", delta_raw).dimmed()
+            };
 
             tot_csize += cand.csize;
             tot_isize += cand.isize;
-            tot_delta += p.net_delta;
+            if let Some(delta) = p.net_delta {
+                tot_delta += delta;
+                has_known_delta = true;
+            }
 
             if is_full {
                 println!(
@@ -859,7 +875,11 @@ pub fn render_transaction_view(
     }
 
     let card_inner_w = (avail.saturating_sub(4)).clamp(30, 60);
-    let (tot_delta_str, tot_delta_color) = format_delta_text(tot_delta);
+    let (tot_delta_str, tot_delta_color) = if has_known_delta {
+        format_delta_text(tot_delta)
+    } else {
+        ("-".to_string(), colored::Color::BrightBlack)
+    };
 
     let print_card_line = |label: &str, val_str: &str, colored_val: String| {
         let label_w = str_width(label);
@@ -941,24 +961,48 @@ pub fn render_transaction_view(
         );
     }
 
-    let dl_summary = format_size(tot_csize);
+    let dl_summary = if tot_csize > 0 {
+        format_size(tot_csize)
+    } else if aur_count > 0 && updates.len() == aur_count {
+        "-".to_string()
+    } else {
+        format_size(tot_csize)
+    };
     print_card_line(
         "📥 Total Download Size : ",
         &dl_summary,
-        dl_summary.cyan().to_string(),
+        if dl_summary == "-" {
+            "-".dimmed().to_string()
+        } else {
+            dl_summary.cyan().to_string()
+        },
     );
 
-    let inst_summary = format_size(tot_isize);
+    let inst_summary = if tot_isize > 0 {
+        format_size(tot_isize)
+    } else if aur_count > 0 && updates.len() == aur_count {
+        "-".to_string()
+    } else {
+        format_size(tot_isize)
+    };
     print_card_line(
         "💾 Total Install Size  : ",
         &inst_summary,
-        inst_summary.dimmed().to_string(),
+        if inst_summary == "-" {
+            "-".dimmed().to_string()
+        } else {
+            inst_summary.dimmed().to_string()
+        },
     );
 
     print_card_line(
         "📊 Net Space Delta     : ",
         &tot_delta_str,
-        tot_delta_str.color(tot_delta_color).to_string(),
+        if has_known_delta {
+            tot_delta_str.color(tot_delta_color).to_string()
+        } else {
+            tot_delta_str.dimmed().to_string()
+        },
     );
     println!("  └{}┘\n", "─".repeat(card_inner_w));
 
@@ -978,6 +1022,9 @@ mod tests {
             ("📥 Total Download Size : ", "2.30 MiB"),
             ("💾 Total Install Size  : ", "7.60 MiB"),
             ("📊 Net Space Delta     : ", "+601.3 KiB"),
+            ("📥 Total Download Size : ", "-"),
+            ("💾 Total Install Size  : ", "-"),
+            ("📊 Net Space Delta     : ", "-"),
         ];
 
         let top_border = format!("  ┌{}┐", "─".repeat(card_inner_w));
