@@ -44,6 +44,7 @@ use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::{exit, Command};
+use std::thread;
 use ui::{print_banner, prompt_multiselect, render_transaction_view};
 
 fn check_pacman_lock() {
@@ -81,6 +82,14 @@ fn check_pacman_lock() {
 
 fn cmd_check(config: &Config) {
     print_banner();
+
+    // Spawn external integrations check concurrently with ALPM & AUR resolution
+    let ext_config = config.clone();
+    let ext_handle = thread::spawn(move || {
+        let ext_providers = IntegrationsManager::get_active_providers(&ext_config);
+        IntegrationsManager::check_updates_parallel(&ext_providers)
+    });
+
     let manager = match AlpmManager::with_repo_order(&config.repo_order) {
         Ok(m) => m,
         Err(e) => {
@@ -140,8 +149,7 @@ fn cmd_check(config: &Config) {
     }
 
     let res = resolver.resolve_all(config);
-    let ext_providers = IntegrationsManager::get_active_providers(config);
-    let external_updates = IntegrationsManager::check_updates_parallel(&ext_providers);
+    let external_updates = ext_handle.join().unwrap_or_default();
     render_transaction_view(&res, &config.options.helper, &external_updates);
 
     if config.features.smart_orphans {
@@ -206,6 +214,11 @@ fn cmd_upgrade(
         }
     }
 
+    let ext_providers_for_check = ext_providers.clone();
+    let ext_handle = thread::spawn(move || {
+        IntegrationsManager::check_updates_parallel(&ext_providers_for_check)
+    });
+
     let manager = match AlpmManager::with_repo_order(&config.repo_order) {
         Ok(m) => m,
         Err(e) => {
@@ -218,7 +231,7 @@ fn cmd_upgrade(
     }
     let resolver = ResolverEngine::new(&manager);
     let res = resolver.resolve_all(config);
-    let external_updates = IntegrationsManager::check_updates_parallel(&ext_providers);
+    let external_updates = ext_handle.join().unwrap_or_default();
     let updates = render_transaction_view(&res, &config.options.helper, &external_updates);
     let orphans = if config.features.smart_orphans {
         manager.get_orphans(&updates)

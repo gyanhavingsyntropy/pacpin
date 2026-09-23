@@ -215,33 +215,38 @@ impl<'a> ResolverEngine<'a> {
     }
 
     pub fn load_installed_dbs() -> HashMap<String, String> {
+        use std::io::Read;
         let mut map = HashMap::new();
         let dbpath = crate::db::AlpmManager::get_dbpath();
         let local_dir = dbpath.join("local");
+        let mut buf = [0u8; 1024];
+
         if let Ok(entries) = std::fs::read_dir(local_dir) {
             for entry in entries.flatten() {
                 let desc_path = entry.path().join("desc");
-                if desc_path.is_file() {
-                    if let Ok(content) = std::fs::read_to_string(&desc_path) {
-                        let mut name = None;
-                        let mut db = None;
-                        let mut lines = content.lines();
-                        while let Some(line) = lines.next() {
-                            if line == "%NAME%" {
-                                if let Some(val) = lines.next() {
-                                    name = Some(val.trim().to_string());
+                if let Ok(mut file) = std::fs::File::open(&desc_path) {
+                    if let Ok(n) = file.read(&mut buf) {
+                        if let Ok(content) = std::str::from_utf8(&buf[..n]) {
+                            let mut name = None;
+                            let mut db = None;
+                            let mut lines = content.lines();
+                            while let Some(line) = lines.next() {
+                                if line == "%NAME%" {
+                                    if let Some(val) = lines.next() {
+                                        name = Some(val.trim().to_string());
+                                    }
+                                } else if line == "%INSTALLED_DB%" {
+                                    if let Some(val) = lines.next() {
+                                        db = Some(val.trim().to_string());
+                                    }
                                 }
-                            } else if line == "%INSTALLED_DB%" {
-                                if let Some(val) = lines.next() {
-                                    db = Some(val.trim().to_string());
+                                if name.is_some() && db.is_some() {
+                                    break;
                                 }
                             }
-                            if name.is_some() && db.is_some() {
-                                break;
+                            if let (Some(n), Some(d)) = (name, db) {
+                                map.insert(n, d);
                             }
-                        }
-                        if let (Some(n), Some(d)) = (name, db) {
-                            map.insert(n, d);
                         }
                     }
                 }
@@ -258,10 +263,14 @@ impl<'a> ResolverEngine<'a> {
         };
         let alpm = self.manager.handle();
         let syncdbs: Vec<&alpm::Db> = alpm.syncdbs().into_iter().collect();
+        let mut foreign_pkgs_set = HashSet::new();
         let mut foreign_pkgs = Vec::new();
         for pkg in alpm.localdb().pkgs() {
             if !syncdbs.iter().any(|db| db.pkg(pkg.name()).is_ok()) {
-                foreign_pkgs.push(pkg.name().to_string());
+                let name = pkg.name().to_string();
+                if foreign_pkgs_set.insert(name.clone()) {
+                    foreign_pkgs.push(name);
+                }
             }
         }
         for (pattern, repo) in &pins {
@@ -270,17 +279,18 @@ impl<'a> ResolverEngine<'a> {
             }
             if let Ok(glob) = Pattern::new(pattern) {
                 for pkg in alpm.localdb().pkgs() {
-                    if glob.matches(pkg.name())
-                        && !foreign_pkgs.iter().any(|name| name == pkg.name())
-                    {
-                        foreign_pkgs.push(pkg.name().to_string());
+                    if glob.matches(pkg.name()) {
+                        let name = pkg.name().to_string();
+                        if foreign_pkgs_set.insert(name.clone()) {
+                            foreign_pkgs.push(name);
+                        }
                     }
                 }
             }
             if !pattern.contains('*')
                 && !pattern.contains('?')
                 && !pattern.contains('[')
-                && !foreign_pkgs.iter().any(|name| name == pattern)
+                && foreign_pkgs_set.insert(pattern.clone())
             {
                 foreign_pkgs.push(pattern.clone());
             }
@@ -294,13 +304,15 @@ impl<'a> ResolverEngine<'a> {
             }
         });
 
+        let installed_dbs_handle = thread::spawn(Self::load_installed_dbs);
+
         let alpm = self.manager.handle();
         let repos = self.manager.repos();
         let local_pkgs = alpm.localdb().pkgs();
         let installed_count = local_pkgs.len();
 
         let aur_data = aur_handle.join().unwrap_or_default();
-        let installed_dbs = Self::load_installed_dbs();
+        let installed_dbs = installed_dbs_handle.join().unwrap_or_default();
 
         let syncdbs_list: Vec<&alpm::Db> = alpm.syncdbs().into_iter().collect();
         let syncdb_map: HashMap<&str, &alpm::Db> =

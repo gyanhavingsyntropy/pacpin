@@ -4,7 +4,7 @@
 //! enforcing database locks, repository priority, delay buffers, companion
 //! cascades, and transaction journaling.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -869,6 +869,19 @@ pub fn wait_for_lock(max_wait_secs: u64) -> Result<(), String> {
 pub fn check_package_conflicts(manager: &AlpmManager, targets: &[String]) -> Vec<(String, String)> {
     let local_db = manager.handle().localdb();
     let mut conflicts = Vec::new();
+    let mut conflict_set: HashSet<(String, String)> = HashSet::new();
+
+    // Pre-index conflicts declared by installed packages:
+    // conflict_dep_name -> list of installed package names declaring it
+    let mut installed_conflicts: HashMap<String, Vec<String>> = HashMap::new();
+    for inst in local_db.pkgs() {
+        for conflict_dep in inst.conflicts() {
+            installed_conflicts
+                .entry(conflict_dep.name().to_string())
+                .or_default()
+                .push(inst.name().to_string());
+        }
+    }
 
     for target in targets {
         let pkg_clean = if let Some((_, p)) = target.split_once('/') {
@@ -885,31 +898,36 @@ pub fn check_package_conflicts(manager: &AlpmManager, targets: &[String]) -> Vec
 
         if let Some(pkg) = pkg_opt {
             let pkg_name = pkg.name();
+
+            // 1. Check if candidate package declares conflicts with any installed package
             for conflict_dep in pkg.conflicts() {
                 if let Some(inst) = local_db.pkgs().find_satisfier(conflict_dep.name()) {
                     if inst.name() != pkg_name
-                        && !conflicts
-                            .iter()
-                            .any(|(c, i)| c == pkg_name && i == inst.name())
+                        && conflict_set.insert((pkg_name.to_string(), inst.name().to_string()))
                     {
                         conflicts.push((pkg_name.to_string(), inst.name().to_string()));
                     }
                 }
             }
-            for inst in local_db.pkgs() {
-                for conflict_dep in inst.conflicts() {
-                    let conflicts_target = conflict_dep.name() == pkg_name
-                        || pkg
-                            .provides()
-                            .iter()
-                            .any(|pr| pr.name() == conflict_dep.name());
-                    if conflicts_target
-                        && inst.name() != pkg_name
-                        && !conflicts
-                            .iter()
-                            .any(|(c, i)| c == pkg_name && i == inst.name())
+
+            // 2. Check if any installed package declares a conflict with candidate package or what it provides
+            if let Some(inst_names) = installed_conflicts.get(pkg_name) {
+                for inst_name in inst_names {
+                    if inst_name != pkg_name
+                        && conflict_set.insert((pkg_name.to_string(), inst_name.clone()))
                     {
-                        conflicts.push((pkg_name.to_string(), inst.name().to_string()));
+                        conflicts.push((pkg_name.to_string(), inst_name.clone()));
+                    }
+                }
+            }
+            for pr in pkg.provides() {
+                if let Some(inst_names) = installed_conflicts.get(pr.name()) {
+                    for inst_name in inst_names {
+                        if inst_name != pkg_name
+                            && conflict_set.insert((pkg_name.to_string(), inst_name.clone()))
+                        {
+                            conflicts.push((pkg_name.to_string(), inst_name.clone()));
+                        }
                     }
                 }
             }
@@ -1274,5 +1292,18 @@ mod tests {
         let (cmds, _op, aur_op) = build_install_commands(&[], &aur_targets, "paru", &opts_syu, true);
         assert_eq!(aur_op, "-Syu");
         assert_eq!(cmds, vec!["paru -Syu --aur --needed google-chrome".to_string()]);
+    }
+
+    #[test]
+    fn test_check_package_conflicts_runs_safely() {
+        if let Ok(manager) = AlpmManager::new() {
+            // Verify empty targets returns empty conflicts without error
+            let empty = check_package_conflicts(&manager, &[]);
+            assert!(empty.is_empty());
+
+            // Non-existent target returns no conflicts
+            let non_existent = check_package_conflicts(&manager, &["nonexistent_pkg_xyz_12345".to_string()]);
+            assert!(non_existent.is_empty());
+        }
     }
 }
