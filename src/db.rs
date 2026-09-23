@@ -204,6 +204,7 @@ impl AlpmManager {
         let mut visited_pkgs = HashSet::new();
         let mut ordered_targets = Vec::new();
 
+        #[allow(clippy::too_many_arguments)]
         fn resolve_deps(
             pkg: &alpm::Package,
             manager: &AlpmManager,
@@ -242,7 +243,7 @@ impl AlpmManager {
                     if visited_pkgs.insert(real_name.clone()) {
                         // Recurse first so dependencies precede this package
                         resolve_deps(
-                            &dep_pkg,
+                            dep_pkg,
                             manager,
                             syncdb_map,
                             local_db,
@@ -276,10 +277,10 @@ impl AlpmManager {
 
         visited_pkgs.insert(target_pkg.name().to_string());
         resolve_deps(
-            &target_pkg,
+            target_pkg,
             self,
             &syncdb_map,
-            &local_db,
+            local_db,
             &mut visited_deps,
             &mut visited_pkgs,
             &mut ordered_targets,
@@ -366,7 +367,7 @@ impl AlpmManager {
                     if name == pkg_name {
                         continue;
                     }
-                    if pins.get(name).map(|r| r.as_str()) == Some("aur") {
+                    if pins.get(name).map(|r| r.eq_ignore_ascii_case("aur")) == Some(true) {
                         continue;
                     }
                     if direct_deps.contains(name)
@@ -442,9 +443,9 @@ impl AlpmManager {
             let is_installed = local_db.pkg(name).is_ok();
             let is_direct = direct_deps.contains(name);
 
-            if p_base == target_base && (is_installed || is_direct) {
-                companions.insert(name.to_string());
-            } else if (name.starts_with(&prefix) || name.starts_with(&base_prefix))
+            if (p_base == target_base
+                || name.starts_with(&prefix)
+                || name.starts_with(&base_prefix))
                 && (is_installed || is_direct)
             {
                 companions.insert(name.to_string());

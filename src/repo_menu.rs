@@ -76,7 +76,7 @@ pub fn run_repo_menu(initial_repos: &[String]) -> Option<Vec<String>> {
         let term_width = terminal_size::terminal_size()
             .map(|(w, _)| w.0 as usize)
             .unwrap_or(80);
-        let box_width = term_width.min(84).max(60);
+        let box_width = term_width.clamp(60, 84);
 
         // Render UI
         let _ = queue!(out, MoveTo(0, 0), Clear(ClearType::All));
@@ -160,8 +160,8 @@ pub fn run_repo_menu(initial_repos: &[String]) -> Option<Vec<String>> {
                                 repos.swap(selected, selected - 1);
                                 selected -= 1;
                             }
-                        } else if selected > 0 {
-                            selected -= 1;
+                        } else {
+                            selected = selected.saturating_sub(1);
                         }
                     }
                     // Navigation Down

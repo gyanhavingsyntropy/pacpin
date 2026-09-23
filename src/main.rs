@@ -1117,34 +1117,32 @@ fn cmd_pin(mut config: Config, repo: String, patterns: Vec<String>) {
     }
 
     let mut to_pin = patterns.clone();
-    if repo != "aur" {
-        let mut all_companions = Vec::new();
-        let existing_set: std::collections::HashSet<String> = to_pin.iter().cloned().collect();
-        for pat in &patterns {
-            if !pat.contains('*') && !pat.contains('?') && !pat.contains('[') {
-                let companions = manager.find_companions(pat, &repo, &config.pins);
-                for c in companions {
-                    if !existing_set.contains(&c) && !all_companions.contains(&c) {
-                        all_companions.push(c);
-                    }
+    let mut all_companions = Vec::new();
+    let existing_set: std::collections::HashSet<String> = to_pin.iter().cloned().collect();
+    for pat in &patterns {
+        if !pat.contains('*') && !pat.contains('?') && !pat.contains('[') {
+            let companions = manager.find_companions(pat, &repo, &config.pins);
+            for c in companions {
+                if !existing_set.contains(&c) && !all_companions.contains(&c) {
+                    all_companions.push(c);
                 }
             }
         }
-        if !all_companions.is_empty() {
-            let title = if patterns.len() == 1 {
-                format!(
-                    "'{}' has companion packages in [{}] to avoid version mismatches",
-                    patterns[0], repo
-                )
-            } else {
-                format!(
-                    "Target packages have companion packages in [{}] to avoid version mismatches",
-                    repo
-                )
-            };
-            let selected = prompt_multiselect(&title, &repo, &all_companions);
-            to_pin.extend(selected);
-        }
+    }
+    if !all_companions.is_empty() {
+        let title = if patterns.len() == 1 {
+            format!(
+                "'{}' has companion packages in [{}] to avoid version mismatches",
+                patterns[0], repo
+            )
+        } else {
+            format!(
+                "Target packages have companion packages in [{}] to avoid version mismatches",
+                repo
+            )
+        };
+        let selected = prompt_multiselect(&title, &repo, &all_companions);
+        to_pin.extend(selected);
     }
 
     for p in &to_pin {
@@ -1338,12 +1336,12 @@ fn cmd_history(tx_id: Option<usize>) {
         format!("Transaction Journal (Last {}):", txs.len()).bold()
     );
     println!(
-        "  {:<5} {:<20} {:<10} {:<10} {}",
-        "ID", "TIMESTAMP", "ACTION", "PACKAGES", "SUMMARY"
+        "  {:<5} {:<20} {:<10} {:<10} SUMMARY",
+        "ID", "TIMESTAMP", "ACTION", "PACKAGES"
     );
     println!(
-        "  {:<5} {:<20} {:<10} {:<10} {}",
-        "─────", "────────────────────", "──────────", "──────────", "─────────────────────────"
+        "  {:<5} {:<20} {:<10} {:<10} ─────────────────────────",
+        "─────", "────────────────────", "──────────", "──────────"
     );
 
     for tx in &txs {
@@ -1878,10 +1876,10 @@ fn cmd_sync_groups(config: &Config, groups: &[String]) {
         for db in alpm.syncdbs() {
             for pkg in db.pkgs() {
                 for grp in pkg.groups() {
-                    if filter_groups.contains(grp) {
-                        if writeln!(stdout, "{} {}", grp, pkg.name()).is_err() {
-                            return;
-                        }
+                    if filter_groups.contains(grp)
+                        && writeln!(stdout, "{} {}", grp, pkg.name()).is_err()
+                    {
+                        return;
                     }
                 }
             }
@@ -2382,17 +2380,7 @@ fn main() {
                 exit(1);
             }
         }
-    } else if cmd.starts_with("-U") {
-        check_pacman_lock();
-        let status = Command::new("sudo").arg("pacman").args(&args).status();
-        match status {
-            Ok(s) => exit(s.code().unwrap_or(0)),
-            Err(e) => {
-                eprintln!("{}", format!("Failed to run sudo pacman: {}", e).red());
-                exit(1);
-            }
-        }
-    } else if cmd.starts_with("-D") {
+    } else if cmd.starts_with("-U") || cmd.starts_with("-D") {
         check_pacman_lock();
         let status = Command::new("sudo").arg("pacman").args(&args).status();
         match status {
@@ -2446,8 +2434,8 @@ fn main() {
                     opts.bin = Some(args[i + 1].clone());
                     i += 1;
                 }
-            } else if a.starts_with("--bin=") {
-                opts.bin = Some(a["--bin=".len()..].to_string());
+            } else if let Some(stripped) = a.strip_prefix("--bin=") {
+                opts.bin = Some(stripped.to_string());
             } else if positional.is_empty() && !a.starts_with('-') {
                 positional.push(a.clone());
             } else {
@@ -2519,8 +2507,8 @@ fn main() {
                     opts.bin = Some(args[i + 1].clone());
                     i += 1;
                 }
-            } else if a.starts_with("--bin=") {
-                opts.bin = Some(a["--bin=".len()..].to_string());
+            } else if let Some(stripped) = a.strip_prefix("--bin=") {
+                opts.bin = Some(stripped.to_string());
             } else if positional.is_empty() && !a.starts_with('-') {
                 positional.push(a.clone());
             } else {
@@ -2697,7 +2685,7 @@ fn parse_pin_args(
     }
 
     if positional.is_empty() {
-        return Err("'pacpin pin' requires a repository name.".to_string());
+        Err("'pacpin pin' requires a repository name.".to_string())
     } else if positional.len() == 1 {
         if file_patterns.is_empty() {
             return Err(

@@ -112,8 +112,8 @@ pub fn run_checkbox_menu(
         let (term_width, term_height) = terminal_size::terminal_size()
             .map(|(w, h)| (w.0 as usize, h.0 as usize))
             .unwrap_or((80, 24));
-        let box_width = term_width.min(88).max(64);
-        let max_visible = (term_height.saturating_sub(13)).min(18).max(5);
+        let box_width = term_width.clamp(64, 88);
+        let max_visible = (term_height.saturating_sub(13)).clamp(5, 18);
 
         // Adjust viewport offset
         if selected < viewport_offset {
@@ -179,9 +179,7 @@ pub fn run_checkbox_menu(
                 match code {
                     // Navigation Up
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if selected > 0 {
-                            selected -= 1;
-                        }
+                        selected = selected.saturating_sub(1);
                     }
                     // Navigation Down
                     KeyCode::Down | KeyCode::Char('j') => {
@@ -263,6 +261,7 @@ pub fn run_checkbox_menu(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_checkbox_ui<W: Write>(
     out: &mut W,
     title: &str,

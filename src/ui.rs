@@ -56,8 +56,8 @@ pub fn format_repo_name(repo: &str, max_w: usize) -> String {
     if str_width(&full) <= max_w {
         return full;
     }
-    if repo.starts_with("cachyos-") {
-        let abbr = format!("[c-{}]", &repo["cachyos-".len()..]);
+    if let Some(stripped) = repo.strip_prefix("cachyos-") {
+        let abbr = format!("[c-{}]", stripped);
         if str_width(&abbr) <= max_w {
             return abbr;
         }
@@ -70,8 +70,8 @@ pub fn format_version_diff(old_ver: &str, new_ver: &str, max_w: usize) -> String
     if str_width(&full) <= max_w {
         return full;
     }
-    let old_clean = old_ver.split(':').last().unwrap_or(old_ver);
-    let new_clean = new_ver.split(':').last().unwrap_or(new_ver);
+    let old_clean = old_ver.split(':').next_back().unwrap_or(old_ver);
+    let new_clean = new_ver.split(':').next_back().unwrap_or(new_ver);
     let clean = format!("{} ➔ {}", old_clean, new_clean);
     if str_width(&clean) <= max_w {
         return clean;
@@ -201,8 +201,8 @@ pub fn parse_selection_indices(raw: &str, items: &[String]) -> Vec<String> {
         return Vec::new();
     }
 
-    let (invert, tokens_str) = if raw.starts_with('^') {
-        (true, &raw[1..])
+    let (invert, tokens_str) = if let Some(stripped) = raw.strip_prefix('^') {
+        (true, stripped)
     } else {
         (false, raw)
     };
@@ -595,7 +595,7 @@ pub fn render_transaction_view(
         );
 
         let is_full = avail >= 115;
-        let is_medium = avail >= 95 && avail < 115;
+        let is_medium = (95..115).contains(&avail);
 
         let max_repo_len = updates
             .iter()

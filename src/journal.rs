@@ -79,7 +79,7 @@ impl TransactionJournal {
     }
 
     pub fn find_cached_package(pkg_name: &str, version: &str) -> Option<PathBuf> {
-        let ver_no_epoch = version.split(':').last().unwrap_or(version);
+        let ver_no_epoch = version.split(':').next_back().unwrap_or(version);
         if !Self::is_safe_pkg_name(pkg_name) || !Self::is_safe_version(ver_no_epoch) {
             return None;
         }
@@ -175,7 +175,7 @@ impl TransactionJournal {
             .append(true)
             .open(&history_file)?;
         let line = serde_json::to_string(&record)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         writeln!(file, "{}", line)?;
 
         Ok(next_id)
@@ -193,7 +193,7 @@ impl TransactionJournal {
         let mut txs = std::collections::VecDeque::with_capacity(limit);
         if let Ok(file) = fs::File::open(&history_file) {
             let reader = BufReader::new(file);
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 if let Ok(record) = serde_json::from_str::<TransactionRecord>(&line) {
                     if txs.len() == limit {
                         txs.pop_front();
@@ -217,7 +217,7 @@ impl TransactionJournal {
 
         if let Ok(file) = fs::File::open(&history_file) {
             let reader = BufReader::new(file);
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 if let Ok(record) = serde_json::from_str::<TransactionRecord>(&line) {
                     if record.id == tx_id {
                         return Some(record);

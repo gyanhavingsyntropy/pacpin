@@ -244,7 +244,7 @@ pub fn save_config_to_path(config: &Config, path: &Path) -> Result<(), std::io::
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let toml_str = toml::to_string_pretty(config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     use std::io::Write;
     #[cfg(unix)]

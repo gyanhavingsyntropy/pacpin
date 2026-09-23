@@ -61,14 +61,14 @@ impl IntegrationProvider for FlatpakProvider {
 
     fn refresh_metadata(&self) -> Result<(), std::io::Error> {
         let _ = Command::new("flatpak")
-            .args(&["update", "--appstream"])
+            .args(["update", "--appstream"])
             .output()?;
         Ok(())
     }
 
     fn check_updates(&self) -> Vec<ExternalUpdate> {
         let output = Command::new("flatpak")
-            .args(&[
+            .args([
                 "remote-ls",
                 "--updates",
                 "--columns=name,application,version,origin",
@@ -140,7 +140,7 @@ impl IntegrationProvider for FlatpakProvider {
 
     fn execute_clean(&self) -> Result<bool, std::io::Error> {
         let status = Command::new("flatpak")
-            .args(&["uninstall", "--unused", "-y"])
+            .args(["uninstall", "--unused", "-y"])
             .status()?;
         Ok(status.success())
     }
@@ -174,7 +174,7 @@ impl IntegrationProvider for NixProvider {
 
     fn check_updates(&self) -> Vec<ExternalUpdate> {
         // Check outdated packages via nix-env or nix profile
-        let output = Command::new("nix-env").args(&["-q", "--outdated"]).output();
+        let output = Command::new("nix-env").args(["-q", "--outdated"]).output();
 
         let mut results = Vec::new();
         if let Ok(out) = output {
@@ -203,7 +203,7 @@ impl IntegrationProvider for NixProvider {
 
     fn execute_upgrade(&self, _updates: &[ExternalUpdate]) -> Result<bool, std::io::Error> {
         let status = Command::new("nix")
-            .args(&["profile", "upgrade", ".*"])
+            .args(["profile", "upgrade", ".*"])
             .status();
 
         match status {
@@ -246,7 +246,7 @@ impl IntegrationProvider for PipxProvider {
     }
 
     fn check_updates(&self) -> Vec<ExternalUpdate> {
-        let output = Command::new("pipx").args(&["list", "--json"]).output();
+        let output = Command::new("pipx").args(["list", "--json"]).output();
 
         let mut results = Vec::new();
         if let Ok(out) = output {

@@ -455,13 +455,13 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
     let bwrap_available = crate::is_command_available("bwrap");
 
     if !options.no_sandbox && !bwrap_available {
-        return Err(format!(
+        return Err(
             "Bubblewrap ('bwrap') is not installed on this system.\n  \
             'pacpin try' defaults to fail-closed container isolation for security.\n  \
             To run securely in a sandbox container, install bubblewrap:\n    \
             sudo pacman -S bubblewrap\n  \
-            To bypass sandboxing and run directly on your host (UNSAFE), pass --no-sandbox."
-        ));
+            To bypass sandboxing and run directly on your host (UNSAFE), pass --no-sandbox.".to_string()
+        );
     }
 
     let prefix = if options.is_run_mode { "pacpin-run" } else { "pacpin-try" };
