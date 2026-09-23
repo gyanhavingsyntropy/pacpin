@@ -673,7 +673,7 @@ mod tests {
             depends: Vec::new(),
         };
         let age = cand_recent.age_days();
-        assert!(age >= 1.9 && age <= 2.1);
+        assert!((1.9..=2.1).contains(&age));
 
         let cand_zero = CandidatePackage {
             builddate: 0,

@@ -1,3 +1,10 @@
+//! Centralized Package Management Engine for pacpin.
+//!
+//! Encapsulates all subprocess interactions with pacman and AUR helpers,
+//! enforcing database locks, repository priority, delay buffers, companion
+//! cascades, and transaction journaling.
+
+use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,12 +39,8 @@ impl Default for InstallOptions {
     }
 }
 
-/// Centralized package installation engine for pacpin.
-///
-/// Handles target normalization, repository priority routing, AUR fallback,
-/// stability delay checks on new installs, companion package detection,
-/// sudo pacman / AUR helper execution, and transaction journaling.
-pub fn install_packages(
+/// Installs packages with repository resolution, companion cascading, and delay tree verification.
+pub fn install(
     config: &mut Config,
     targets: &[String],
     options: &InstallOptions,
@@ -46,13 +49,7 @@ pub fn install_packages(
         return Err("No package targets specified.".to_string());
     }
 
-    let lock_path = AlpmManager::get_dbpath().join("db.lck");
-    if lock_path.exists() {
-        return Err(format!(
-            "Pacman database is locked ({}). Another package management process is currently running.",
-            lock_path.display()
-        ));
-    }
+    check_lock()?;
 
     if options.refresh && !options.dry_run {
         println!(
@@ -117,8 +114,8 @@ pub fn install_packages(
                 ));
             }
 
-            // Check stability delay on new install target
-            check_target_delay(
+            // Verify stability delay on the package and its uninstalled dependency tree
+            verify_target_and_dependencies_delay(
                 pkg,
                 Some(repo),
                 config,
@@ -176,7 +173,7 @@ pub fn install_packages(
                 .any(|db| db.pkg(target.as_str()).is_ok());
 
             if exists_in_sync {
-                check_target_delay(
+                verify_target_and_dependencies_delay(
                     target,
                     None,
                     config,
@@ -187,11 +184,11 @@ pub fn install_packages(
                 )?;
                 pacman_targets.push(target.clone());
             } else {
-                // Query the AUR only after ruling out every configured sync repository
+                // Query AUR fallback
                 let aur_query = vec![target.clone()];
                 let aur_map = aur::query_aur(&aur_query);
                 if aur_map.contains_key(target) {
-                    check_target_delay(
+                    verify_target_and_dependencies_delay(
                         target,
                         Some("aur"),
                         config,
@@ -203,7 +200,6 @@ pub fn install_packages(
                     aur_targets.push(target.clone());
                     pending_pins.push((target.clone(), "aur".to_string()));
                 } else {
-                    // Preserve pacman's normal error reporting for packages unknown to both
                     pacman_targets.push(target.clone());
                 }
             }
@@ -405,14 +401,149 @@ pub fn install_packages(
     }
 }
 
-/// Checks whether an uninstalled package target violates an active stability delay rule.
-///
-/// Because Arch Linux official mirrors only retain the single latest version of any package,
-/// a brand-new package cannot fetch older versions from mirrors. If the package was released
-/// more recently than the configured delay buffer, this function provides an informative
-/// advisory and prompts the user before proceeding.
-fn check_target_delay(
-    pkg: &str,
+/// Removes packages via pacman with journal logging and smart unpin prompt.
+pub fn remove(config: &mut Config, targets: &[String], flags: &[String]) -> Result<(), String> {
+    if targets.is_empty() {
+        return Err("No package targets specified for removal.".to_string());
+    }
+
+    check_lock()?;
+
+    let mut cmd_args = Vec::new();
+    cmd_args.extend(flags.iter().map(|s| s.as_str()));
+    cmd_args.extend(targets.iter().map(|s| s.as_str()));
+
+    println!(
+        "{} Removing package(s) via sudo pacman {}...",
+        "::".cyan(),
+        cmd_args.join(" ")
+    );
+
+    let status = Command::new("sudo").arg("pacman").args(&cmd_args).status();
+
+    match status {
+        Ok(s) if s.success() => {
+            let noconfirm = flags.iter().any(|f| f == "--noconfirm");
+            crate::check_and_prompt_smart_unpin(config.clone(), targets, noconfirm);
+
+            let packages = targets
+                .iter()
+                .map(|name| serde_json::json!({ "name": name, "target": name }))
+                .collect();
+            let command = format!("sudo pacman {}", cmd_args.join(" "));
+            if let Err(e) = TransactionJournal::record_transaction("remove", packages, &command) {
+                eprintln!(
+                    "{}",
+                    format!("Warning: Failed to record removal transaction: {}", e).yellow()
+                );
+            }
+            Ok(())
+        }
+        Ok(s) => Err(format!("Removal exited with code {}.", s.code().unwrap_or(1))),
+        Err(e) => Err(format!("Failed to run sudo pacman: {}", e)),
+    }
+}
+
+/// Searches packages via AUR helper or pacman.
+pub fn search(config: &Config, query_args: &[String]) -> Result<i32, String> {
+    if query_args.is_empty() {
+        return Err("No search query provided.".to_string());
+    }
+
+    let helper = &config.options.helper;
+    let status = if crate::is_command_available(helper) {
+        Command::new(helper).arg("-Ss").args(query_args).status()
+    } else {
+        Command::new("pacman").arg("-Ss").args(query_args).status()
+    };
+
+    match status {
+        Ok(s) => Ok(s.code().unwrap_or(0)),
+        Err(e) => Err(format!("Search execution failed: {}", e)),
+    }
+}
+
+/// Queries package information via AUR helper or pacman.
+pub fn info(config: &Config, pkg_args: &[String]) -> Result<i32, String> {
+    if pkg_args.is_empty() {
+        return Err("No package specified.".to_string());
+    }
+
+    let helper = &config.options.helper;
+    let status = if crate::is_command_available(helper) {
+        Command::new(helper).arg("-Si").args(pkg_args).status()
+    } else {
+        Command::new("pacman").arg("-Si").args(pkg_args).status()
+    };
+
+    match status {
+        Ok(s) => Ok(s.code().unwrap_or(0)),
+        Err(e) => Err(format!("Info query failed: {}", e)),
+    }
+}
+
+/// Cleans package cache via AUR helper or pacman.
+pub fn clean(config: &Config, extra_args: &[String]) -> Result<i32, String> {
+    check_lock()?;
+    let helper = &config.options.helper;
+    let status = if crate::is_command_available(helper) {
+        println!(
+            "{} Cleaning package cache via {} -Sc...",
+            "::".cyan(),
+            helper
+        );
+        Command::new(helper).arg("-Sc").args(extra_args).status()
+    } else {
+        println!(
+            "{} Cleaning package cache via sudo pacman -Sc...",
+            "::".cyan()
+        );
+        Command::new("sudo")
+            .arg("pacman")
+            .arg("-Sc")
+            .args(extra_args)
+            .status()
+    };
+
+    match status {
+        Ok(s) => Ok(s.code().unwrap_or(0)),
+        Err(e) => Err(format!("Clean execution failed: {}", e)),
+    }
+}
+
+/// Forwards arbitrary commands directly to pacman with database lock protection.
+pub fn forward_pacman(args: &[String], needs_sudo: bool) -> Result<i32, String> {
+    if needs_sudo {
+        check_lock()?;
+        let status = Command::new("sudo").arg("pacman").args(args).status();
+        match status {
+            Ok(s) => Ok(s.code().unwrap_or(0)),
+            Err(e) => Err(format!("Failed to run sudo pacman: {}", e)),
+        }
+    } else {
+        let status = Command::new("pacman").args(args).status();
+        match status {
+            Ok(s) => Ok(s.code().unwrap_or(0)),
+            Err(e) => Err(format!("Failed to run pacman: {}", e)),
+        }
+    }
+}
+
+/// Checks if pacman database is currently locked.
+pub fn check_lock() -> Result<(), String> {
+    let lock_path = AlpmManager::get_dbpath().join("db.lck");
+    if lock_path.exists() {
+        return Err(format!(
+            "Pacman database is locked ({}). Another package management process is currently running.",
+            lock_path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Verifies stability delay for the target package and its uninstalled dependency graph.
+fn verify_target_and_dependencies_delay(
+    target_pkg: &str,
     repo: Option<&str>,
     config: &Config,
     glob_delays: &[(String, glob::Pattern, u32)],
@@ -424,8 +555,90 @@ fn check_target_delay(
         return Ok(());
     }
 
-    // Delay buffers only apply to uninstalled targets; already-installed packages
-    // are governed during system upgrade evaluations.
+    // 1. Check target package itself
+    check_single_pkg_delay(
+        target_pkg,
+        target_pkg,
+        repo,
+        false,
+        config,
+        glob_delays,
+        manager,
+        now_epoch,
+        options,
+    )?;
+
+    // 2. Discover uninstalled direct dependencies and check their delay buffers
+    let mut direct_deps = Vec::new();
+    if let Some(r) = repo {
+        if r.eq_ignore_ascii_case("aur") {
+            let aur_map = aur::query_aur(&[target_pkg.to_string()]);
+            if let Some(item) = aur_map.get(target_pkg) {
+                for d in &item.depends {
+                    direct_deps.push(aur::clean_dep_name(d).to_string());
+                }
+            }
+        } else if let Some(db) = manager.handle().syncdbs().iter().find(|d| d.name() == r) {
+            if let Ok(pkg) = db.pkg(target_pkg) {
+                for d in pkg.depends() {
+                    direct_deps.push(d.name().to_string());
+                }
+            }
+        }
+    } else {
+        for db in manager.handle().syncdbs() {
+            if let Ok(pkg) = db.pkg(target_pkg) {
+                for d in pkg.depends() {
+                    direct_deps.push(d.name().to_string());
+                }
+                break;
+            }
+        }
+    }
+
+    let local_db = manager.handle().localdb();
+    let mut checked_deps = HashSet::new();
+
+    for dep_name in direct_deps {
+        if !checked_deps.insert(dep_name.clone()) {
+            continue;
+        }
+
+        // If dependency is already satisfied locally, delay buffer is irrelevant
+        if local_db.pkgs().find_satisfier(&*dep_name).is_some() {
+            continue;
+        }
+
+        check_single_pkg_delay(
+            &dep_name,
+            target_pkg,
+            None,
+            true,
+            config,
+            glob_delays,
+            manager,
+            now_epoch,
+            options,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Evaluates a single package against delay rules.
+#[allow(clippy::too_many_arguments)]
+fn check_single_pkg_delay(
+    pkg: &str,
+    root_target: &str,
+    repo: Option<&str>,
+    is_dependency: bool,
+    config: &Config,
+    glob_delays: &[(String, glob::Pattern, u32)],
+    manager: &AlpmManager,
+    now_epoch: i64,
+    options: &InstallOptions,
+) -> Result<(), String> {
+    // If already installed locally, skip
     if manager.handle().localdb().pkg(pkg).is_ok() {
         return Ok(());
     }
@@ -435,7 +648,6 @@ fn check_target_delay(
         None => return Ok(()),
     };
 
-    // Determine candidate build date
     let build_date: Option<i64> = if let Some(r) = repo {
         if r.eq_ignore_ascii_case("aur") {
             let aur_map = aur::query_aur(&[pkg.to_string()]);
@@ -469,20 +681,26 @@ fn check_target_delay(
         let req_days_f = req_days as f64;
         if age_days < req_days_f {
             let days_left = ((req_days_f - age_days + 0.99) as u32).max(1);
+            let context_label = if is_dependency {
+                format!("Dependency '{}' (required by '{}')", pkg, root_target)
+            } else {
+                format!("Package '{}'", pkg)
+            };
+
             if options.noconfirm || !io::stdin().is_terminal() {
                 println!(
-                    "{} Package '{}' was released {:.1} days ago (within your {}d stability delay buffer, {}d remaining). Proceeding in non-interactive mode.",
+                    "{} {} was released {:.1} days ago (within your {}d stability delay buffer, {}d remaining). Proceeding in non-interactive mode.",
                     ":: Warning:".yellow().bold(),
-                    pkg,
+                    context_label,
                     age_days.max(0.0),
                     req_days,
                     days_left
                 );
             } else {
                 print!(
-                    "\n{} Package '{}' was released {:.1} days ago (within your {}d stability delay buffer, {}d remaining).\n   Arch mirrors only host the latest version. Proceed with installation? [Y/n] ",
+                    "\n{} {} was released {:.1} days ago (within your {}d stability delay buffer, {}d remaining).\n   Arch mirrors only host the latest version. Proceed with installation? [Y/n] ",
                     ":: Notice:".yellow().bold(),
-                    pkg,
+                    context_label,
                     age_days.max(0.0),
                     req_days,
                     days_left
@@ -493,8 +711,8 @@ fn check_target_delay(
                     let trimmed = input.trim().to_lowercase();
                     if trimmed == "n" || trimmed == "no" {
                         return Err(format!(
-                            "Installation of '{}' cancelled due to active {}-day stability delay policy ({}d remaining).",
-                            pkg, req_days, days_left
+                            "Installation cancelled: {} violates active {}-day stability delay policy ({}d remaining).",
+                            context_label, req_days, days_left
                         ));
                     }
                 }
@@ -523,7 +741,7 @@ mod tests {
     fn test_empty_targets_rejected() {
         let mut config = Config::default();
         let opts = InstallOptions::default();
-        let res = install_packages(&mut config, &[], &opts);
+        let res = install(&mut config, &[], &opts);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err(), "No package targets specified.");
     }
@@ -532,7 +750,7 @@ mod tests {
     fn test_unknown_repo_rejected() {
         let mut config = Config::default();
         let opts = InstallOptions::default();
-        let res = install_packages(&mut config, &["nonexistent_repo/foobar".to_string()], &opts);
+        let res = install(&mut config, &["nonexistent_repo/foobar".to_string()], &opts);
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("Repository '[nonexistent_repo]' is not recognized"));
     }

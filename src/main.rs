@@ -18,7 +18,8 @@ mod alias;
 mod aur;
 mod config;
 mod db;
-mod installer;
+mod download;
+pub mod pm;
 mod integrations;
 mod journal;
 mod orphans;
@@ -46,17 +47,8 @@ use std::process::{exit, Command};
 use ui::{print_banner, prompt_multiselect, render_transaction_view};
 
 fn check_pacman_lock() {
-    let lock_path = AlpmManager::get_dbpath().join("db.lck");
-    if lock_path.exists() {
-        eprintln!(
-            "{}",
-            format!(
-                "Error: Pacman database is locked ({}).",
-                lock_path.display()
-            )
-            .red()
-        );
-        eprintln!("Another package management process is currently running. Exiting.");
+    if let Err(e) = pm::check_lock() {
+        eprintln!("{}", format!("Error: {}", e).red());
         exit(1);
     }
 }
@@ -524,7 +516,7 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
         .cloned()
         .collect();
 
-    let options = installer::InstallOptions {
+    let options = pm::InstallOptions {
         needed,
         noconfirm,
         refresh,
@@ -532,7 +524,7 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
         forwarded_flags,
     };
 
-    match installer::install_packages(&mut config, targets, &options) {
+    match pm::install(&mut config, targets, &options) {
         Ok(_) => {}
         Err(e) => {
             eprintln!("{}", format!("Error: {}", e).red());
@@ -1169,7 +1161,7 @@ pub fn find_matching_pin(
     ResolverEngine::find_matching_pin_rule(pkg, pins, &glob_pins)
 }
 
-fn check_and_prompt_smart_unpin(mut config: Config, removed_pkgs: &[String], noconfirm: bool) {
+pub(crate) fn check_and_prompt_smart_unpin(mut config: Config, removed_pkgs: &[String], noconfirm: bool) {
     let mut config_dirty = false;
     let interactive = io::stdin().is_terminal();
 
@@ -1261,23 +1253,10 @@ fn check_and_prompt_smart_unpin(mut config: Config, removed_pkgs: &[String], noc
 }
 
 fn cmd_search(config: &Config, query_args: &[String]) {
-    if query_args.is_empty() {
-        eprintln!("{}", "Error: No search query provided.".red());
-        eprintln!("Usage: pacpin search <query...> or pacpin -Ss <query...>");
-        exit(1);
-    }
-
-    let helper = &config.options.helper;
-    let status = if is_command_available(helper) {
-        Command::new(helper).arg("-Ss").args(query_args).status()
-    } else {
-        Command::new("pacman").arg("-Ss").args(query_args).status()
-    };
-
-    match status {
-        Ok(s) => {
-            if !s.success() {
-                exit(s.code().unwrap_or(1));
+    match pm::search(config, query_args) {
+        Ok(code) => {
+            if code != 0 {
+                exit(code);
             }
         }
         Err(e) => {
@@ -1288,23 +1267,10 @@ fn cmd_search(config: &Config, query_args: &[String]) {
 }
 
 fn cmd_info(config: &Config, pkg_args: &[String]) {
-    if pkg_args.is_empty() {
-        eprintln!("{}", "Error: No package specified.".red());
-        eprintln!("Usage: pacpin info <pkg...> or pacpin -Si <pkg...>");
-        exit(1);
-    }
-
-    let helper = &config.options.helper;
-    let status = if is_command_available(helper) {
-        Command::new(helper).arg("-Si").args(pkg_args).status()
-    } else {
-        Command::new("pacman").arg("-Si").args(pkg_args).status()
-    };
-
-    match status {
-        Ok(s) => {
-            if !s.success() {
-                exit(s.code().unwrap_or(1));
+    match pm::info(config, pkg_args) {
+        Ok(code) => {
+            if code != 0 {
+                exit(code);
             }
         }
         Err(e) => {
@@ -1315,31 +1281,10 @@ fn cmd_info(config: &Config, pkg_args: &[String]) {
 }
 
 fn cmd_clean(config: &Config, extra_args: &[String]) {
-    check_pacman_lock();
-    let helper = &config.options.helper;
-    let status = if is_command_available(helper) {
-        println!(
-            "{} Cleaning package cache via {} -Sc...",
-            "::".cyan(),
-            helper
-        );
-        Command::new(helper).arg("-Sc").args(extra_args).status()
-    } else {
-        println!(
-            "{} Cleaning package cache via sudo pacman -Sc...",
-            "::".cyan()
-        );
-        Command::new("sudo")
-            .arg("pacman")
-            .arg("-Sc")
-            .args(extra_args)
-            .status()
-    };
-
-    match status {
-        Ok(s) => {
-            if !s.success() {
-                exit(s.code().unwrap_or(1));
+    match pm::clean(config, extra_args) {
+        Ok(code) => {
+            if code != 0 {
+                exit(code);
             }
         }
         Err(e) => {
@@ -1354,71 +1299,25 @@ fn cmd_clean(config: &Config, extra_args: &[String]) {
     }
 }
 
-fn cmd_remove(config: Config, args: &[String], is_friendly: bool) {
-    check_pacman_lock();
-
+fn cmd_remove(mut config: Config, args: &[String], is_friendly: bool) {
     let mut flags = Vec::new();
     let mut targets = Vec::new();
 
     if is_friendly {
         flags.push("-Rns".to_string());
-        for a in args {
-            if a.starts_with('-') {
-                flags.push(a.clone());
-            } else {
-                targets.push(a.clone());
-            }
-        }
-    } else {
-        for a in args {
-            if a.starts_with('-') {
-                flags.push(a.clone());
-            } else {
-                targets.push(a.clone());
-            }
+    }
+    for a in args {
+        if a.starts_with('-') {
+            flags.push(a.clone());
+        } else {
+            targets.push(a.clone());
         }
     }
 
-    if targets.is_empty() {
-        eprintln!(
-            "{}",
-            "Error: No package targets specified for removal.".red()
-        );
-        eprintln!("Usage: pacpin remove <pkg...> or pacpin -Rns <pkg...>");
-        exit(1);
-    }
-
-    let mut cmd_args = Vec::new();
-    cmd_args.extend(flags.iter().map(|s| s.as_str()));
-    cmd_args.extend(targets.iter().map(|s| s.as_str()));
-
-    println!(
-        "{} Removing package(s) via sudo pacman {}...",
-        "::".cyan(),
-        cmd_args.join(" ")
-    );
-
-    let status = Command::new("sudo").arg("pacman").args(&cmd_args).status();
-
-    match status {
-        Ok(s) if s.success() => {
-            let noconfirm = flags.iter().any(|f| f == "--noconfirm");
-            check_and_prompt_smart_unpin(config, &targets, noconfirm);
-            let packages = targets
-                .iter()
-                .map(|name| serde_json::json!({ "name": name, "target": name }))
-                .collect();
-            let command = format!("sudo pacman {}", cmd_args.join(" "));
-            if let Err(e) = TransactionJournal::record_transaction("remove", packages, &command) {
-                eprintln!(
-                    "{}",
-                    format!("Warning: Failed to record removal transaction: {}", e).yellow()
-                );
-            }
-        }
-        Ok(s) => exit(s.code().unwrap_or(1)),
+    match pm::remove(&mut config, &targets, &flags) {
+        Ok(_) => {}
         Err(e) => {
-            eprintln!("{}", format!("Failed to run sudo pacman: {}", e).red());
+            eprintln!("{}", format!("Error: {}", e).red());
             exit(1);
         }
     }
@@ -1990,10 +1889,8 @@ fn main() {
     } else if cmd.starts_with("-Sw")
         || (cmd.starts_with("-S") && args.iter().any(|a| a == "-w" || a == "--downloadonly"))
     {
-        check_pacman_lock();
-        let status = Command::new("sudo").arg("pacman").args(&args).status();
-        match status {
-            Ok(s) => exit(s.code().unwrap_or(0)),
+        match pm::forward_pacman(&args, true) {
+            Ok(code) => exit(code),
             Err(e) => {
                 eprintln!("{}", format!("Failed to run sudo pacman: {}", e).red());
                 exit(1);
@@ -2039,9 +1936,8 @@ fn main() {
         cmd_sync_groups(&config, &groups);
         exit(0);
     } else if cmd.starts_with("-T") {
-        let status = Command::new("pacman").args(&args).status();
-        match status {
-            Ok(s) => exit(s.code().unwrap_or(0)),
+        match pm::forward_pacman(&args, false) {
+            Ok(code) => exit(code),
             Err(e) => {
                 eprintln!("{}", format!("Failed to run pacman: {}", e).red());
                 exit(1);
@@ -2074,9 +1970,8 @@ fn main() {
         };
         cmd_remove(config, &sub_args, is_friendly);
     } else if cmd.starts_with("-Q") {
-        let status = Command::new("pacman").args(&args).status();
-        match status {
-            Ok(s) => exit(s.code().unwrap_or(0)),
+        match pm::forward_pacman(&args, false) {
+            Ok(code) => exit(code),
             Err(e) => {
                 eprintln!("{}", format!("Failed to run pacman: {}", e).red());
                 exit(1);
@@ -2084,24 +1979,16 @@ fn main() {
         }
     } else if cmd.starts_with("-F") {
         let needs_sudo = pacman_files_needs_sudo(&args);
-        let status = if needs_sudo {
-            check_pacman_lock();
-            Command::new("sudo").arg("pacman").args(&args).status()
-        } else {
-            Command::new("pacman").args(&args).status()
-        };
-        match status {
-            Ok(s) => exit(s.code().unwrap_or(0)),
+        match pm::forward_pacman(&args, needs_sudo) {
+            Ok(code) => exit(code),
             Err(e) => {
                 eprintln!("{}", format!("Failed to run pacman: {}", e).red());
                 exit(1);
             }
         }
     } else if cmd.starts_with("-U") || cmd.starts_with("-D") {
-        check_pacman_lock();
-        let status = Command::new("sudo").arg("pacman").args(&args).status();
-        match status {
-            Ok(s) => exit(s.code().unwrap_or(0)),
+        match pm::forward_pacman(&args, true) {
+            Ok(code) => exit(code),
             Err(e) => {
                 eprintln!("{}", format!("Failed to run sudo pacman: {}", e).red());
                 exit(1);
@@ -2537,7 +2424,7 @@ mod tests {
     #[test]
     fn test_pure_orphan_filtering() {
         use crate::db::OrphanPackage;
-        let orphans = vec![
+        let orphans = [
             OrphanPackage {
                 name: "pure-orphan".to_string(),
                 version: "1.0".to_string(),

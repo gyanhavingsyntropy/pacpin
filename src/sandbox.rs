@@ -311,142 +311,11 @@ fn create_secure_temp_dir(prefix: &str) -> Result<PathBuf, String> {
     Err("Failed to create secure sandbox directory with exclusive permissions".to_string())
 }
 
-fn create_secure_temp_file(dir: &Path, prefix: &str, ext: &str) -> Result<PathBuf, String> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    for _ in 0..100 {
-        let mut random_bytes = [0u8; 16];
-        if let Ok(mut f) = fs::File::open("/dev/urandom") {
-            use std::io::Read;
-            let _ = f.read_exact(&mut random_bytes);
-        } else {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let pid = std::process::id() as u128;
-            random_bytes = (nanos ^ (pid << 64)).to_le_bytes();
-        }
-        let hex = random_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-        let target = dir.join(format!("{}-{}.{}", prefix, hex, ext));
-
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-
-        if opts.open(&target).is_ok() {
-            return Ok(target);
-        }
-    }
-    Err("Failed to create secure temporary file".to_string())
-}
-
-pub fn is_safe_tar_entry(entry: &str) -> bool {
-    let trimmed = entry.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-    // Absolute paths or drive letters
-    if trimmed.starts_with('/') || trimmed.starts_with('\\') {
-        return false;
-    }
-    // Path traversal components
-    for component in trimmed.split(['/', '\\']) {
-        if component == ".." {
-            return false;
-        }
-    }
-    true
-}
-
-pub fn is_safe_link_destination(src: &str, dst: &str) -> bool {
-    let trimmed_dst = dst.trim();
-    if trimmed_dst.is_empty() {
-        return false;
-    }
-    // No absolute paths or drive letters
-    if trimmed_dst.starts_with('/') || trimmed_dst.starts_with('\\') {
-        return false;
-    }
-    if trimmed_dst.len() >= 2
-        && trimmed_dst.chars().next().unwrap().is_ascii_alphabetic()
-        && trimmed_dst.chars().nth(1) == Some(':')
-    {
-        return false;
-    }
-
-    // Calculate directory depth of the link's source relative to sandbox root
-    let src_trimmed = src.trim().trim_start_matches(['/', '\\']);
-    let parent_components: Vec<&str> = src_trimmed
-        .split(['/', '\\'])
-        .filter(|c| !c.is_empty() && *c != ".")
-        .collect();
-    let mut depth: isize = if parent_components.is_empty() {
-        0
-    } else {
-        (parent_components.len() - 1) as isize
-    };
-
-    for comp in trimmed_dst.split(['/', '\\']) {
-        if comp.is_empty() || comp == "." {
-            continue;
-        }
-        if comp == ".." {
-            depth -= 1;
-            if depth < 0 {
-                // Link traverses above the archive root!
-                return false;
-            }
-        } else {
-            depth += 1;
-        }
-    }
-
-    true
-}
-
-pub fn is_safe_tar_listing_line(line: &str) -> Result<(String, u64), String> {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    if tokens.is_empty() {
-        return Ok((String::new(), 0));
-    }
-    if tokens.len() < 6 {
-        // Shorter output: fallback to raw entry check
-        let entry = tokens.last().unwrap_or(&"");
-        if !is_safe_tar_entry(entry) {
-            return Err(format!("Unsafe archive path: {}", entry));
-        }
-        return Ok((entry.to_string(), 0));
-    }
-
-    let size = tokens[2].parse::<u64>().unwrap_or(0);
-    let full_path = tokens[5..].join(" ");
-
-    if let Some((src, dst)) = full_path.split_once(" -> ") {
-        if !is_safe_tar_entry(src) {
-            return Err(format!("Unsafe symlink source entry: {}", src));
-        }
-        if !is_safe_link_destination(src, dst) {
-            return Err(format!("Unsafe symlink destination '{}' points outside sandbox root", dst));
-        }
-        Ok((src.to_string(), size))
-    } else if let Some((src, dst)) = full_path.split_once(" link to ") {
-        if !is_safe_tar_entry(src) {
-            return Err(format!("Unsafe hardlink source entry: {}", src));
-        }
-        if !is_safe_link_destination(src, dst) {
-            return Err(format!("Unsafe hardlink destination '{}' points outside sandbox root", dst));
-        }
-        Ok((src.to_string(), size))
-    } else {
-        if !is_safe_tar_entry(&full_path) {
-            return Err(format!("Unsafe path traversal entry: {}", full_path));
-        }
-        Ok((full_path, size))
-    }
-}
+#[allow(unused_imports)]
+pub use crate::download::{
+    compute_sha256, create_secure_temp_file, extract_archive, is_safe_link_destination,
+    is_safe_tar_entry, is_safe_tar_listing_line, MAX_ARCHIVE_ENTRIES, MAX_UNPACKED_BYTES,
+};
 
 fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptions) -> Result<i32, String> {
     if pkg.is_empty() || !crate::journal::TransactionJournal::is_safe_pkg_name(pkg) {
@@ -469,14 +338,14 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
                 if trimmed.is_empty() || trimmed == "y" || trimmed == "yes" {
                     println!("{}", ":: Installing bubblewrap via pacpin...".cyan());
                     let mut config = crate::config::load_config();
-                    let install_opts = crate::installer::InstallOptions {
+                    let install_opts = crate::pm::InstallOptions {
                         needed: true,
                         noconfirm: false,
                         refresh: false,
                         dry_run: false,
                         forwarded_flags: Vec::new(),
                     };
-                    match crate::installer::install_packages(
+                    match crate::pm::install(
                         &mut config,
                         &["bubblewrap".to_string()],
                         &install_opts,
@@ -548,9 +417,6 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
         );
     }
 
-    const MAX_ARCHIVE_ENTRIES: usize = 50_000;
-    const MAX_UNPACKED_BYTES: u64 = 5 * 1024 * 1024 * 1024; // 5 GB limit
-
     // 1. Download, verify, and safely inspect archives before extraction
     for target in &resolved {
         let candidate_urls = if target.candidate_urls.is_empty() {
@@ -566,70 +432,7 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
             &mut guard,
         )?;
 
-        // Tar Path Traversal & Expansion Bomb Guard: inspect entries and link targets before extraction
-        let tar_tvf = Command::new("tar")
-            .args(["-tvf", tarball_path.to_str().unwrap()])
-            .output()
-            .map_err(|e| format!("Failed to inspect archive '{}': {}", tarball_path.display(), e))?;
-
-        if !tar_tvf.status.success() {
-            return Err(format!(
-                "Failed to list archive contents for '{}' (exit code {:?})",
-                tarball_path.display(),
-                tar_tvf.status.code()
-            ));
-        }
-
-        let listing = String::from_utf8_lossy(&tar_tvf.stdout);
-        let mut total_entries = 0usize;
-        let mut total_size = 0u64;
-
-        for line in listing.lines() {
-            let line_trimmed = line.trim();
-            if line_trimmed.is_empty() {
-                continue;
-            }
-            total_entries += 1;
-            if total_entries > MAX_ARCHIVE_ENTRIES {
-                return Err(format!(
-                    "Security violation: archive '{}' exceeds maximum allowed file count ({})",
-                    tarball_path.display(),
-                    MAX_ARCHIVE_ENTRIES
-                ));
-            }
-
-            let (_entry, size) = is_safe_tar_listing_line(line_trimmed)
-                .map_err(|e| format!("Security violation in archive '{}': {}. Extraction aborted.", tarball_path.display(), e))?;
-
-            total_size = total_size.saturating_add(size);
-            if total_size > MAX_UNPACKED_BYTES {
-                return Err(format!(
-                    "Security violation: archive '{}' uncompressed size exceeds safety limit of 5 GB. Extraction aborted.",
-                    tarball_path.display()
-                ));
-            }
-        }
-
-        let extract_status = Command::new("tar")
-            .args([
-                "-xf",
-                tarball_path.to_str().unwrap(),
-                "-C",
-                sandbox_dir.to_str().unwrap(),
-                "--no-same-owner",
-                "--no-same-permissions",
-                "--delay-directory-restore",
-            ])
-            .status()
-            .map_err(|e| format!("Failed to execute tar on '{}': {}", target.name, e))?;
-
-        if !extract_status.success() {
-            return Err(format!(
-                "Extraction of '{}' failed with exit code {}.",
-                target.name,
-                extract_status.code().unwrap_or(1)
-            ));
-        }
+        crate::download::extract_archive(&tarball_path, &sandbox_dir)?;
     }
 
     // 2. Find executable binary
@@ -811,163 +614,13 @@ fn get_or_download_package(
     allow_unverified: bool,
     guard: &mut SandboxGuard,
 ) -> Result<PathBuf, String> {
-    // 1. Check local pacman cache first (/var/cache/pacman/pkg/)
-    let cache_dir = Path::new("/var/cache/pacman/pkg");
-    if cache_dir.exists() {
-        if let Ok(entries) = fs::read_dir(cache_dir) {
-            let mut matching: Vec<PathBuf> = entries
-                .flatten()
-                .filter(|e| {
-                    let file_name = e.file_name();
-                    let name_str = file_name.to_string_lossy();
-                    (name_str.ends_with(".pkg.tar.zst") || name_str.ends_with(".pkg.tar.xz"))
-                        && (name_str.starts_with(&format!("{}-", pkg)))
-                })
-                .map(|e| e.path())
-                .collect();
-
-            if !matching.is_empty() {
-                matching.sort_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
-                let found = matching.last().unwrap().clone();
-
-                let cache_valid = if let Some(expected) = expected_sha {
-                    if let Ok(out) = Command::new("sha256sum").arg(&found).output() {
-                        if out.status.success() {
-                            let stdout = String::from_utf8_lossy(&out.stdout);
-                            let computed = stdout.split_whitespace().next().unwrap_or("");
-                            computed.eq_ignore_ascii_case(expected)
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    allow_unverified
-                };
-
-                if cache_valid {
-                    println!("{} Found verified '{}' in local pacman cache.", "::".cyan(), pkg);
-                    return Ok(found);
-                } else if expected_sha.is_some() {
-                    println!(
-                        "{} Cached package for '{}' failed checksum verification or was outdated; downloading fresh...",
-                        "::".yellow(),
-                        pkg
-                    );
-                }
-            }
-        }
-    }
-
-    // 2. Fail-closed: verify that checksum is available unless user explicitly opted out
-    let expected = match expected_sha {
-        Some(s) => s,
-        None if allow_unverified => {
-            println!(
-                "{} Warning: No SHA256 checksum in repository metadata for '{}'; proceeding (--allow-unverified).",
-                "::".yellow(),
-                pkg
-            );
-            ""
-        }
-        None => {
-            return Err(format!(
-                "Security violation: Repository metadata for '{}' does not provide a SHA256 checksum.\n  \
-                Fail-closed policy rejects unverified package downloads.\n  \
-                To bypass integrity verification at your own risk, re-run with --allow-unverified.",
-                pkg
-            ));
-        }
-    };
-
-    if candidate_urls.is_empty() {
-        return Err(format!("No download URLs configured for package '{}'", pkg));
-    }
-
-    // 3. Download with automatic mirror failover and SHA256 integrity verification
-    let mut last_err = String::new();
-    for (i, url) in candidate_urls.iter().enumerate() {
-        if i > 0 {
-            println!(
-                "{} Retrying download from backup mirror {}...",
-                "::".yellow(),
-                url.dimmed()
-            );
-        } else {
-            println!("{} Fetching '{}' from {}...", "::".cyan(), pkg, url.dimmed());
-        }
-
-        let ext = if url.ends_with(".pkg.tar.xz") {
-            "pkg.tar.xz"
-        } else {
-            "pkg.tar.zst"
-        };
-
-        let temp_download = create_secure_temp_file(
-            &env::temp_dir(),
-            &format!("pacpin-download-{}", pkg),
-            ext,
-        )?;
-        guard.downloaded_tarballs.push(temp_download.clone());
-
-        // -f (--fail) ensures curl immediately fails on HTTP 4xx/5xx rather than writing HTML error pages
-        let curl_status = Command::new("curl")
-            .args(["-sSLf", "-o", temp_download.to_str().unwrap(), url])
-            .status();
-
-        match curl_status {
-            Ok(s) if s.success() => {
-                if !expected.is_empty() {
-                    let out = Command::new("sha256sum").arg(&temp_download).output();
-                    match out {
-                        Ok(o) if o.status.success() => {
-                            let stdout = String::from_utf8_lossy(&o.stdout);
-                            let computed = stdout.split_whitespace().next().unwrap_or("");
-                            if computed.eq_ignore_ascii_case(expected) {
-                                return Ok(temp_download);
-                            } else {
-                                last_err = format!(
-                                    "SHA256 checksum mismatch (expected: {}, computed: {})",
-                                    expected, computed
-                                );
-                                let _ = fs::remove_file(&temp_download);
-                                println!(
-                                    "{} Warning: Mirror '{}' returned invalid checksum. Trying next mirror...",
-                                    "::".yellow(),
-                                    url
-                                );
-                            }
-                        }
-                        _ => {
-                            last_err = "Failed to run sha256sum".to_string();
-                            let _ = fs::remove_file(&temp_download);
-                        }
-                    }
-                } else {
-                    return Ok(temp_download);
-                }
-            }
-            Ok(s) => {
-                last_err = format!("curl failed with HTTP error or status {:?}", s.code());
-                let _ = fs::remove_file(&temp_download);
-                println!(
-                    "{} Warning: Mirror '{}' failed (HTTP error). Trying next mirror...",
-                    "::".yellow(),
-                    url
-                );
-            }
-            Err(e) => {
-                last_err = format!("Failed to execute curl: {}", e);
-                let _ = fs::remove_file(&temp_download);
-            }
-        }
-    }
-
-    Err(format!(
-        "All configured mirrors failed to download verified package '{}': {}",
-        pkg, last_err
-    ))
+    crate::download::fetch_package_archive(
+        pkg,
+        candidate_urls,
+        expected_sha,
+        allow_unverified,
+        &mut guard.downloaded_tarballs,
+    )
 }
 
 fn find_executable(sandbox_dir: &Path, pkg: &str, requested_bin: Option<&str>) -> Result<PathBuf, String> {
