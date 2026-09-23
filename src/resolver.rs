@@ -474,6 +474,7 @@ impl<'a> ResolverEngine<'a> {
                         continue;
                     } else if let Some(&db) = syncdb_map.get(installed_db.as_str()) {
                         if let Ok(p) = db.pkg(pkg_name) {
+                            let is_needed = state == "custom" || vercmp(p.version().as_str(), inst_ver) == Ordering::Greater;
                             candidate = Some(CandidatePackage {
                                 name: p.name().to_string(),
                                 version: p.version().to_string(),
@@ -481,10 +482,14 @@ impl<'a> ResolverEngine<'a> {
                                 base: p.base().unwrap_or(p.name()).to_string(),
                                 csize: p.size(),
                                 isize: p.isize(),
-                                desc: p.desc().unwrap_or("").to_string(),
+                                desc: if is_needed { p.desc().unwrap_or("").to_string() } else { String::new() },
                                 builddate: p.build_date(),
                                 is_aur: false,
-                                depends: p.depends().iter().map(|d| d.name().to_string()).collect(),
+                                depends: if is_needed {
+                                    p.depends().iter().map(|d| d.name().to_string()).collect()
+                                } else {
+                                    Vec::new()
+                                },
                             });
                             is_sticky = true;
                         }
@@ -500,6 +505,7 @@ impl<'a> ResolverEngine<'a> {
                                 let is_excl = config.features.pinning
                                     && Self::is_excluded(pkg_name, r, &config.exclude);
                                 if !is_excl && candidate.is_none() {
+                                    let is_needed = state == "custom" || vercmp(p.version().as_str(), inst_ver) == Ordering::Greater;
                                     candidate = Some(CandidatePackage {
                                         name: p.name().to_string(),
                                         version: p.version().to_string(),
@@ -507,14 +513,17 @@ impl<'a> ResolverEngine<'a> {
                                         base: p.base().unwrap_or(p.name()).to_string(),
                                         csize: p.size(),
                                         isize: p.isize(),
-                                        desc: p.desc().unwrap_or("").to_string(),
+                                        desc: if is_needed { p.desc().unwrap_or("").to_string() } else { String::new() },
                                         builddate: p.build_date(),
                                         is_aur: false,
-                                        depends: p
-                                            .depends()
-                                            .iter()
-                                            .map(|d| d.name().to_string())
-                                            .collect(),
+                                        depends: if is_needed {
+                                            p.depends()
+                                                .iter()
+                                                .map(|d| d.name().to_string())
+                                                .collect()
+                                        } else {
+                                            Vec::new()
+                                        },
                                     });
                                 }
                                 if natural_top_repo.is_some() && candidate.is_some() {

@@ -84,18 +84,19 @@ fn query_aur_chunk(chunk: &[String]) -> HashMap<String, AurItem> {
 
         match agent.get(&url).call() {
             Ok(resp) => {
-                let text = match resp.into_string() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        if attempts == max_attempts {
-                            eprintln!(
-                                "{}",
-                                format!(":: Warning: Failed to read AUR RPC response: {}", e).yellow()
-                            );
-                        }
-                        continue;
+                use std::io::Read;
+                const MAX_AUR_RESPONSE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB safety cap
+                let mut reader = resp.into_reader().take(MAX_AUR_RESPONSE_BYTES);
+                let mut text = String::new();
+                if let Err(e) = reader.read_to_string(&mut text) {
+                    if attempts == max_attempts {
+                        eprintln!(
+                            "{}",
+                            format!(":: Warning: Failed to read AUR RPC response: {}", e).yellow()
+                        );
                     }
-                };
+                    continue;
+                }
 
                 match serde_json::from_str::<AurRpcResponse>(&text) {
                     Ok(rpc) => {
@@ -107,7 +108,12 @@ fn query_aur_chunk(chunk: &[String]) -> HashMap<String, AurItem> {
                                 );
                             }
                         } else {
-                            for item in rpc.results {
+                            for mut item in rpc.results {
+                                item.name = crate::utils::sanitize_display_text(&item.name);
+                                item.description = item
+                                    .description
+                                    .as_ref()
+                                    .map(|d| crate::utils::sanitize_display_text(d));
                                 results.insert(item.name.clone(), item);
                             }
                             success = true;
@@ -177,20 +183,24 @@ pub fn query_aur(pkg_names: &[String]) -> HashMap<String, AurItem> {
         return query_aur_chunk(pkg_names);
     }
 
-    // Query multiple 50-package chunks concurrently in parallel
+    // Query 50-package chunks concurrently with bounded worker concurrency (max 4 parallel connections)
     let chunks: Vec<Vec<String>> = pkg_names.chunks(50).map(|c| c.to_vec()).collect();
-    let mut handles = Vec::new();
-
-    for chunk in chunks {
-        handles.push(std::thread::spawn(move || query_aur_chunk(&chunk)));
-    }
-
     let mut results = HashMap::new();
-    for h in handles {
-        if let Ok(chunk_res) = h.join() {
-            results.extend(chunk_res);
+    const MAX_CONCURRENT_AUR_WORKERS: usize = 4;
+
+    for chunk_batch in chunks.chunks(MAX_CONCURRENT_AUR_WORKERS) {
+        let mut handles = Vec::new();
+        for chunk in chunk_batch {
+            let chunk = chunk.clone();
+            handles.push(std::thread::spawn(move || query_aur_chunk(&chunk)));
+        }
+        for h in handles {
+            if let Ok(chunk_res) = h.join() {
+                results.extend(chunk_res);
+            }
         }
     }
+
     results
 }
 

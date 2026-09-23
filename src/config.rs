@@ -238,11 +238,67 @@ pub fn save_config(config: &Config) -> Result<(), std::io::Error> {
     save_config_to_path(config, &path)
 }
 
+#[allow(dead_code)]
+pub fn mutate_config<F, R>(f: F) -> Result<R, String>
+where
+    F: FnOnce(&mut Config) -> Result<R, String>,
+{
+    let path = get_config_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let lock_path = path.with_extension("lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("Failed to open config lock file: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX);
+        }
+    }
+
+    let mut cfg = load_config();
+    let res = f(&mut cfg)?;
+    save_config(&cfg).map_err(|e| format!("Failed to save configuration: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+
+    Ok(res)
+}
+
 pub fn save_config_to_path(config: &Config, path: &Path) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
+
+    let lock_path = path.with_extension("lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX);
+        }
+    }
+
     let toml_str = toml::to_string_pretty(config)
         .map_err(std::io::Error::other)?;
 

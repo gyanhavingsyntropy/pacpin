@@ -70,9 +70,20 @@ pub fn build_install_commands(
         for f in &options.forwarded_flags {
             cmd.push(f.as_str());
         }
+        cmd.push("--");
         let mut s = cmd.join(" ");
         s.push(' ');
-        s.push_str(&pacman_targets.join(" "));
+        let quoted_targets: Vec<String> = pacman_targets
+            .iter()
+            .map(|t| {
+                if t.contains(' ') || t.contains('\'') || t.contains('"') {
+                    crate::utils::shell_quote(t)
+                } else {
+                    t.clone()
+                }
+            })
+            .collect();
+        s.push_str(&quoted_targets.join(" "));
         command_strs.push(s);
     }
 
@@ -93,9 +104,20 @@ pub fn build_install_commands(
         for f in &options.forwarded_flags {
             cmd.push(f.as_str());
         }
+        cmd.push("--");
         let mut s = cmd.join(" ");
         s.push(' ');
-        s.push_str(&aur_targets.join(" "));
+        let quoted_targets: Vec<String> = aur_targets
+            .iter()
+            .map(|t| {
+                if t.contains(' ') || t.contains('\'') || t.contains('"') {
+                    crate::utils::shell_quote(t)
+                } else {
+                    t.clone()
+                }
+            })
+            .collect();
+        s.push_str(&quoted_targets.join(" "));
         command_strs.push(s);
     }
 
@@ -110,6 +132,10 @@ pub fn install(
 ) -> Result<Vec<String>, String> {
     if targets.is_empty() {
         return Err("No package targets specified.".to_string());
+    }
+
+    if let Some(bad) = targets.iter().find(|t| !crate::utils::is_safe_install_target(t)) {
+        return Err(format!("Refusing unsafe package target '{}'.", bad));
     }
 
     let wait_secs = options
@@ -397,6 +423,7 @@ pub fn install(
         for f in &options.forwarded_flags {
             args.push(f.as_str());
         }
+        args.push("--");
         args.extend(pacman_targets.iter().map(|s| s.as_str()));
         let status = Command::new("sudo").args(&args).status();
         match status {
@@ -412,6 +439,7 @@ pub fn install(
                 for f in &options.forwarded_flags {
                     cmd_parts.push(f.as_str());
                 }
+                cmd_parts.push("--");
                 let mut cmd_str = cmd_parts.join(" ");
                 cmd_str.push(' ');
                 cmd_str.push_str(&pacman_targets.join(" "));
@@ -440,6 +468,7 @@ pub fn install(
         for f in &options.forwarded_flags {
             args.push(f.as_str());
         }
+        args.push("--");
         args.extend(aur_targets.iter().map(|s| s.as_str()));
         let status = Command::new(helper).args(&args).status();
         match status {
@@ -455,6 +484,7 @@ pub fn install(
                 for f in &options.forwarded_flags {
                     cmd_parts.push(f.as_str());
                 }
+                cmd_parts.push("--");
                 let mut cmd_str = cmd_parts.join(" ");
                 cmd_str.push(' ');
                 cmd_str.push_str(&aur_targets.join(" "));
@@ -533,6 +563,10 @@ pub fn remove(config: &mut Config, targets: &[String], flags: &[String]) -> Resu
         return Err("No package targets specified for removal.".to_string());
     }
 
+    if let Some(bad) = targets.iter().find(|t| !crate::utils::is_safe_install_target(t)) {
+        return Err(format!("Refusing unsafe package target for removal: '{}'.", bad));
+    }
+
     let wait_secs = flags
         .iter()
         .enumerate()
@@ -559,6 +593,7 @@ pub fn remove(config: &mut Config, targets: &[String], flags: &[String]) -> Resu
 
     let mut cmd_args = Vec::new();
     cmd_args.extend(flags.iter().map(|s| s.as_str()));
+    cmd_args.push("--");
     cmd_args.extend(targets.iter().map(|s| s.as_str()));
 
     println!(
@@ -1243,7 +1278,7 @@ mod tests {
             cmds,
             vec![
                 "sudo pacman -Sy".to_string(),
-                "sudo pacman -S --needed ollama".to_string()
+                "sudo pacman -S --needed -- ollama".to_string()
             ]
         );
 
@@ -1259,7 +1294,7 @@ mod tests {
         };
         let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", &opts_sy, false);
         assert_eq!(op, "-S");
-        assert_eq!(cmds, vec!["sudo pacman -S --needed ollama".to_string()]);
+        assert_eq!(cmds, vec!["sudo pacman -S --needed -- ollama".to_string()]);
 
         // 3. Sysupgrade (-Syu): atomic full upgrade, no duplicate -Sy
         let opts_syu = InstallOptions {
@@ -1272,7 +1307,7 @@ mod tests {
         };
         let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", &opts_syu, true);
         assert_eq!(op, "-Syu");
-        assert_eq!(cmds, vec!["sudo pacman -Syu --needed ollama".to_string()]);
+        assert_eq!(cmds, vec!["sudo pacman -Syu --needed -- ollama".to_string()]);
 
         // 4. Sysupgrade without refresh (-Su):
         let opts_su = InstallOptions {
@@ -1285,13 +1320,30 @@ mod tests {
         };
         let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", &opts_su, true);
         assert_eq!(op, "-Su");
-        assert_eq!(cmds, vec!["sudo pacman -Su --needed ollama".to_string()]);
+        assert_eq!(cmds, vec!["sudo pacman -Su --needed -- ollama".to_string()]);
 
         // 5. AUR targets with sysupgrade when no repo targets:
         let aur_targets = vec!["google-chrome".to_string()];
         let (cmds, _op, aur_op) = build_install_commands(&[], &aur_targets, "paru", &opts_syu, true);
         assert_eq!(aur_op, "-Syu");
-        assert_eq!(cmds, vec!["paru -Syu --aur --needed google-chrome".to_string()]);
+        assert_eq!(cmds, vec!["paru -Syu --aur --needed -- google-chrome".to_string()]);
+    }
+
+    #[test]
+    fn test_install_unsafe_target_rejected() {
+        let mut cfg = Config::default();
+        let opts = InstallOptions::default();
+
+        let res_flag = install(&mut cfg, &["--config=/tmp/bad".to_string()], &opts);
+        assert!(res_flag.is_err());
+        assert!(res_flag.unwrap_err().contains("Refusing unsafe package target"));
+
+        let res_hyphen = install(&mut cfg, &["-badpkg".to_string()], &opts);
+        assert!(res_hyphen.is_err());
+
+        let res_remove = remove(&mut cfg, &["--dbpath=/tmp/bad".to_string()], &[]);
+        assert!(res_remove.is_err());
+        assert!(res_remove.unwrap_err().contains("Refusing unsafe package target for removal"));
     }
 
     #[test]

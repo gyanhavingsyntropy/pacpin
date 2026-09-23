@@ -79,23 +79,13 @@ pub fn clean_stale_sandboxes() {
     }
 }
 
-#[cfg(unix)]
-extern "C" fn sig_handler(sig: libc::c_int) {
-    cleanup_active_targets();
-    unsafe {
-        libc::signal(sig, libc::SIG_DFL);
-        libc::raise(sig);
-    }
-}
-
 pub fn init_signal_handlers() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        #[cfg(unix)]
-        unsafe {
-            libc::signal(libc::SIGINT, sig_handler as *const () as usize);
-            libc::signal(libc::SIGTERM, sig_handler as *const () as usize);
-        }
+        let _ = ctrlc::set_handler(move || {
+            cleanup_active_targets();
+            std::process::exit(130);
+        });
     });
 }
 
@@ -666,12 +656,22 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
         }
 
         // 6. Current working directory: read-only by default, read-write only if --rw
-        if cwd.exists() && !cwd.starts_with("/tmp") {
+        let cwd_is_home = home_path.exists()
+            && cwd.canonicalize().ok() == home_path.canonicalize().ok();
+
+        if cwd.exists() && !cwd.starts_with("/tmp") && !cwd_is_home {
             if options.rw_cwd {
                 bwrap_cmd.arg("--bind").arg(&cwd).arg(&cwd);
             } else {
                 bwrap_cmd.arg("--ro-bind").arg(&cwd).arg(&cwd);
             }
+        } else if cwd_is_home {
+            eprintln!(
+                "{}",
+                ":: Note: Running from $HOME — working directory will not be bind-mounted \
+into the sandbox to keep your home directory isolated."
+                    .yellow()
+            );
         }
 
         // 7. Mount sandbox directory containing extracted packages read-only
@@ -994,5 +994,21 @@ mod tests {
     fn test_check_bwrap_capability_runs() {
         // Must execute cleanly without panic
         let _ = check_bwrap_capability();
+    }
+
+    #[test]
+    fn test_cwd_is_home_logic() {
+        let temp_home = std::env::temp_dir().join(format!("pacpin-test-home-{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_home);
+        let sub_dir = temp_home.join("workspace");
+        let _ = fs::create_dir_all(&sub_dir);
+
+        let is_home = temp_home.canonicalize().ok() == temp_home.canonicalize().ok();
+        assert!(is_home);
+
+        let sub_is_home = sub_dir.canonicalize().ok() == temp_home.canonicalize().ok();
+        assert!(!sub_is_home);
+
+        let _ = fs::remove_dir_all(&temp_home);
     }
 }

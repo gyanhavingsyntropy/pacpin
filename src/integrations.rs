@@ -99,17 +99,17 @@ impl IntegrationProvider for FlatpakProvider {
                 for line in stdout.lines() {
                     let parts: Vec<&str> = line.split('\t').collect();
                     if parts.len() >= 4 {
-                        let name = parts[0].trim().to_string();
-                        let app_id = parts[1].trim().to_string();
-                        let ver = parts[2].trim().to_string();
-                        let origin = parts[3].trim().to_string();
+                        let name = crate::utils::sanitize_display_text(parts[0].trim());
+                        let app_id = crate::utils::sanitize_display_text(parts[1].trim());
+                        let ver = crate::utils::sanitize_display_text(parts[2].trim());
+                        let origin = crate::utils::sanitize_display_text(parts[3].trim());
 
                         if !app_id.is_empty() {
                             results.push(ExternalUpdate {
                                 runner: "Flatpak".to_string(),
-                                id: app_id,
+                                id: app_id.clone(),
                                 name: if name.is_empty() {
-                                    parts[1].to_string()
+                                    app_id
                                 } else {
                                     name
                                 },
@@ -140,13 +140,13 @@ impl IntegrationProvider for FlatpakProvider {
             "flatpak update -y".to_string()
         } else {
             let ids: Vec<&str> = updates.iter().map(|u| u.id.as_str()).collect();
-            format!("flatpak update -y {}", ids.join(" "))
+            format!("flatpak update -y -- {}", ids.join(" "))
         }
     }
 
     fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> Result<bool, std::io::Error> {
         let mut cmd = Command::new("flatpak");
-        cmd.arg("update").arg("-y");
+        cmd.arg("update").arg("-y").arg("--");
         for u in updates {
             cmd.arg(&u.id);
         }

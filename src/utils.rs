@@ -109,6 +109,76 @@ pub fn is_executable_file(path: &std::path::Path) -> bool {
     }
 }
 
+/// Validates whether an install or removal target is safe.
+/// Supports both bare package names ("ollama") and repository-qualified targets ("extra/ollama").
+pub fn is_safe_install_target(target: &str) -> bool {
+    let t = target.trim();
+    if t.is_empty() || t.starts_with('-') || t.starts_with('.') {
+        return false;
+    }
+    match t.split_once('/') {
+        Some((repo, pkg)) => {
+            !repo.is_empty()
+                && !pkg.is_empty()
+                && is_safe_pkg_name(repo)
+                && is_safe_pkg_name(pkg)
+                && !pkg.contains('/')
+        }
+        None => is_safe_pkg_name(t),
+    }
+}
+
+/// Strips C0 and C1 control characters and ANSI/VT100/OSC escape sequences from untrusted display text,
+/// while leaving standard UTF-8 characters (including wide/emoji glyphs) and basic whitespace intact.
+pub fn sanitize_display_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if let Some(&next) = chars.peek() {
+                if next == '[' {
+                    chars.next();
+                    // CSI sequence: terminates on a final byte in '@'..='~' (0x40..=0x7E)
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                } else if next == ']' {
+                    chars.next();
+                    // OSC sequence: terminates on BEL (\x07) or ST (\x1b\\)
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if c == '\x07' {
+                            break;
+                        } else if c == '\x1b' {
+                            if let Some(&'\\') = chars.peek() {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                } else {
+                    // Two-character escape sequence (e.g. ESC M, ESC 7, ESC =)
+                    chars.next();
+                }
+            }
+            continue;
+        }
+        // Allow tab, newline, carriage return, but reject other ASCII control codes (0x00..0x1F)
+        if (ch as u32) < 0x20 && ch != '\t' && ch != '\n' && ch != '\r' {
+            continue;
+        }
+        // Reject DEL (0x7F) and C1 control codes (0x80..=0x9F)
+        if (0x7F..=0x9F).contains(&(ch as u32)) {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +200,41 @@ mod tests {
         assert!(!is_safe_pkg_name("pkg name"));
         assert!(!is_safe_pkg_name("-badname"));
         assert!(!is_safe_pkg_name(".badname"));
+    }
+
+    #[test]
+    fn test_is_safe_install_target() {
+        assert!(is_safe_install_target("ollama"));
+        assert!(is_safe_install_target("extra/ollama"));
+        assert!(is_safe_install_target("cachyos/linux-cachyos"));
+        assert!(is_safe_install_target("lib32-glibc"));
+
+        assert!(!is_safe_install_target(""));
+        assert!(!is_safe_install_target("-S"));
+        assert!(!is_safe_install_target("--config=/tmp/bad"));
+        assert!(!is_safe_install_target("-bad"));
+        assert!(!is_safe_install_target(".bad"));
+        assert!(!is_safe_install_target("extra/"));
+        assert!(!is_safe_install_target("/ollama"));
+        assert!(!is_safe_install_target("extra/../etc/passwd"));
+        assert!(!is_safe_install_target("extra/sub/pkg"));
+        assert!(!is_safe_install_target("ollama;rm -rf /"));
+    }
+
+    #[test]
+    fn test_sanitize_display_text() {
+        assert_eq!(sanitize_display_text("Normal text"), "Normal text");
+        assert_eq!(sanitize_display_text("Line 1\nLine 2"), "Line 1\nLine 2");
+        assert_eq!(sanitize_display_text("Emojis: 🚀 and symbols: — ✔"), "Emojis: 🚀 and symbols: — ✔");
+
+        // ANSI color escapes
+        assert_eq!(sanitize_display_text("\x1b[31mRed Text\x1b[0m"), "Red Text");
+        // Cursor movement / clear screen
+        assert_eq!(sanitize_display_text("\x1b[2J\x1b[HClear"), "Clear");
+        // OSC hyperlink
+        assert_eq!(sanitize_display_text("\x1b]8;;https://malicious.link\x07Click Here\x1b]8;;\x07"), "Click Here");
+        // C0 control chars
+        assert_eq!(sanitize_display_text("Bell\x07 and Backspace\x08"), "Bell and Backspace");
     }
 
     #[test]

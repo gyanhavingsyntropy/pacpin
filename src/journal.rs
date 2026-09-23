@@ -152,6 +152,21 @@ impl TransactionJournal {
         let history_file = Self::history_file()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
 
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&history_file)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            unsafe {
+                libc::flock(fd, libc::LOCK_EX);
+            }
+        }
+
         let next_id = if history_file.exists() {
             Self::get_last_transaction_id(&history_file)
                 .map(|id| id + 1)
@@ -170,13 +185,19 @@ impl TransactionJournal {
             packages,
         };
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&history_file)?;
         let line = serde_json::to_string(&record)
             .map_err(std::io::Error::other)?;
         writeln!(file, "{}", line)?;
+        let _ = file.sync_data();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            unsafe {
+                libc::flock(fd, libc::LOCK_UN);
+            }
+        }
 
         Ok(next_id)
     }
@@ -329,6 +350,7 @@ impl TransactionJournal {
         }
 
         let mut cmd_args: Vec<String> = vec!["pacman".to_string(), "-U".to_string()];
+        cmd_args.push("--".to_string());
         for (_, _, path) in &pkgs_to_restore {
             cmd_args.push(path.display().to_string());
         }

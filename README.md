@@ -103,6 +103,11 @@ pipx = true
 | `pacpin history [id]` | View transaction history timeline or inspect full package diff |
 | `pacpin rollback [id] [-n]` | Restore previous package versions from pacman cache |
 
+> **Sandbox Security Note**:
+> - **Credential & Home Isolation**: Sandboxed containers run in unshared Linux user, mount, IPC, PID, and network namespaces with read-only root filesystems and a private in-memory tmpfs over `$HOME`. When running `pacpin try` from `$HOME` itself, the working directory is deliberately not overlaid to keep host credentials (`~/.ssh`, `~/.gnupg`, tokens) strictly isolated.
+> - **Hardware & GUI Passthrough**: Flags like `--gui` and `--audio` pass through host display sockets (`/tmp/.X11-unix`, Wayland) and audio nodes (`/dev/snd`), which intentionally broadens the trust boundary for desktop interaction.
+> - **Archive & Input Verification**: Ephemeral packages are downloaded with fail-closed SHA256 integrity verification, streamed through structured `tar` header validation, and guarded against symlink/hardlink directory escapes.
+
 ### Transparent Pacman Drop-in
 `pacpin` serves as a complete drop-in wrapper. Any native pacman flag sequence (`-Syu`, `-S -y -u`, `-Ss`, `-Si`, `-Sc`, `-Sp`, `-Sl`, `-Sg`, `-Sw`, `-T`, `-Q`, `-Qi`, `-Ql`, `-Qo`, `-F`, `-Fy`, `-U`, `-D`, etc.) passed to `pacpin` or `pin` is transparently handled with proper permission routing (non-root for queries, `sudo` for modifications).
 
