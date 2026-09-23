@@ -17,7 +17,7 @@
 use alpm::{Alpm, SigLevel};
 use glob::Pattern;
 use std::collections::{BTreeMap, HashMap, HashSet};
-
+use std::path::PathBuf;
 use std::process::Command;
 
 #[derive(Debug, Clone)]
@@ -37,8 +37,38 @@ impl AlpmManager {
         Self::with_repo_order(&[])
     }
 
+    pub fn get_dbpath() -> PathBuf {
+        if let Ok(output) = Command::new("pacman-conf").arg("DBPath").output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let trimmed = stdout.trim();
+                if !trimmed.is_empty() {
+                    return PathBuf::from(trimmed);
+                }
+            }
+        }
+        PathBuf::from("/var/lib/pacman")
+    }
+
+    pub fn get_rootdir() -> PathBuf {
+        if let Ok(output) = Command::new("pacman-conf").arg("RootDir").output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let trimmed = stdout.trim();
+                if !trimmed.is_empty() {
+                    return PathBuf::from(trimmed);
+                }
+            }
+        }
+        PathBuf::from("/")
+    }
+
     pub fn with_repo_order(repo_order: &[String]) -> Result<Self, alpm::Error> {
-        let handle = Alpm::new("/", "/var/lib/pacman")?;
+        let root = Self::get_rootdir();
+        let dbpath = Self::get_dbpath();
+        let root = root.to_string_lossy();
+        let dbpath = dbpath.to_string_lossy();
+        let handle = Alpm::new(root.as_ref(), dbpath.as_ref())?;
         let repos = Self::resolve_repo_order(repo_order);
         for repo in &repos {
             let _ = handle.register_syncdb(repo.as_str(), SigLevel::USE_DEFAULT);
@@ -100,7 +130,10 @@ impl AlpmManager {
     }
 
     pub fn get_mirror_servers(repo: &str) -> Vec<String> {
-        if let Ok(output) = Command::new("pacman-conf").args(["--repo", repo, "Server"]).output() {
+        if let Ok(output) = Command::new("pacman-conf")
+            .args(["--repo", repo, "Server"])
+            .output()
+        {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let servers: Vec<String> = stdout
@@ -122,10 +155,8 @@ impl AlpmManager {
         pkg_name: &str,
     ) -> Result<Vec<DownloadTarget>, String> {
         let syncdbs_list: Vec<&alpm::Db> = self.handle.syncdbs().into_iter().collect();
-        let syncdb_map: HashMap<&str, &alpm::Db> = syncdbs_list
-            .iter()
-            .map(|d| (d.name(), *d))
-            .collect();
+        let syncdb_map: HashMap<&str, &alpm::Db> =
+            syncdbs_list.iter().map(|d| (d.name(), *d)).collect();
 
         // Find target package
         let (target_db_name, target_pkg) = if let Some(r) = repo {
@@ -146,7 +177,12 @@ impl AlpmManager {
                     }
                 }
             }
-            found.ok_or_else(|| format!("Package '{}' not found in any configured repository", pkg_name))?
+            found.ok_or_else(|| {
+                format!(
+                    "Package '{}' not found in any configured repository",
+                    pkg_name
+                )
+            })?
         };
 
         let mut server_cache: HashMap<String, String> = HashMap::new();
@@ -155,10 +191,9 @@ impl AlpmManager {
                 return Ok(s.clone());
             }
             let servers = Self::get_mirror_servers(repo_name);
-            let s = servers
-                .first()
-                .cloned()
-                .ok_or_else(|| format!("No mirror server configured for repository '{}'", repo_name))?;
+            let s = servers.first().cloned().ok_or_else(|| {
+                format!("No mirror server configured for repository '{}'", repo_name)
+            })?;
             server_cache.insert(repo_name.to_string(), s.clone());
             Ok(s)
         };
@@ -205,11 +240,20 @@ impl AlpmManager {
                     let real_name = dep_pkg.name().to_string();
                     if visited_pkgs.insert(real_name.clone()) {
                         // Recurse first so dependencies precede this package
-                        resolve_deps(&dep_pkg, manager, syncdb_map, local_db, visited_deps, visited_pkgs, ordered_targets, get_server)?;
+                        resolve_deps(
+                            &dep_pkg,
+                            manager,
+                            syncdb_map,
+                            local_db,
+                            visited_deps,
+                            visited_pkgs,
+                            ordered_targets,
+                            get_server,
+                        )?;
 
-                        let filename = dep_pkg
-                            .filename()
-                            .ok_or_else(|| format!("No filename found for package '{}'", real_name))?;
+                        let filename = dep_pkg.filename().ok_or_else(|| {
+                            format!("No filename found for package '{}'", real_name)
+                        })?;
                         let server = get_server(&sdb_name)?;
                         let url = format!("{}/{}", server.trim_end_matches('/'), filename);
                         let sha256 = dep_pkg.sha256sum().map(|s| s.to_string());
@@ -240,7 +284,11 @@ impl AlpmManager {
             .filename()
             .ok_or_else(|| format!("No filename found for package '{}'", target_pkg.name()))?;
         let target_server = get_server(&target_db_name)?;
-        let target_url = format!("{}/{}", target_server.trim_end_matches('/'), target_filename);
+        let target_url = format!(
+            "{}/{}",
+            target_server.trim_end_matches('/'),
+            target_filename
+        );
         let target_sha256 = target_pkg.sha256sum().map(|s| s.to_string());
         ordered_targets.push(DownloadTarget {
             name: target_pkg.name().to_string(),
@@ -303,8 +351,11 @@ impl AlpmManager {
         };
 
         let target_base = sync_pkg.base().unwrap_or(pkg_name);
-        let direct_deps: HashSet<String> =
-            sync_pkg.depends().iter().map(|d| d.name().to_string()).collect();
+        let direct_deps: HashSet<String> = sync_pkg
+            .depends()
+            .iter()
+            .map(|d| d.name().to_string())
+            .collect();
         let local_db = self.handle.localdb();
 
         let prefix = format!("{}-", pkg_name);
@@ -377,7 +428,11 @@ mod tests {
 
     #[test]
     fn test_order_repos_empty_override() {
-        let discovered = vec!["cachyos".to_string(), "core".to_string(), "extra".to_string()];
+        let discovered = vec![
+            "cachyos".to_string(),
+            "core".to_string(),
+            "extra".to_string(),
+        ];
         let order = AlpmManager::order_repos(&discovered, &[]);
         assert_eq!(order, discovered);
     }
@@ -447,8 +502,10 @@ mod tests {
         assert!(last.sha256.is_some());
         println!("Resolved {} packages for nix:", list.len());
         for target in &list {
-            println!("  {} -> {} (sha256: {:?})", target.name, target.url, target.sha256);
+            println!(
+                "  {} -> {} (sha256: {:?})",
+                target.name, target.url, target.sha256
+            );
         }
     }
 }
-

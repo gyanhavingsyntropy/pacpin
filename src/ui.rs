@@ -150,7 +150,6 @@ pub fn str_width(s: &str) -> usize {
     w
 }
 
-
 pub fn format_size(bytes_val: i64) -> String {
     let abs_val = bytes_val.abs() as f64;
     if abs_val < 1024.0 {
@@ -168,7 +167,10 @@ pub fn format_delta_text(delta: i64) -> (String, colored::Color) {
     if delta > 0 {
         (format!("+{}", format_size(delta)), colored::Color::Yellow)
     } else if delta < 0 {
-        (format!("-{}", format_size(delta.abs())), colored::Color::Green)
+        (
+            format!("-{}", format_size(delta.abs())),
+            colored::Color::Green,
+        )
     } else {
         ("~0 B".to_string(), colored::Color::BrightBlack)
     }
@@ -228,7 +230,9 @@ pub fn parse_selection_indices(raw: &str, items: &[String]) -> Vec<String> {
     }
 
     let mut chosen_indices: Vec<usize> = if invert {
-        (1..=total).filter(|i| !selected_indices.contains(i)).collect()
+        (1..=total)
+            .filter(|i| !selected_indices.contains(i))
+            .collect()
     } else {
         selected_indices.into_iter().collect()
     };
@@ -246,7 +250,10 @@ pub fn prompt_multiselect(title: &str, repo: &str, items: &[String]) -> Vec<Stri
     }
 
     if io::stdin().is_terminal() {
-        let subtitle = format!("Select companion packages from [{}] to avoid version mismatches", repo);
+        let subtitle = format!(
+            "Select companion packages from [{}] to avoid version mismatches",
+            repo
+        );
         let checkbox_items: Vec<crate::tui_select::CheckboxItem> = items
             .iter()
             .map(|name| {
@@ -260,7 +267,9 @@ pub fn prompt_multiselect(title: &str, repo: &str, items: &[String]) -> Vec<Stri
             })
             .collect();
 
-        if let Some(selected) = crate::tui_select::run_checkbox_menu(title, &subtitle, &checkbox_items) {
+        if let Some(selected) =
+            crate::tui_select::run_checkbox_menu(title, &subtitle, &checkbox_items)
+        {
             return selected;
         } else {
             return Vec::new();
@@ -327,7 +336,10 @@ pub fn render_orphans_summary(orphans: &[crate::db::OrphanPackage]) {
     let render_row = |idx: usize, o: &crate::db::OrphanPackage| {
         let size_str = format_size(o.isize);
         let note = if o.is_projected {
-            format!(" [{}]", format!("projected: dropped by {}", o.dropped_by.join(", ")).cyan())
+            format!(
+                " [{}]",
+                format!("projected: dropped by {}", o.dropped_by.join(", ")).cyan()
+            )
         } else if !o.optional_for.is_empty() {
             format!(" (opt for: {})", o.optional_for.join(", ").dimmed())
         } else {
@@ -427,7 +439,9 @@ pub fn prompt_orphan_selection(
             })
             .collect();
 
-        if let Some(selected) = crate::tui_select::run_checkbox_menu(title, subtitle, &checkbox_items) {
+        if let Some(selected) =
+            crate::tui_select::run_checkbox_menu(title, subtitle, &checkbox_items)
+        {
             return selected;
         } else {
             return Vec::new();
@@ -492,7 +506,6 @@ pub fn prompt_orphan_selection(
     parse_selection_indices(raw, &all_names)
 }
 
-
 pub fn render_transaction_view(
     data: &ResolveResult,
     helper: &str,
@@ -502,14 +515,22 @@ pub fn render_transaction_view(
     let held = &data.held_packages;
 
     if !data.unresolved_pins.is_empty() {
-        println!("\n{}", format!("⚠ Unresolved Custom Pins ({}):", data.unresolved_pins.len()).yellow().bold());
+        println!(
+            "\n{}",
+            format!("⚠ Unresolved Custom Pins ({}):", data.unresolved_pins.len())
+                .yellow()
+                .bold()
+        );
         for (pkg, repo) in &data.unresolved_pins {
             println!("  • {:<28} ➔ [{}] NOT FOUND", pkg.bold(), repo.red());
         }
     }
 
     if !held.is_empty() {
-        println!("\n{}", format!("⏸ Held Packages ({}):", held.len()).yellow().bold());
+        println!(
+            "\n{}",
+            format!("⏸ Held Packages ({}):", held.len()).yellow().bold()
+        );
         for p in held {
             let cand_ver = p
                 .candidate
@@ -526,7 +547,11 @@ pub fn render_transaction_view(
                 "sticky" => "[sticky]".blue(),
                 _ => "[default]".dimmed(),
             };
-            let target_repo = p.candidate.as_ref().map(|c| format!("[{}]", c.repo)).unwrap_or_default();
+            let target_repo = p
+                .candidate
+                .as_ref()
+                .map(|c| format!("[{}]", c.repo))
+                .unwrap_or_default();
             println!(
                 "  • {} {:<24} {:<10} : {} ➔ {}  ({})",
                 state_badge,
@@ -609,8 +634,16 @@ pub fn render_transaction_view(
         if is_full {
             println!(
                 "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10} {:>10} {:>11}",
-                "STATE", "PACKAGE", "REPO", "VERSION", "DOWNLOAD", "INSTALLED", "NET DELTA",
-                pw = pkg_w, rw = repo_w, vw = ver_w
+                "STATE",
+                "PACKAGE",
+                "REPO",
+                "VERSION",
+                "DOWNLOAD",
+                "INSTALLED",
+                "NET DELTA",
+                pw = pkg_w,
+                rw = repo_w,
+                vw = ver_w
             );
             println!(
                 "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10} {:>10} {:>11}",
@@ -621,13 +654,22 @@ pub fn render_transaction_view(
                 "──────────",
                 "──────────",
                 "───────────",
-                pw = pkg_w, rw = repo_w, vw = ver_w
+                pw = pkg_w,
+                rw = repo_w,
+                vw = ver_w
             );
         } else if is_medium {
             println!(
                 "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10} {:>10}",
-                "STATE", "PACKAGE", "REPO", "VERSION", "DOWNLOAD", "NET DELTA",
-                pw = pkg_w, rw = repo_w, vw = ver_w
+                "STATE",
+                "PACKAGE",
+                "REPO",
+                "VERSION",
+                "DOWNLOAD",
+                "NET DELTA",
+                pw = pkg_w,
+                rw = repo_w,
+                vw = ver_w
             );
             println!(
                 "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10} {:>10}",
@@ -637,13 +679,21 @@ pub fn render_transaction_view(
                 "─".repeat(ver_w),
                 "──────────",
                 "──────────",
-                pw = pkg_w, rw = repo_w, vw = ver_w
+                pw = pkg_w,
+                rw = repo_w,
+                vw = ver_w
             );
         } else {
             println!(
                 "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10}",
-                "STATE", "PACKAGE", "REPO", "VERSION", "NET DELTA",
-                pw = pkg_w, rw = repo_w, vw = ver_w
+                "STATE",
+                "PACKAGE",
+                "REPO",
+                "VERSION",
+                "NET DELTA",
+                pw = pkg_w,
+                rw = repo_w,
+                vw = ver_w
             );
             println!(
                 "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10}",
@@ -652,7 +702,9 @@ pub fn render_transaction_view(
                 "─".repeat(repo_w),
                 "─".repeat(ver_w),
                 "──────────",
-                pw = pkg_w, rw = repo_w, vw = ver_w
+                pw = pkg_w,
+                rw = repo_w,
+                vw = ver_w
             );
         }
 
@@ -671,31 +723,34 @@ pub fn render_transaction_view(
             let state_str = if p.state == "custom" {
                 custom_count += 1;
                 if p.is_downgrade {
-                    format!("{:<9}", "[down]".red())
+                    format!("{:<9}", "[down]").red()
                 } else if p.update_type == "pin_sync" {
-                    format!("{:<9}", "[sync]".magenta())
+                    format!("{:<9}", "[sync]").magenta()
                 } else {
-                    format!("{:<9}", "[custom]".cyan())
+                    format!("{:<9}", "[custom]").cyan()
                 }
             } else if p.state == "sticky" {
                 sticky_count += 1;
-                format!("{:<9}", "[sticky]".blue())
+                format!("{:<9}", "[sticky]").blue()
             } else {
                 default_count += 1;
-                format!("{:<9}", "[default]".green())
+                format!("{:<9}", "[default]").green()
             };
 
             let repo_raw = format_repo_name(&cand.repo, repo_w);
+            let padded_repo = format!("{:<rw$}", repo_raw, rw = repo_w);
             let repo_str = if p.state == "custom" {
-                format!("{:<rw$}", repo_raw.yellow(), rw = repo_w)
+                padded_repo.yellow()
             } else if p.state == "sticky" {
-                format!("{:<rw$}", repo_raw.blue(), rw = repo_w)
+                padded_repo.blue()
             } else {
-                format!("{:<rw$}", repo_raw.dimmed(), rw = repo_w)
+                padded_repo.dimmed()
             };
 
             let pkg_raw = truncate_str(&p.name, pkg_w);
+            let pkg_str = format!("{:<pw$}", pkg_raw, pw = pkg_w).bold();
             let ver_raw = format_version_diff(&p.installed_ver, &cand.version, ver_w);
+            let ver_str = format!("{:<vw$}", ver_raw, vw = ver_w);
 
             let csize_str = if cand.csize > 0 {
                 format_size(cand.csize)
@@ -707,7 +762,12 @@ pub fn render_transaction_view(
             } else {
                 "-".to_string()
             };
-            let (delta_str, delta_color) = format_delta_text(p.net_delta);
+            let (delta_raw, delta_color) = format_delta_text(p.net_delta);
+
+            let csize_padded = format!("{:>10}", csize_str).dimmed();
+            let isize_padded = format!("{:>10}", isize_str).dimmed();
+            let delta_11 = format!("{:>11}", delta_raw).color(delta_color);
+            let delta_10 = format!("{:>10}", delta_raw).color(delta_color);
 
             tot_csize += cand.csize;
             tot_isize += cand.isize;
@@ -715,36 +775,18 @@ pub fn render_transaction_view(
 
             if is_full {
                 println!(
-                    "  {} {:<pw$} {} {:<vw$} {:>10} {:>10} {:>11}",
-                    state_str,
-                    pkg_raw.bold(),
-                    repo_str,
-                    ver_raw,
-                    csize_str.dimmed(),
-                    isize_str.dimmed(),
-                    delta_str.color(delta_color),
-                    pw = pkg_w, vw = ver_w
+                    "  {} {} {} {} {} {} {}",
+                    state_str, pkg_str, repo_str, ver_str, csize_padded, isize_padded, delta_11
                 );
             } else if is_medium {
                 println!(
-                    "  {} {:<pw$} {} {:<vw$} {:>10} {:>10}",
-                    state_str,
-                    pkg_raw.bold(),
-                    repo_str,
-                    ver_raw,
-                    csize_str.dimmed(),
-                    delta_str.color(delta_color),
-                    pw = pkg_w, vw = ver_w
+                    "  {} {} {} {} {} {}",
+                    state_str, pkg_str, repo_str, ver_str, csize_padded, delta_10
                 );
             } else {
                 println!(
-                    "  {} {:<pw$} {} {:<vw$} {:>10}",
-                    state_str,
-                    pkg_raw.bold(),
-                    repo_str,
-                    ver_raw,
-                    delta_str.color(delta_color),
-                    pw = pkg_w, vw = ver_w
+                    "  {} {} {} {} {}",
+                    state_str, pkg_str, repo_str, ver_str, delta_10
                 );
             }
         }
@@ -753,7 +795,11 @@ pub fn render_transaction_view(
     if !external_updates.is_empty() {
         println!(
             "\n{}",
-            format!("External Package Transactions ({}):", external_updates.len()).bold()
+            format!(
+                "External Package Transactions ({}):",
+                external_updates.len()
+            )
+            .bold()
         );
 
         let rem_ext = avail.saturating_sub(10 + 14 + 3);
@@ -762,8 +808,12 @@ pub fn render_transaction_view(
 
         println!(
             "  {:<10} {:<pw$} {:<14} {:<vw$}",
-            "RUNNER", "PACKAGE / APP ID", "REPO", "TARGET VERSION",
-            pw = ext_pkg_w, vw = ext_ver_w
+            "RUNNER",
+            "PACKAGE / APP ID",
+            "REPO",
+            "TARGET VERSION",
+            pw = ext_pkg_w,
+            vw = ext_ver_w
         );
         println!(
             "  {:<10} {:<pw$} {:<14} {:<vw$}",
@@ -771,19 +821,27 @@ pub fn render_transaction_view(
             "─".repeat(ext_pkg_w),
             "──────────────",
             "─".repeat(ext_ver_w),
-            pw = ext_pkg_w, vw = ext_ver_w
+            pw = ext_pkg_w,
+            vw = ext_ver_w
         );
 
         for ext in external_updates {
             let repo_display = format!("[{}]", ext.repo);
-            println!(
-                "  {:<10} {:<pw$} {:<14} {:<vw$}",
-                ext.runner.cyan(),
-                truncate_str(&ext.name, ext_pkg_w).bold(),
-                truncate_str(&repo_display, 14).dimmed(),
-                truncate_str(&ext.version, ext_ver_w).green(),
-                pw = ext_pkg_w, vw = ext_ver_w
-            );
+            let runner_str = format!("{:<10}", ext.runner).cyan();
+            let name_str = format!(
+                "{:<pw$}",
+                truncate_str(&ext.name, ext_pkg_w),
+                pw = ext_pkg_w
+            )
+            .bold();
+            let repo_str = format!("{:<14}", truncate_str(&repo_display, 14)).dimmed();
+            let ver_str = format!(
+                "{:<vw$}",
+                truncate_str(&ext.version, ext_ver_w),
+                vw = ext_ver_w
+            )
+            .green();
+            println!("  {} {} {} {}", runner_str, name_str, repo_str, ver_str);
         }
     }
 
@@ -845,11 +903,7 @@ pub fn render_transaction_view(
 
     if pacman_count > 0 {
         let s = format!("{} updates", pacman_count);
-        print_card_line(
-            "  • Pacman             : ",
-            &s,
-            s.cyan().to_string(),
-        );
+        print_card_line("  • Pacman             : ", &s, s.cyan().to_string());
     }
 
     if aur_count > 0 {
@@ -860,38 +914,22 @@ pub fn render_transaction_view(
         };
         let label = format!("  • {:<18} : ", helper_title);
         let s = format!("{} updates", aur_count);
-        print_card_line(
-            &label,
-            &s,
-            s.yellow().to_string(),
-        );
+        print_card_line(&label, &s, s.yellow().to_string());
     }
 
     if flatpak_count > 0 {
         let s = format!("{} updates", flatpak_count);
-        print_card_line(
-            "  • Flatpak            : ",
-            &s,
-            s.blue().to_string(),
-        );
+        print_card_line("  • Flatpak            : ", &s, s.blue().to_string());
     }
 
     if nix_count > 0 {
         let s = format!("{} updates", nix_count);
-        print_card_line(
-            "  • Nix                : ",
-            &s,
-            s.magenta().to_string(),
-        );
+        print_card_line("  • Nix                : ", &s, s.magenta().to_string());
     }
 
     if pipx_count > 0 {
         let s = format!("{} updates", pipx_count);
-        print_card_line(
-            "  • Pipx               : ",
-            &s,
-            s.green().to_string(),
-        );
+        print_card_line("  • Pipx               : ", &s, s.green().to_string());
     }
 
     if !held.is_empty() {
@@ -971,18 +1009,32 @@ mod tests {
 
     #[test]
     fn test_parse_selection_indices() {
-        let items = vec!["pkgA".to_string(), "pkgB".to_string(), "pkgC".to_string(), "pkgD".to_string()];
-        
+        let items = vec![
+            "pkgA".to_string(),
+            "pkgB".to_string(),
+            "pkgC".to_string(),
+            "pkgD".to_string(),
+        ];
+
         assert_eq!(parse_selection_indices("", &items), items);
         assert_eq!(parse_selection_indices("all", &items), items);
         assert_eq!(parse_selection_indices("ALL", &items), items);
-        assert_eq!(parse_selection_indices("none", &items), Vec::<String>::new());
+        assert_eq!(
+            parse_selection_indices("none", &items),
+            Vec::<String>::new()
+        );
         assert_eq!(parse_selection_indices("^", &items), Vec::<String>::new());
 
         assert_eq!(parse_selection_indices("1 3", &items), vec!["pkgA", "pkgC"]);
         assert_eq!(parse_selection_indices("1-2", &items), vec!["pkgA", "pkgB"]);
-        assert_eq!(parse_selection_indices("2-4", &items), vec!["pkgB", "pkgC", "pkgD"]);
-        assert_eq!(parse_selection_indices("^2", &items), vec!["pkgA", "pkgC", "pkgD"]);
+        assert_eq!(
+            parse_selection_indices("2-4", &items),
+            vec!["pkgB", "pkgC", "pkgD"]
+        );
+        assert_eq!(
+            parse_selection_indices("^2", &items),
+            vec!["pkgA", "pkgC", "pkgD"]
+        );
     }
 
     #[test]
@@ -995,16 +1047,29 @@ mod tests {
     #[test]
     fn test_format_repo_name() {
         assert_eq!(format_repo_name("core", 10), "[core]");
-        assert_eq!(format_repo_name("cachyos-extra-v3", 18), "[cachyos-extra-v3]");
+        assert_eq!(
+            format_repo_name("cachyos-extra-v3", 18),
+            "[cachyos-extra-v3]"
+        );
         assert_eq!(format_repo_name("cachyos-extra-v3", 14), "[c-extra-v3]");
     }
 
     #[test]
     fn test_format_version_diff() {
         assert_eq!(format_version_diff("1.0", "1.1", 20), "1.0 ➔ 1.1");
-        assert_eq!(format_version_diff("3:26.2.2-2", "3:26.2.3-1", 20), "26.2.2-2 ➔ 26.2.3-1");
+        assert_eq!(
+            format_version_diff("3:26.2.2-2", "3:26.2.3-1", 20),
+            "26.2.2-2 ➔ 26.2.3-1"
+        );
+    }
+
+    #[test]
+    fn test_colored_padding_alignment() {
+        let down_padded = format!("{:<9}", "[down]");
+        let default_padded = format!("{:<9}", "[default]");
+        assert_eq!(str_width(&down_padded), 9);
+        assert_eq!(str_width(&default_padded), 9);
+        assert_eq!(down_padded, "[down]   ");
+        assert_eq!(default_padded, "[default]");
     }
 }
-
-
-

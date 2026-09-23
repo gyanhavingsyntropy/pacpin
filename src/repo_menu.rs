@@ -44,7 +44,11 @@ pub fn run_repo_menu(initial_repos: &[String]) -> Option<Vec<String>> {
     }
 
     let mut repos: Vec<String> = if initial_repos.is_empty() {
-        vec!["core".to_string(), "extra".to_string(), "multilib".to_string()]
+        vec![
+            "core".to_string(),
+            "extra".to_string(),
+            "multilib".to_string(),
+        ]
     } else {
         initial_repos.to_vec()
     };
@@ -93,6 +97,11 @@ pub fn run_repo_menu(initial_repos: &[String]) -> Option<Vec<String>> {
             code, modifiers, ..
         })) = event::read()
         {
+            if modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(code, KeyCode::Char('c') | KeyCode::Char('C'))
+            {
+                return None;
+            }
             if adding_mode {
                 match code {
                     KeyCode::Enter => {
@@ -110,10 +119,8 @@ pub fn run_repo_menu(initial_repos: &[String]) -> Option<Vec<String>> {
                             } else {
                                 repos.insert(selected + 1, trimmed.to_string());
                                 selected += 1;
-                                status_msg = Some((
-                                    format!("Added repository '[{}]'", trimmed),
-                                    false,
-                                ));
+                                status_msg =
+                                    Some((format!("Added repository '[{}]'", trimmed), false));
                                 adding_mode = false;
                                 add_input.clear();
                             }
@@ -134,7 +141,9 @@ pub fn run_repo_menu(initial_repos: &[String]) -> Option<Vec<String>> {
                         add_input.pop();
                     }
                     KeyCode::Char(c) => {
-                        if add_input.len() < 32 && (c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                        if add_input.len() < 32
+                            && (c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                        {
                             add_input.push(c);
                         }
                     }
@@ -197,15 +206,11 @@ pub fn run_repo_menu(initial_repos: &[String]) -> Option<Vec<String>> {
                             if selected >= repos.len() {
                                 selected = repos.len() - 1;
                             }
-                            status_msg = Some((
-                                format!("Removed repository '[{}]'", removed),
-                                false,
-                            ));
+                            status_msg =
+                                Some((format!("Removed repository '[{}]'", removed), false));
                         } else {
-                            status_msg = Some((
-                                "Cannot remove the last repository".to_string(),
-                                true,
-                            ));
+                            status_msg =
+                                Some(("Cannot remove the last repository".to_string(), true));
                         }
                     }
                     // Save and exit
@@ -216,11 +221,7 @@ pub fn run_repo_menu(initial_repos: &[String]) -> Option<Vec<String>> {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                         return None;
                     }
-                    _ => {
-                        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
-                            return None;
-                        }
-                    }
+                    _ => {}
                 }
             }
         }
@@ -359,7 +360,12 @@ fn render_menu_ui<W: Write>(
         let prompt_text = format!(" Enter repository name: {}█", add_input);
         let raw_len = prompt_text.len();
         let pad = inner_width.saturating_sub(raw_len);
-        let line1 = format!("│{}{}{}│\r\n", prompt_text.yellow().bold(), " ".repeat(pad), "");
+        let line1 = format!(
+            "│{}{}{}│\r\n",
+            prompt_text.yellow().bold(),
+            " ".repeat(pad),
+            ""
+        );
         let _ = queue!(out, Print(line1));
 
         let help = " [Enter] Confirm   [Esc] Cancel";
@@ -369,22 +375,12 @@ fn render_menu_ui<W: Write>(
     } else {
         let help1 = " [↑/↓] or [k/j] Select    [+/-] Move Priority    [a] Add Repo";
         let help1_pad = inner_width.saturating_sub(help1.len());
-        let line1 = format!(
-            "│{}{}{}│\r\n",
-            help1.cyan(),
-            " ".repeat(help1_pad),
-            ""
-        );
+        let line1 = format!("│{}{}{}│\r\n", help1.cyan(), " ".repeat(help1_pad), "");
         let _ = queue!(out, Print(line1));
 
         let help2 = " [d] Delete Repo          [Enter] Save Order     [Esc/q] Cancel";
         let help2_pad = inner_width.saturating_sub(help2.len());
-        let line2 = format!(
-            "│{}{}{}│\r\n",
-            help2.dimmed(),
-            " ".repeat(help2_pad),
-            ""
-        );
+        let line2 = format!("│{}{}{}│\r\n", help2.dimmed(), " ".repeat(help2_pad), "");
         let _ = queue!(out, Print(line2));
     }
 

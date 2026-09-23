@@ -37,7 +37,13 @@ pub struct CheckboxItem {
 }
 
 impl CheckboxItem {
-    pub fn new(id: impl Into<String>, label: impl Into<String>, description: impl Into<String>, is_pure: bool, checked: bool) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        description: impl Into<String>,
+        is_pure: bool,
+        checked: bool,
+    ) -> Self {
         Self {
             id: id.into(),
             label: label.into(),
@@ -139,6 +145,11 @@ pub fn run_checkbox_menu(
             code, modifiers, ..
         })) = event::read()
         {
+            if modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(code, KeyCode::Char('c') | KeyCode::Char('C'))
+            {
+                return None;
+            }
             if search_mode {
                 match code {
                     KeyCode::Enter => {
@@ -245,11 +256,7 @@ pub fn run_checkbox_menu(
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                         return None;
                     }
-                    _ => {
-                        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
-                            return None;
-                        }
-                    }
+                    _ => {}
                 }
             }
         }
@@ -305,14 +312,24 @@ fn render_checkbox_ui<W: Write>(
     let bar1_pad = inner_width.saturating_sub(bar1.len());
     let _ = queue!(
         out,
-        Print(format!("│{}{}{}│\r\n", bar1.cyan(), " ".repeat(bar1_pad), ""))
+        Print(format!(
+            "│{}{}{}│\r\n",
+            bar1.cyan(),
+            " ".repeat(bar1_pad),
+            ""
+        ))
     );
 
     let bar2 = " [↑/↓] Navigate    [PgUp/Dn] Scroll        [/] Search     [Enter] Confirm";
     let bar2_pad = inner_width.saturating_sub(bar2.len());
     let _ = queue!(
         out,
-        Print(format!("│{}{}{}│\r\n", bar2.dimmed(), " ".repeat(bar2_pad), ""))
+        Print(format!(
+            "│{}{}{}│\r\n",
+            bar2.dimmed(),
+            " ".repeat(bar2_pad),
+            ""
+        ))
     );
 
     let _ = queue!(out, Print(border_color(&div)));
@@ -323,14 +340,20 @@ fn render_checkbox_ui<W: Write>(
         let more_pad = inner_width.saturating_sub(more_top.len());
         let _ = queue!(
             out,
-            Print(format!("│{}{}{}│\r\n", more_top.yellow().bold(), " ".repeat(more_pad), ""))
+            Print(format!(
+                "│{}{}{}│\r\n",
+                more_top.yellow().bold(),
+                " ".repeat(more_pad),
+                ""
+            ))
         );
     } else {
         let _ = queue!(out, Print(format!("│{}│\r\n", " ".repeat(inner_width))));
     }
 
     // Visible Items
-    let visible_indices = &matching_indices[viewport_offset..matching_indices.len().min(viewport_offset + max_visible)];
+    let visible_indices = &matching_indices
+        [viewport_offset..matching_indices.len().min(viewport_offset + max_visible)];
     for (rel_i, &real_idx) in visible_indices.iter().enumerate() {
         let is_cursor = (viewport_offset + rel_i) == selected;
         let item = &items[real_idx];
@@ -408,20 +431,23 @@ fn render_checkbox_ui<W: Write>(
     let status_str = if remaining_below > 0 {
         format!(
             "   ▼ {} more below... (Selected: {}/{} items)",
-            remaining_below, checked_count, items.len()
+            remaining_below,
+            checked_count,
+            items.len()
         )
     } else {
-        format!(
-            "   (Selected: {}/{} items)",
-            checked_count, items.len()
-        )
+        format!("   (Selected: {}/{} items)", checked_count, items.len())
     };
     let status_pad = inner_width.saturating_sub(status_str.len());
     let _ = queue!(
         out,
         Print(format!(
             "│{}{}{}│\r\n",
-            if remaining_below > 0 { status_str.yellow().bold() } else { status_str.dimmed() },
+            if remaining_below > 0 {
+                status_str.yellow().bold()
+            } else {
+                status_str.dimmed()
+            },
             " ".repeat(status_pad),
             ""
         ))
@@ -435,21 +461,39 @@ fn render_checkbox_ui<W: Write>(
         let s_pad = inner_width.saturating_sub(search_text.len());
         let _ = queue!(
             out,
-            Print(format!("│{}{}{}│\r\n", search_text.yellow().bold(), " ".repeat(s_pad), ""))
+            Print(format!(
+                "│{}{}{}│\r\n",
+                search_text.yellow().bold(),
+                " ".repeat(s_pad),
+                ""
+            ))
         );
     } else if !search_query.is_empty() {
-        let search_text = format!(" Filter active: '{}' ({} matches) - press [/] to edit", search_query, total_matched);
+        let search_text = format!(
+            " Filter active: '{}' ({} matches) - press [/] to edit",
+            search_query, total_matched
+        );
         let s_pad = inner_width.saturating_sub(search_text.len());
         let _ = queue!(
             out,
-            Print(format!("│{}{}{}│\r\n", search_text.cyan(), " ".repeat(s_pad), ""))
+            Print(format!(
+                "│{}{}{}│\r\n",
+                search_text.cyan(),
+                " ".repeat(s_pad),
+                ""
+            ))
         );
     } else {
         let footer = " [Enter] Confirm Selection    [Esc/q] Cancel / Abort";
         let f_pad = inner_width.saturating_sub(footer.len());
         let _ = queue!(
             out,
-            Print(format!("│{}{}{}│\r\n", footer.dimmed(), " ".repeat(f_pad), ""))
+            Print(format!(
+                "│{}{}{}│\r\n",
+                footer.dimmed(),
+                " ".repeat(f_pad),
+                ""
+            ))
         );
     }
 

@@ -23,11 +23,11 @@ use std::thread;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalUpdate {
-    pub runner: String,     // e.g. "Flatpak", "Nix"
-    pub id: String,         // e.g. "io.mrarm.mcpelauncher"
-    pub name: String,       // e.g. "Minecraft Bedrock Launcher"
-    pub repo: String,       // e.g. "flathub", "nixpkgs"
-    pub version: String,    // e.g. "v1.8.5"
+    pub runner: String,  // e.g. "Flatpak", "Nix"
+    pub id: String,      // e.g. "io.mrarm.mcpelauncher"
+    pub name: String,    // e.g. "Minecraft Bedrock Launcher"
+    pub repo: String,    // e.g. "flathub", "nixpkgs"
+    pub version: String, // e.g. "v1.8.5"
 }
 
 pub trait IntegrationProvider: Send + Sync {
@@ -39,6 +39,9 @@ pub trait IntegrationProvider: Send + Sync {
     fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> Result<bool, std::io::Error>;
     fn clean_command_str(&self) -> String;
     fn execute_clean(&self) -> Result<bool, std::io::Error>;
+    fn supports_clean(&self) -> bool {
+        true
+    }
 }
 
 pub struct FlatpakProvider;
@@ -88,9 +91,21 @@ impl IntegrationProvider for FlatpakProvider {
                             results.push(ExternalUpdate {
                                 runner: "Flatpak".to_string(),
                                 id: app_id,
-                                name: if name.is_empty() { parts[1].to_string() } else { name },
-                                repo: if origin.is_empty() { "flathub".to_string() } else { origin },
-                                version: if ver.is_empty() { "update".to_string() } else { ver },
+                                name: if name.is_empty() {
+                                    parts[1].to_string()
+                                } else {
+                                    name
+                                },
+                                repo: if origin.is_empty() {
+                                    "flathub".to_string()
+                                } else {
+                                    origin
+                                },
+                                version: if ver.is_empty() {
+                                    "update".to_string()
+                                } else {
+                                    ver
+                                },
                             });
                         }
                     }
@@ -147,7 +162,11 @@ impl IntegrationProvider for NixProvider {
     }
 
     fn refresh_metadata(&self) -> Result<(), std::io::Error> {
-        if Command::new("nix-channel").arg("--version").output().is_ok() {
+        if Command::new("nix-channel")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
             let _ = Command::new("nix-channel").arg("--update").output()?;
         }
         Ok(())
@@ -155,9 +174,7 @@ impl IntegrationProvider for NixProvider {
 
     fn check_updates(&self) -> Vec<ExternalUpdate> {
         // Check outdated packages via nix-env or nix profile
-        let output = Command::new("nix-env")
-            .args(&["-q", "--outdated"])
-            .output();
+        let output = Command::new("nix-env").args(&["-q", "--outdated"]).output();
 
         let mut results = Vec::new();
         if let Ok(out) = output {
@@ -204,9 +221,7 @@ impl IntegrationProvider for NixProvider {
     }
 
     fn execute_clean(&self) -> Result<bool, std::io::Error> {
-        let status = Command::new("nix-collect-garbage")
-            .arg("-d")
-            .status()?;
+        let status = Command::new("nix-collect-garbage").arg("-d").status()?;
         Ok(status.success())
     }
 }
@@ -231,9 +246,7 @@ impl IntegrationProvider for PipxProvider {
     }
 
     fn check_updates(&self) -> Vec<ExternalUpdate> {
-        let output = Command::new("pipx")
-            .args(&["list", "--json"])
-            .output();
+        let output = Command::new("pipx").args(&["list", "--json"]).output();
 
         let mut results = Vec::new();
         if let Ok(out) = output {
@@ -242,7 +255,8 @@ impl IntegrationProvider for PipxProvider {
                     if let Some(venvs) = v.get("venvs").and_then(|v| v.as_object()) {
                         let mut targets = Vec::new();
                         for (app_name, info) in venvs {
-                            let installed_ver = info.get("metadata")
+                            let installed_ver = info
+                                .get("metadata")
                                 .and_then(|m| m.get("main_package"))
                                 .and_then(|p| p.get("package_version"))
                                 .and_then(|v| v.as_str())
@@ -255,7 +269,9 @@ impl IntegrationProvider for PipxProvider {
 
                         let agent = ureq::AgentBuilder::new()
                             .timeout(std::time::Duration::from_secs(3))
-                            .user_agent("pacpin/3.1 (GPLv3; +https://github.com/gyanhavingsyntropy/pacpin)")
+                            .user_agent(
+                                "pacpin/3.1 (GPLv3; +https://github.com/gyanhavingsyntropy/pacpin)",
+                            )
                             .build();
 
                         let arc_targets = std::sync::Arc::new(targets);
@@ -267,14 +283,25 @@ impl IntegrationProvider for PipxProvider {
                             let agent_clone = agent.clone();
                             handles.push(std::thread::spawn(move || {
                                 let mut worker_results = Vec::new();
-                                for (i, (app_name, installed_ver)) in targets_clone.iter().enumerate() {
+                                for (i, (app_name, installed_ver)) in
+                                    targets_clone.iter().enumerate()
+                                {
                                     if i % num_workers == worker_idx {
-                                        let pypi_url = format!("https://pypi.org/pypi/{}/json", app_name);
+                                        let pypi_url =
+                                            format!("https://pypi.org/pypi/{}/json", app_name);
                                         if let Ok(resp) = agent_clone.get(&pypi_url).call() {
                                             if resp.status() == 200 {
-                                                if let Ok(json) = resp.into_json::<serde_json::Value>() {
-                                                    if let Some(latest_ver) = json.get("info").and_then(|info| info.get("version")).and_then(|v| v.as_str()) {
-                                                        if alpm::vercmp(latest_ver, installed_ver) == std::cmp::Ordering::Greater {
+                                                if let Ok(json) =
+                                                    resp.into_json::<serde_json::Value>()
+                                                {
+                                                    if let Some(latest_ver) = json
+                                                        .get("info")
+                                                        .and_then(|info| info.get("version"))
+                                                        .and_then(|v| v.as_str())
+                                                    {
+                                                        if alpm::vercmp(latest_ver, installed_ver)
+                                                            == std::cmp::Ordering::Greater
+                                                        {
                                                             worker_results.push(ExternalUpdate {
                                                                 runner: "Pipx".to_string(),
                                                                 id: app_name.clone(),
@@ -320,6 +347,10 @@ impl IntegrationProvider for PipxProvider {
 
     fn execute_clean(&self) -> Result<bool, std::io::Error> {
         Ok(true)
+    }
+
+    fn supports_clean(&self) -> bool {
+        false
     }
 }
 
@@ -378,7 +409,9 @@ impl IntegrationsManager {
         }
     }
 
-    pub fn check_updates_parallel(providers: &[Arc<dyn IntegrationProvider>]) -> Vec<ExternalUpdate> {
+    pub fn check_updates_parallel(
+        providers: &[Arc<dyn IntegrationProvider>],
+    ) -> Vec<ExternalUpdate> {
         if providers.is_empty() {
             return Vec::new();
         }
@@ -430,11 +463,17 @@ impl IntegrationsManager {
                     outcomes.push((p.name().to_string(), cmd_str, true));
                 }
                 Ok(false) => {
-                    eprintln!("{}", format!("Warning: {} upgrade exited with errors.", p.name()).yellow());
+                    eprintln!(
+                        "{}",
+                        format!("Warning: {} upgrade exited with errors.", p.name()).yellow()
+                    );
                     outcomes.push((p.name().to_string(), cmd_str, false));
                 }
                 Err(e) => {
-                    eprintln!("{}", format!("Failed to run {} upgrade: {}", p.name(), e).red());
+                    eprintln!(
+                        "{}",
+                        format!("Failed to run {} upgrade: {}", p.name(), e).red()
+                    );
                     outcomes.push((p.name().to_string(), cmd_str, false));
                 }
             }
@@ -444,6 +483,9 @@ impl IntegrationsManager {
 
     pub fn execute_cleanups(providers: &[Arc<dyn IntegrationProvider>]) {
         for p in providers {
+            if !p.supports_clean() {
+                continue;
+            }
             println!(
                 "\n{} Cleaning {} unused packages ({})...",
                 "::".cyan(),
@@ -455,10 +497,16 @@ impl IntegrationsManager {
                     println!("✔ {} cleanup completed successfully.", p.name().green());
                 }
                 Ok(false) => {
-                    eprintln!("{}", format!("Warning: {} cleanup exited with errors.", p.name()).yellow());
+                    eprintln!(
+                        "{}",
+                        format!("Warning: {} cleanup exited with errors.", p.name()).yellow()
+                    );
                 }
                 Err(e) => {
-                    eprintln!("{}", format!("Failed to run {} cleanup: {}", p.name(), e).red());
+                    eprintln!(
+                        "{}",
+                        format!("Failed to run {} cleanup: {}", p.name(), e).red()
+                    );
                 }
             }
         }
@@ -498,5 +546,15 @@ mod tests {
         let config = Config::default();
         let providers = IntegrationsManager::get_active_providers(&config);
         assert!(providers.is_empty());
+    }
+
+    #[test]
+    fn test_provider_supports_clean() {
+        let flatpak = FlatpakProvider;
+        let nix = NixProvider;
+        let pipx = PipxProvider;
+        assert!(flatpak.supports_clean());
+        assert!(nix.supports_clean());
+        assert!(!pipx.supports_clean());
     }
 }

@@ -29,9 +29,14 @@ pub fn validate_helper(helper: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("AUR helper name cannot be empty.".to_string());
     }
-    let forbidden = [';', '&', '|', '`', '$', ' ', '\t', '\n', '\r', '(', ')', '{', '}', '<', '>', '~'];
+    let forbidden = [
+        ';', '&', '|', '`', '$', ' ', '\t', '\n', '\r', '(', ')', '{', '}', '<', '>', '~',
+    ];
     if trimmed.chars().any(|c| forbidden.contains(&c)) {
-        return Err(format!("AUR helper '{}' contains illegal shell characters.", trimmed));
+        return Err(format!(
+            "AUR helper '{}' contains illegal shell characters.",
+            trimmed
+        ));
     }
     if SAFE_AUR_HELPERS.contains(&trimmed) {
         return Ok(trimmed.to_string());
@@ -156,13 +161,21 @@ where
 }
 
 pub fn get_config_path() -> PathBuf {
+    if let Ok(xdg_config) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg_config.trim().is_empty() {
+            return Path::new(&xdg_config).join("pacpin").join("config.toml");
+        }
+    }
     let home = std::env::var("HOME").ok().filter(|h| !h.trim().is_empty());
     if let Some(h) = home {
-        Path::new(&h).join(".config").join("pacpin").join("config.toml")
+        Path::new(&h)
+            .join(".config")
+            .join("pacpin")
+            .join("config.toml")
     } else {
         eprintln!(
             "{}",
-            "Error: $HOME environment variable is not set. Cannot securely locate configuration directory."
+            "Error: Neither $XDG_CONFIG_HOME nor $HOME is set. Cannot securely locate configuration directory."
                 .red()
                 .bold()
         );
@@ -185,7 +198,12 @@ pub fn load_config() -> Config {
             Err(e) => {
                 eprintln!(
                     "{}",
-                    format!("Error: Failed to parse configuration file ({}):", path.display()).red().bold()
+                    format!(
+                        "Error: Failed to parse configuration file ({}):",
+                        path.display()
+                    )
+                    .red()
+                    .bold()
                 );
                 eprintln!("  {}", e);
                 eprintln!("Please fix the syntax error in your config.toml before proceeding.");
@@ -195,7 +213,13 @@ pub fn load_config() -> Config {
         Err(e) => {
             eprintln!(
                 "{}",
-                format!("Error: Failed to read configuration file ({}): {}", path.display(), e).red().bold()
+                format!(
+                    "Error: Failed to read configuration file ({}): {}",
+                    path.display(),
+                    e
+                )
+                .red()
+                .bold()
             );
             std::process::exit(1);
         }
@@ -242,7 +266,10 @@ pub fn save_config_to_path(config: &Config, path: &Path) -> Result<(), std::io::
                 .unwrap_or(0);
             random_bytes = (nanos as u64 ^ (std::process::id() as u64)).to_le_bytes();
         }
-        let hex = random_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let hex = random_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
         let candidate = parent.join(format!(".config.toml.tmp.{}_{}", std::process::id(), hex));
 
         let mut opts = fs::OpenOptions::new();
@@ -377,7 +404,9 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("pacpin_test_cfg_{}", std::process::id()));
         let cfg_path = temp_dir.join("config.toml");
         let mut config = Config::default();
-        config.pins.insert("test-pkg".to_string(), "extra".to_string());
+        config
+            .pins
+            .insert("test-pkg".to_string(), "extra".to_string());
 
         assert!(save_config_to_path(&config, &cfg_path).is_ok());
         assert!(cfg_path.exists());
@@ -387,10 +416,11 @@ mod tests {
         assert!(content.contains("extra"));
 
         // Ensure no leftover temp files exist
-        let leftover = fs::read_dir(&temp_dir)
-            .unwrap()
-            .flatten()
-            .any(|e| e.file_name().to_string_lossy().starts_with(".config.toml.tmp"));
+        let leftover = fs::read_dir(&temp_dir).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".config.toml.tmp")
+        });
         assert!(!leftover);
 
         let _ = fs::remove_dir_all(&temp_dir);

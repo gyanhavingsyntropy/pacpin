@@ -40,6 +40,10 @@ pub fn query_aur(pkg_names: &[String]) -> HashMap<String, AurItem> {
     if pkg_names.is_empty() {
         return results;
     }
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(6))
+        .user_agent("pacpin/3.1 (GPLv3)")
+        .build();
 
     for chunk in pkg_names.chunks(50) {
         let params: Vec<String> = chunk
@@ -59,11 +63,7 @@ pub fn query_aur(pkg_names: &[String]) -> HashMap<String, AurItem> {
                 std::thread::sleep(std::time::Duration::from_millis(400 * attempts as u64));
             }
 
-            match ureq::get(&url)
-                .set("User-Agent", "pacpin/3.1 (GPLv3)")
-                .timeout(std::time::Duration::from_secs(6))
-                .call()
-            {
+            match agent.get(&url).call() {
                 Ok(resp) => match resp.into_json::<AurResponse>() {
                     Ok(data) => {
                         for item in data.results {

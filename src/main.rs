@@ -36,7 +36,7 @@ use db::AlpmManager;
 use integrations::IntegrationsManager;
 use journal::TransactionJournal;
 use orphans::OrphanManager;
-use resolver::{ResolverEngine, ResolvedPackage};
+use resolver::{ResolvedPackage, ResolverEngine};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::io::{self, IsTerminal, Write};
@@ -45,10 +45,15 @@ use std::process::{exit, Command};
 use ui::{print_banner, prompt_multiselect, render_transaction_view};
 
 fn check_pacman_lock() {
-    if Path::new("/var/lib/pacman/db.lck").exists() {
+    let lock_path = AlpmManager::get_dbpath().join("db.lck");
+    if lock_path.exists() {
         eprintln!(
             "{}",
-            "Error: Pacman database is locked (/var/lib/pacman/db.lck).".red()
+            format!(
+                "Error: Pacman database is locked ({}).",
+                lock_path.display()
+            )
+            .red()
         );
         eprintln!("Another package management process is currently running. Exiting.");
         exit(1);
@@ -70,11 +75,14 @@ fn cmd_check(config: &Config) {
     let local_pkgs = alpm.localdb().pkgs();
 
     let glob_pins = ResolverEngine::compile_glob_pins(&config.pins);
-    let syncdb_map: HashMap<&str, &alpm::Db> = alpm.syncdbs().into_iter().map(|d| (d.name(), d)).collect();
+    let syncdb_map: HashMap<&str, &alpm::Db> =
+        alpm.syncdbs().into_iter().map(|d| (d.name(), d)).collect();
 
     let mut custom_pkgs = Vec::new();
     for p in local_pkgs {
-        if let Some(target_repo) = ResolverEngine::match_pinned_package(p.name(), &config.pins, &glob_pins) {
+        if let Some(target_repo) =
+            ResolverEngine::match_pinned_package(p.name(), &config.pins, &glob_pins)
+        {
             let mut cand_ver = "pinned".to_string();
             if let Some(&db) = syncdb_map.get(target_repo.as_str()) {
                 if let Ok(cand) = db.pkg(p.name()) {
@@ -133,8 +141,14 @@ fn cmd_check(config: &Config) {
     }
 }
 
-
-fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, autoremove: bool, extra_flags: &[String]) {
+fn cmd_upgrade(
+    config: &Config,
+    dry_run: bool,
+    refresh: bool,
+    noconfirm: bool,
+    autoremove: bool,
+    extra_flags: &[String],
+) {
     check_pacman_lock();
     print_banner();
 
@@ -145,15 +159,17 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
             "{}",
             ":: Refreshing package databases (sudo pacman -Sy)...".cyan()
         );
-        let status = Command::new("sudo")
-            .args(["pacman", "-Sy"])
-            .status();
+        let status = Command::new("sudo").args(["pacman", "-Sy"]).status();
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => {
                 eprintln!(
                     "{}",
-                    format!("Error: Database refresh failed with exit code {}.", s.code().unwrap_or(1)).red()
+                    format!(
+                        "Error: Database refresh failed with exit code {}.",
+                        s.code().unwrap_or(1)
+                    )
+                    .red()
                 );
                 exit(s.code().unwrap_or(1));
             }
@@ -286,7 +302,10 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
         if !targets_to_show.is_empty() {
             let names: Vec<String> = targets_to_show.iter().map(|o| o.name.clone()).collect();
             println!("{}", "Dry-Run: Projected Orphan Removal Command:".bold());
-            println!("  ➔ {}\n", format!("sudo pacman -Rns --noconfirm {}", names.join(" ")).cyan());
+            println!(
+                "  ➔ {}\n",
+                format!("sudo pacman -Rns --noconfirm {}", names.join(" ")).cyan()
+            );
         }
         return;
     }
@@ -474,7 +493,6 @@ fn cmd_upgrade(config: &Config, dry_run: bool, refresh: bool, noconfirm: bool, a
     }
 }
 
-
 fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
     if targets.is_empty() {
         eprintln!("{}", "Error: No package targets specified.".red());
@@ -503,15 +521,17 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
             "{}",
             ":: Refreshing package databases (sudo pacman -Sy)...".cyan()
         );
-        let status = Command::new("sudo")
-            .args(["pacman", "-Sy"])
-            .status();
+        let status = Command::new("sudo").args(["pacman", "-Sy"]).status();
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => {
                 eprintln!(
                     "{}",
-                    format!("Error: Database refresh failed with exit code {}.", s.code().unwrap_or(1)).red()
+                    format!(
+                        "Error: Database refresh failed with exit code {}.",
+                        s.code().unwrap_or(1)
+                    )
+                    .red()
                 );
                 exit(s.code().unwrap_or(1));
             }
@@ -573,7 +593,27 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
                 }
             }
         } else {
-            pacman_targets.push(target.clone());
+            let exists_in_sync = manager
+                .handle()
+                .syncdbs()
+                .into_iter()
+                .any(|db| db.pkg(target.as_str()).is_ok());
+            if exists_in_sync {
+                pacman_targets.push(target.clone());
+            } else {
+                // Query the AUR only after ruling out every configured sync
+                // repository, so unqualified AUR packages work like they do in
+                // modern Arch helpers without changing official-package routing.
+                let aur_query = vec![target.clone()];
+                if aur::query_aur(&aur_query).contains_key(target) {
+                    aur_targets.push(target.clone());
+                    pending_pins.push((target.clone(), "aur".to_string()));
+                } else {
+                    // Preserve pacman's normal error reporting for packages
+                    // unknown to both the configured repos and the AUR.
+                    pacman_targets.push(target.clone());
+                }
+            }
         }
     }
 
@@ -722,9 +762,9 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
     if !installed_targets.is_empty() {
         let mut confirmed_pins_added = false;
         for (pkg_name, repo_name) in pending_pins {
-            let was_installed = installed_targets.iter().any(|t| {
-                t == &pkg_name || t == &format!("{}/{}", repo_name, pkg_name)
-            });
+            let was_installed = installed_targets
+                .iter()
+                .any(|t| t == &pkg_name || t == &format!("{}/{}", repo_name, pkg_name));
             if was_installed {
                 config.pins.insert(pkg_name, repo_name);
                 confirmed_pins_added = true;
@@ -733,9 +773,15 @@ fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
 
         if confirmed_pins_added && !dry_run {
             if let Err(e) = save_config(&config) {
-                eprintln!("{}", format!("Warning: Failed to save pins to configuration: {}", e).yellow());
+                eprintln!(
+                    "{}",
+                    format!("Warning: Failed to save pins to configuration: {}", e).yellow()
+                );
             } else {
-                println!("{}", "✔ Configuration updated with confirmed repository pins.".green());
+                println!(
+                    "{}",
+                    "✔ Configuration updated with confirmed repository pins.".green()
+                );
             }
         }
         let tx_packages: Vec<serde_json::Value> = installed_targets
@@ -779,7 +825,11 @@ fn cmd_list(config: &Config) {
     println!("\n{}", "Active Engine Features:".bold());
     println!(
         "  • Repository Pinning:      {}",
-        if config.features.pinning { "Enabled".green() } else { "Disabled".dimmed() }
+        if config.features.pinning {
+            "Enabled".green()
+        } else {
+            "Disabled".dimmed()
+        }
     );
     println!(
         "  • Vendor Stickiness:       {}",
@@ -791,11 +841,19 @@ fn cmd_list(config: &Config) {
     );
     println!(
         "  • Smart Orphan Lifecycle:  {}",
-        if config.features.smart_orphans { "Enabled".green() } else { "Disabled".dimmed() }
+        if config.features.smart_orphans {
+            "Enabled".green()
+        } else {
+            "Disabled".dimmed()
+        }
     );
     println!(
         "  • Stability Delay Buffers: {}",
-        if config.features.stability_delays { "Enabled".green() } else { "Disabled".dimmed() }
+        if config.features.stability_delays {
+            "Enabled".green()
+        } else {
+            "Disabled".dimmed()
+        }
     );
     let ext_status = if config.features.integrations {
         let mut enabled_exts = Vec::new();
@@ -811,7 +869,9 @@ fn cmd_list(config: &Config) {
         if enabled_exts.is_empty() {
             "Enabled (none active)".yellow().to_string()
         } else {
-            format!("Enabled ({})", enabled_exts.join(", ")).green().to_string()
+            format!("Enabled ({})", enabled_exts.join(", "))
+                .green()
+                .to_string()
         }
     } else {
         "Disabled".dimmed().to_string()
@@ -826,7 +886,9 @@ fn cmd_list(config: &Config) {
             let prio = if i == 0 {
                 "(Priority 1 - Highest)".green().bold().to_string()
             } else if i == config.repo_order.len() - 1 {
-                format!("(Priority {} - Lowest)", i + 1).dimmed().to_string()
+                format!("(Priority {} - Lowest)", i + 1)
+                    .dimmed()
+                    .to_string()
             } else {
                 format!("(Priority {})", i + 1).cyan().to_string()
             };
@@ -866,12 +928,15 @@ fn cmd_list(config: &Config) {
     let local_pkgs = alpm.localdb().pkgs();
     let glob_pins = ResolverEngine::compile_glob_pins(&config.pins);
     let glob_delays = ResolverEngine::compile_glob_delays(&config.delay);
-    let syncdb_map: HashMap<&str, &alpm::Db> = alpm.syncdbs().into_iter().map(|d| (d.name(), d)).collect();
+    let syncdb_map: HashMap<&str, &alpm::Db> =
+        alpm.syncdbs().into_iter().map(|d| (d.name(), d)).collect();
     let installed_dbs = ResolverEngine::load_installed_dbs();
 
     let mut custom_matches = Vec::new();
     for p in local_pkgs {
-        if let Some((_, target_repo, _)) = ResolverEngine::find_matching_pin_rule(p.name(), &config.pins, &glob_pins) {
+        if let Some((_, target_repo, _)) =
+            ResolverEngine::find_matching_pin_rule(p.name(), &config.pins, &glob_pins)
+        {
             let inst_db = installed_dbs.get(p.name()).cloned().unwrap_or_default();
             let mut cand_info = None;
             if let Some(&db) = syncdb_map.get(target_repo.as_str()) {
@@ -884,7 +949,14 @@ fn cmd_list(config: &Config) {
             } else {
                 None
             };
-            custom_matches.push((p.name().to_string(), p.version().to_string(), inst_db, target_repo, cand_info, delay_info));
+            custom_matches.push((
+                p.name().to_string(),
+                p.version().to_string(),
+                inst_db,
+                target_repo,
+                cand_info,
+                delay_info,
+            ));
         }
     }
     custom_matches.sort_by(|a, b| a.0.cmp(&b.0));
@@ -902,13 +974,13 @@ fn cmd_list(config: &Config) {
             let mut status_str = if let Some((repo, version)) = cand_info {
                 format!("➔ [{}] {}", repo, version)
             } else {
-                format!(
-                    "➔ {}",
-                    format!("[{}] NOT FOUND", pinned_repo).red()
-                )
+                format!("➔ {}", format!("[{}] NOT FOUND", pinned_repo).red())
             };
             if let Some(days) = delay_info {
-                status_str.push_str(&format!(" {}", format!("[DELAYED - {}d buffer]", days).yellow()));
+                status_str.push_str(&format!(
+                    " {}",
+                    format!("[DELAYED - {}d buffer]", days).yellow()
+                ));
             }
             let inst_db_str = if !inst_db.is_empty() {
                 format!(" (installed from [{}])", inst_db)
@@ -956,7 +1028,9 @@ fn cmd_repos(mut config: Config) {
             let prio = if i == 0 {
                 "(Priority 1 - Highest)".green().bold().to_string()
             } else if i == new_order.len() - 1 {
-                format!("(Priority {} - Lowest)", i + 1).dimmed().to_string()
+                format!("(Priority {} - Lowest)", i + 1)
+                    .dimmed()
+                    .to_string()
             } else {
                 format!("(Priority {})", i + 1).cyan().to_string()
             };
@@ -972,11 +1046,15 @@ fn cmd_pin(mut config: Config, repo: String, patterns: Vec<String>) {
     print_banner();
 
     let is_valid_repo_name = !repo.is_empty()
-        && repo.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        && repo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
     if !is_valid_repo_name {
         eprintln!(
             "{}",
-            format!("Error: Invalid repository name '[{}]'.", repo).red().bold()
+            format!("Error: Invalid repository name '[{}]'.", repo)
+                .red()
+                .bold()
         );
         eprintln!("Repository names may only contain letters, numbers, hyphens, and underscores.");
         exit(1);
@@ -995,14 +1073,24 @@ fn cmd_pin(mut config: Config, repo: String, patterns: Vec<String>) {
     if !known_repos.iter().any(|r| r == &repo) {
         eprintln!(
             "{}",
-            format!("Error: Repository '[{}]' is not recognized.", repo).red().bold()
+            format!("Error: Repository '[{}]' is not recognized.", repo)
+                .red()
+                .bold()
         );
-        eprintln!("Available repositories on your system: {}", known_repos.join(", "));
+        eprintln!(
+            "Available repositories on your system: {}",
+            known_repos.join(", ")
+        );
         exit(1);
     }
 
     if patterns.is_empty() {
-        eprintln!("{}", "Error: No packages or patterns specified to pin.".red().bold());
+        eprintln!(
+            "{}",
+            "Error: No packages or patterns specified to pin."
+                .red()
+                .bold()
+        );
         exit(1);
     }
 
@@ -1059,7 +1147,11 @@ fn cmd_pin(mut config: Config, repo: String, patterns: Vec<String>) {
     if to_pin.len() == 1 {
         println!(
             "{}",
-            format!("✔ Successfully pinned '{}' to repository [{}].", to_pin[0], repo).green()
+            format!(
+                "✔ Successfully pinned '{}' to repository [{}].",
+                to_pin[0], repo
+            )
+            .green()
         );
     } else {
         println!(
@@ -1086,7 +1178,10 @@ fn cmd_unpin(mut config: Config, pattern: &str) {
         }
         println!("{}", format!("✔ Unpinned '{}'.", pattern).green());
     } else {
-        println!("{}", format!("Pattern '{}' was not pinned.", pattern).yellow());
+        println!(
+            "{}",
+            format!("Pattern '{}' was not pinned.", pattern).yellow()
+        );
     }
 }
 
@@ -1094,7 +1189,12 @@ fn cmd_delay(mut config: Config, pkg: &str, days: u32) {
     print_banner();
 
     if !crate::utils::is_safe_pattern(pkg) {
-        eprintln!("{}", format!("Error: Invalid package or pattern '{}'.", pkg).red().bold());
+        eprintln!(
+            "{}",
+            format!("Error: Invalid package or pattern '{}'.", pkg)
+                .red()
+                .bold()
+        );
         exit(1);
     }
 
@@ -1133,14 +1233,19 @@ fn cmd_delay(mut config: Config, pkg: &str, days: u32) {
 fn cmd_undelay(mut config: Config, pkg: &str) {
     print_banner();
     if config.delay.remove(pkg).is_some() {
-
         if let Err(e) = save_config(&config) {
             eprintln!("{}", format!("Failed to save config: {}", e).red());
             exit(1);
         }
-        println!("{}", format!("✔ Removed stability delay on '{}'.", pkg).green());
+        println!(
+            "{}",
+            format!("✔ Removed stability delay on '{}'.", pkg).green()
+        );
     } else {
-        println!("{}", format!("Package '{}' did not have a delay rule.", pkg).yellow());
+        println!(
+            "{}",
+            format!("Package '{}' did not have a delay rule.", pkg).yellow()
+        );
     }
 }
 
@@ -1150,7 +1255,10 @@ fn cmd_history(tx_id: Option<usize>) {
         let tx = match TransactionJournal::get_transaction(id) {
             Some(t) => t,
             None => {
-                eprintln!("{}", format!("Error: Transaction #{} not found in history.", id).red());
+                eprintln!(
+                    "{}",
+                    format!("Error: Transaction #{} not found in history.", id).red()
+                );
                 return;
             }
         };
@@ -1163,11 +1271,17 @@ fn cmd_history(tx_id: Option<usize>) {
         );
         println!("Command: {}\n", tx.command.dimmed());
 
-        println!("{}", format!("Packages Involved ({}):", tx.packages.len()).bold());
+        println!(
+            "{}",
+            format!("Packages Involved ({}):", tx.packages.len()).bold()
+        );
         for p in &tx.packages {
             let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
             let from_repo = p.get("from_repo").and_then(|v| v.as_str()).unwrap_or("?");
-            let from_ver = p.get("from_version").and_then(|v| v.as_str()).unwrap_or("?");
+            let from_ver = p
+                .get("from_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             let to_repo = p.get("to_repo").and_then(|v| v.as_str()).unwrap_or("?");
             let to_ver = p.get("to_version").and_then(|v| v.as_str()).unwrap_or("?");
             let state = p.get("state").and_then(|v| v.as_str()).unwrap_or("default");
@@ -1188,11 +1302,7 @@ fn cmd_history(tx_id: Option<usize>) {
                     state_badge
                 );
             } else if let Some(restored) = p.get("restored_version").and_then(|v| v.as_str()) {
-                println!(
-                    "  • {:<28} : restored to {}",
-                    name.bold(),
-                    restored.green()
-                );
+                println!("  • {:<28} : restored to {}", name.bold(), restored.green());
             } else {
                 let target = p.get("target").and_then(|v| v.as_str()).unwrap_or(name);
                 println!("  • {:<28} : {}", name.bold(), target);
@@ -1211,7 +1321,10 @@ fn cmd_history(tx_id: Option<usize>) {
         return;
     }
 
-    println!("\n{}", format!("Transaction Journal (Last {}):", txs.len()).bold());
+    println!(
+        "\n{}",
+        format!("Transaction Journal (Last {}):", txs.len()).bold()
+    );
     println!(
         "  {:<5} {:<20} {:<10} {:<10} {}",
         "ID", "TIMESTAMP", "ACTION", "PACKAGES", "SUMMARY"
@@ -1254,7 +1367,6 @@ fn cmd_history(tx_id: Option<usize>) {
 }
 
 fn cmd_orphans(clean: bool, noconfirm: bool) {
-
     print_banner();
     let manager = match AlpmManager::new() {
         Ok(m) => m,
@@ -1266,7 +1378,10 @@ fn cmd_orphans(clean: bool, noconfirm: bool) {
 
     let orphans = manager.get_orphans(&[]);
     if orphans.is_empty() {
-        println!("\n{}", "✔ No orphaned packages found on your system.".green());
+        println!(
+            "\n{}",
+            "✔ No orphaned packages found on your system.".green()
+        );
         return;
     }
 
@@ -1302,7 +1417,6 @@ fn cmd_orphans(clean: bool, noconfirm: bool) {
     }
 }
 
-
 pub fn is_command_available(cmd: &str) -> bool {
     let p = Path::new(cmd);
     if p.is_absolute() {
@@ -1335,7 +1449,9 @@ fn check_and_prompt_smart_unpin(mut config: Config, removed_pkgs: &[String], noc
     for pkg in removed_pkgs {
         if let Some((pattern, repo, is_exact)) = find_matching_pin(pkg, &config.pins) {
             let should_remove = if noconfirm {
-                true
+                // A non-interactive removal may clean up a direct pin, but a
+                // wildcard rule can apply to many packages and must survive.
+                is_exact
             } else if interactive {
                 if is_exact {
                     print!(
@@ -1407,7 +1523,10 @@ fn check_and_prompt_smart_unpin(mut config: Config, removed_pkgs: &[String], noc
 
     if config_dirty {
         if let Err(e) = save_config(&config) {
-            eprintln!("{}", format!("Warning: Failed to save updated config: {}", e).yellow());
+            eprintln!(
+                "{}",
+                format!("Warning: Failed to save updated config: {}", e).yellow()
+            );
         } else {
             println!("{}", ":: Configuration updated successfully.".dimmed());
         }
@@ -1472,11 +1591,22 @@ fn cmd_clean(config: &Config, extra_args: &[String]) {
     check_pacman_lock();
     let helper = &config.options.helper;
     let status = if is_command_available(helper) {
-        println!("{} Cleaning package cache via {} -Sc...", "::".cyan(), helper);
+        println!(
+            "{} Cleaning package cache via {} -Sc...",
+            "::".cyan(),
+            helper
+        );
         Command::new(helper).arg("-Sc").args(extra_args).status()
     } else {
-        println!("{} Cleaning package cache via sudo pacman -Sc...", "::".cyan());
-        Command::new("sudo").arg("pacman").arg("-Sc").args(extra_args).status()
+        println!(
+            "{} Cleaning package cache via sudo pacman -Sc...",
+            "::".cyan()
+        );
+        Command::new("sudo")
+            .arg("pacman")
+            .arg("-Sc")
+            .args(extra_args)
+            .status()
     };
 
     match status {
@@ -1523,7 +1653,10 @@ fn cmd_remove(config: Config, args: &[String], is_friendly: bool) {
     }
 
     if targets.is_empty() {
-        eprintln!("{}", "Error: No package targets specified for removal.".red());
+        eprintln!(
+            "{}",
+            "Error: No package targets specified for removal.".red()
+        );
         eprintln!("Usage: pacpin remove <pkg...> or pacpin -Rns <pkg...>");
         exit(1);
     }
@@ -1538,15 +1671,23 @@ fn cmd_remove(config: Config, args: &[String], is_friendly: bool) {
         cmd_args.join(" ")
     );
 
-    let status = Command::new("sudo")
-        .arg("pacman")
-        .args(&cmd_args)
-        .status();
+    let status = Command::new("sudo").arg("pacman").args(&cmd_args).status();
 
     match status {
         Ok(s) if s.success() => {
             let noconfirm = flags.iter().any(|f| f == "--noconfirm");
             check_and_prompt_smart_unpin(config, &targets, noconfirm);
+            let packages = targets
+                .iter()
+                .map(|name| serde_json::json!({ "name": name, "target": name }))
+                .collect();
+            let command = format!("sudo pacman {}", cmd_args.join(" "));
+            if let Err(e) = TransactionJournal::record_transaction("remove", packages, &command) {
+                eprintln!(
+                    "{}",
+                    format!("Warning: Failed to record removal transaction: {}", e).yellow()
+                );
+            }
         }
         Ok(s) => exit(s.code().unwrap_or(1)),
         Err(e) => {
@@ -1564,7 +1705,10 @@ fn cmd_reset(force: bool) {
     }
 
     if !force {
-        print!("{}", "Are you sure you want to reset all configurations and pins to default? [y/N] ".bold());
+        print!(
+            "{}",
+            "Are you sure you want to reset all configurations and pins to default? [y/N] ".bold()
+        );
         io::stdout().flush().unwrap();
         let mut input = String::new();
         if io::stdin().read_line(&mut input).is_err() {
@@ -1582,9 +1726,15 @@ fn cmd_reset(force: bool) {
     let now = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let bak_path = path.with_extension(format!("toml.bak.{}", now));
     if let Err(e) = std::fs::copy(&path, &bak_path) {
-        eprintln!("{}", format!("Warning: Could not create backup file: {}", e).yellow());
+        eprintln!(
+            "{}",
+            format!("Warning: Could not create backup file: {}", e).yellow()
+        );
     } else {
-        println!("  {}", format!("📦 Backup created at {}", bak_path.display()).dimmed());
+        println!(
+            "  {}",
+            format!("📦 Backup created at {}", bak_path.display()).dimmed()
+        );
     }
 
     let default_cfg = Config::default();
@@ -1593,7 +1743,12 @@ fn cmd_reset(force: bool) {
         exit(1);
     }
 
-    println!("{}", "✔ All configurations, pins, exclusions, and delays have been reset to default.".green().bold());
+    println!(
+        "{}",
+        "✔ All configurations, pins, exclusions, and delays have been reset to default."
+            .green()
+            .bold()
+    );
     println!("  Run 'pacpin init' to configure preferences from scratch.\n");
 }
 
@@ -1652,7 +1807,13 @@ fn cmd_sync_list(config: &Config, repos: &[String]) {
         for pkg in db.pkgs() {
             let res = if let Ok(local_pkg) = local_db.pkg(pkg.name()) {
                 if local_pkg.version() == pkg.version() {
-                    writeln!(stdout, "{} {} {} [installed]", db.name(), pkg.name(), pkg.version())
+                    writeln!(
+                        stdout,
+                        "{} {} {} [installed]",
+                        db.name(),
+                        pkg.name(),
+                        pkg.version()
+                    )
                 } else {
                     writeln!(
                         stdout,
@@ -1683,7 +1844,8 @@ fn cmd_sync_groups(config: &Config, groups: &[String]) {
     };
 
     let alpm = manager.handle();
-    let filter_groups: std::collections::HashSet<&str> = groups.iter().map(|s| s.as_str()).collect();
+    let filter_groups: std::collections::HashSet<&str> =
+        groups.iter().map(|s| s.as_str()).collect();
     let mut stdout = io::stdout().lock();
 
     if filter_groups.is_empty() {
@@ -1737,18 +1899,28 @@ fn print_help() {
     println!("  clean, -Sc                   Clean pacman and AUR build cache");
     println!();
     println!("{}", "Declarative Rules & Configuration:".bold());
-    println!("  repos                        Interactive BIOS-style repository search priority menu");
-    println!("  pin <repo> <pkg...>          Lock package(s) or wildcards to a designated repository");
-    println!("  pin <repo> -f <file>         Batch pin packages from a text file (one package per line)");
+    println!(
+        "  repos                        Interactive BIOS-style repository search priority menu"
+    );
+    println!(
+        "  pin <repo> <pkg...>          Lock package(s) or wildcards to a designated repository"
+    );
+    println!(
+        "  pin <repo> -f <file>         Batch pin packages from a text file (one package per line)"
+    );
     println!("  unpin <pkg>                  Remove a repository pin rule");
     println!("  delay <pkg> <days>           Set a stability delay buffer on a package");
     println!("  undelay <pkg>                Remove a package stability delay rule");
-    println!("  list                         List active pins, exclusions, delays, and repo priority");
+    println!(
+        "  list                         List active pins, exclusions, delays, and repo priority"
+    );
     println!("  reset [-f]                   Reset all configurations, pins, and delays to default (-f force)");
     println!("  init [--reset]               Interactive onboarding wizard (use --reset for clean slate)");
     println!();
     println!("{}", "System Maintenance & Hygiene:".bold());
-    println!("  orphans [-c]                 Inspect or remove orphaned dependencies (-c to clean)");
+    println!(
+        "  orphans [-c]                 Inspect or remove orphaned dependencies (-c to clean)"
+    );
     println!("  autoremove                   Alias for 'pacpin orphans -c'");
     println!("  keep, adopt <pkg...>         Mark package(s) as explicitly installed (silences orphan warnings)");
     println!("  needrestart                  Inspect processes holding outdated libraries or kernel in RAM");
@@ -1756,7 +1928,9 @@ fn print_help() {
     println!("{}", "Power Tools & Ephemeral Execution:".bold());
     println!("  run [options] [repo/]pkg     Run package directly on host without installing (like 'nix run')");
     println!("  try [options] [repo/]pkg     Run package in isolated ephemeral sandbox (air-gapped bwrap)");
-    println!("  history [id]                 View transaction history timeline or inspect a transaction");
+    println!(
+        "  history [id]                 View transaction history timeline or inspect a transaction"
+    );
     println!("  rollback [id] [-n]           Restore previous package versions from cache");
     println!();
     println!("{}", "Pacman & AUR Drop-in Aliases:".bold());
@@ -1904,7 +2078,9 @@ pub fn is_upgrade_invocation(args: &[String]) -> bool {
     // It's an upgrade if flags contains 'u' or 'y' or long options
     flags.contains(&'u')
         || flags.contains(&'y')
-        || flags_list.iter().any(|a| a == "--sysupgrade" || a == "--refresh")
+        || flags_list
+            .iter()
+            .any(|a| a == "--sysupgrade" || a == "--refresh")
 }
 
 pub fn pacman_files_needs_sudo(args: &[String]) -> bool {
@@ -1934,25 +2110,42 @@ fn main() {
 
     let args: Vec<String> = env::args().skip(1).collect();
 
-    if args.first().map(|s| s == "-v" || s == "-V" || s == "--version").unwrap_or(false) {
+    if args
+        .first()
+        .map(|s| s == "-v" || s == "-V" || s == "--version")
+        .unwrap_or(false)
+    {
         print_version();
         exit(0);
     }
 
-    if args.first().map(|s| s == "-h" || s == "--help" || s == "help").unwrap_or(false) {
+    if args
+        .first()
+        .map(|s| s == "-h" || s == "--help" || s == "help")
+        .unwrap_or(false)
+    {
         print_help();
         exit(0);
     }
 
-    if args.first().map(|s| s == "reset" || s == "config-reset").unwrap_or(false)
+    if args
+        .first()
+        .map(|s| s == "reset" || s == "config-reset")
+        .unwrap_or(false)
         || (args.len() >= 2 && args[0] == "config" && args[1] == "reset")
     {
-        let force = args.iter().any(|a| a == "-f" || a == "--force" || a == "-y");
+        let force = args
+            .iter()
+            .any(|a| a == "-f" || a == "--force" || a == "-y");
         cmd_reset(force);
         exit(0);
     }
 
-    if args.first().map(|s| s == "init" || s == "setup").unwrap_or(false) {
+    if args
+        .first()
+        .map(|s| s == "init" || s == "setup")
+        .unwrap_or(false)
+    {
         let reset = args.iter().any(|a| a == "-r" || a == "--reset");
         wizard::run_first_launch_wizard(true, reset);
         exit(0);
@@ -1987,13 +2180,28 @@ fn main() {
     } else if is_upgrade_invocation(&args) {
         let (_targets, extra_flags) = parse_pacman_cli_args(&args[1..]);
         let dry_run = args.iter().any(|a| a == "-n" || a == "--dry-run")
-            || args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains('n'));
+            || args
+                .iter()
+                .any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains('n'));
         let refresh = args.iter().any(|a| a == "-y" || a == "--refresh")
-            || args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains('y'));
+            || args
+                .iter()
+                .any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains('y'));
         let noconfirm = args.iter().any(|a| a == "--noconfirm");
-        let autoremove = args.iter().any(|a| a == "-c" || a == "--clean" || a == "--autoremove")
-            || args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains('c'));
-        cmd_upgrade(&config, dry_run, refresh, noconfirm, autoremove, &extra_flags);
+        let autoremove = args
+            .iter()
+            .any(|a| a == "-c" || a == "--clean" || a == "--autoremove")
+            || args
+                .iter()
+                .any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains('c'));
+        cmd_upgrade(
+            &config,
+            dry_run,
+            refresh,
+            noconfirm,
+            autoremove,
+            &extra_flags,
+        );
     } else if cmd == "search"
         || cmd == "-Ss"
         || (cmd.starts_with("-S")
@@ -2052,7 +2260,9 @@ fn main() {
             .cloned()
             .collect();
         cmd_clean(&config, &extra_args);
-    } else if cmd.starts_with("-Sw") || (cmd.starts_with("-S") && args.iter().any(|a| a == "-w" || a == "--downloadonly")) {
+    } else if cmd.starts_with("-Sw")
+        || (cmd.starts_with("-S") && args.iter().any(|a| a == "-w" || a == "--downloadonly"))
+    {
         check_pacman_lock();
         let status = Command::new("sudo").arg("pacman").args(&args).status();
         match status {
@@ -2064,7 +2274,10 @@ fn main() {
         }
     } else if cmd == "-Sp"
         || (cmd.starts_with("-S") && cmd.contains('p'))
-        || (cmd.starts_with("-S") && args.iter().any(|a| a == "-p" || a == "--print-uris" || a == "--print"))
+        || (cmd.starts_with("-S")
+            && args
+                .iter()
+                .any(|a| a == "-p" || a == "--print-uris" || a == "--print"))
     {
         let targets: Vec<String> = args
             .iter()
@@ -2107,10 +2320,13 @@ fn main() {
                 exit(1);
             }
         }
-    } else if cmd == "-S" || cmd == "install" || (cmd.starts_with("-S") && {
-        let (t, _) = parse_pacman_cli_args(&args[1..]);
-        !t.is_empty()
-    }) {
+    } else if cmd == "-S"
+        || cmd == "install"
+        || (cmd.starts_with("-S") && {
+            let (t, _) = parse_pacman_cli_args(&args[1..]);
+            !t.is_empty()
+        })
+    {
         let (targets, mut flags) = parse_pacman_cli_args(&args[1..]);
         if cmd.len() > 2 && cmd.starts_with("-S") {
             let subflags = &cmd[2..];
@@ -2180,7 +2396,9 @@ fn main() {
     } else if cmd == "rollback" {
         let mut tx_id = None;
         let dry_run = args.iter().any(|a| a == "-n" || a == "--dry-run");
-        let allow_partial = args.iter().any(|a| a == "--allow-partial" || a == "--partial" || a == "-f" || a == "--force");
+        let allow_partial = args
+            .iter()
+            .any(|a| a == "--allow-partial" || a == "--partial" || a == "-f" || a == "--force");
         for a in &args[1..] {
             if let Ok(id) = a.parse::<usize>() {
                 tx_id = Some(id);
@@ -2227,12 +2445,19 @@ fn main() {
         }
 
         if positional.is_empty() {
-            eprintln!("{}", "Error: 'pacpin run' requires a package target.".red().bold());
+            eprintln!(
+                "{}",
+                "Error: 'pacpin run' requires a package target."
+                    .red()
+                    .bold()
+            );
             eprintln!("Usage: pacpin run [options] [repo/]package [arguments...]");
             eprintln!("Runs an official, AUR, Flatpak, or Nix package directly on host without permanent installation.");
             eprintln!();
             eprintln!("Options:");
-            eprintln!("  --sandbox              Run in Bubblewrap container (unsandboxed by default)");
+            eprintln!(
+                "  --sandbox              Run in Bubblewrap container (unsandboxed by default)"
+            );
             eprintln!("  --bin <name>           Specify exact executable binary name if package provides multiple");
             eprintln!("  --allow-unverified     Proceed even if repository metadata lacks a SHA256 checksum");
             eprintln!();
@@ -2293,7 +2518,12 @@ fn main() {
         }
 
         if positional.is_empty() {
-            eprintln!("{}", "Error: 'pacpin try' requires a package target.".red().bold());
+            eprintln!(
+                "{}",
+                "Error: 'pacpin try' requires a package target."
+                    .red()
+                    .bold()
+            );
             eprintln!("Usage: pacpin try [options] [repo/]package [arguments...]");
             eprintln!("Runs a package inside an isolated, air-gapped Bubblewrap container.");
             eprintln!();
@@ -2320,7 +2550,10 @@ fn main() {
         exit(0);
     } else if cmd == "delay" {
         if args.len() < 3 || args[2].parse::<u32>().is_err() {
-            eprintln!("{}", "Error: 'pacpin delay' requires <pkg> and <days>.".red());
+            eprintln!(
+                "{}",
+                "Error: 'pacpin delay' requires <pkg> and <days>.".red()
+            );
             eprintln!("Usage: pacpin delay <pkg> <days> (e.g. pacpin delay openssl 3)");
             exit(1);
         }
@@ -2340,12 +2573,19 @@ fn main() {
         cmd_orphans(clean, noconfirm);
     } else if cmd == "keep" || cmd == "adopt" {
         if args.len() < 2 {
-            eprintln!("{}", "Error: 'pacpin keep' requires at least one package name.".red());
+            eprintln!(
+                "{}",
+                "Error: 'pacpin keep' requires at least one package name.".red()
+            );
             eprintln!("Usage: pacpin keep <pkg1> [pkg2...]");
             exit(1);
         }
         let pkgs = &args[1..];
-        println!("{} Marking {} package(s) as explicitly installed (sudo pacman -D --asexplicit)...", "::".cyan(), pkgs.len());
+        println!(
+            "{} Marking {} package(s) as explicitly installed (sudo pacman -D --asexplicit)...",
+            "::".cyan(),
+            pkgs.len()
+        );
         let status = Command::new("sudo")
             .arg("pacman")
             .arg("-D")
@@ -2431,7 +2671,10 @@ fn parse_pin_args(
                     }
                 }
                 Err(e) => {
-                    return Err(format!("Error reading package list file '{}': {}", file_path, e));
+                    return Err(format!(
+                        "Error reading package list file '{}': {}",
+                        file_path, e
+                    ));
                 }
             }
             i += 2;
@@ -2445,11 +2688,15 @@ fn parse_pin_args(
         return Err("'pacpin pin' requires a repository name.".to_string());
     } else if positional.len() == 1 {
         if file_patterns.is_empty() {
-            return Err("'pacpin pin' requires both a repository and at least one package.".to_string());
+            return Err(
+                "'pacpin pin' requires both a repository and at least one package.".to_string(),
+            );
         }
         Ok((positional[0].clone(), file_patterns))
     } else if positional.len() == 2 && file_patterns.is_empty() {
-        if known_repos.iter().any(|r| r == &positional[1]) && !known_repos.iter().any(|r| r == &positional[0]) {
+        if known_repos.iter().any(|r| r == &positional[1])
+            && !known_repos.iter().any(|r| r == &positional[0])
+        {
             Ok((positional[1].clone(), vec![positional[0].clone()]))
         } else {
             Ok((positional[0].clone(), vec![positional[1].clone()]))
@@ -2459,7 +2706,10 @@ fn parse_pin_args(
             (positional[0].clone(), positional[1..].to_vec())
         } else if known_repos.iter().any(|r| r == positional.last().unwrap()) {
             let last_idx = positional.len() - 1;
-            (positional[last_idx].clone(), positional[..last_idx].to_vec())
+            (
+                positional[last_idx].clone(),
+                positional[..last_idx].to_vec(),
+            )
         } else {
             (positional[0].clone(), positional[1..].to_vec())
         };
@@ -2538,7 +2788,12 @@ mod tests {
     #[test]
     fn test_parse_pin_args_batch() {
         let known_repos = vec!["core".to_string(), "extra".to_string(), "aur".to_string()];
-        let args = vec!["core".to_string(), "pkg1".to_string(), "pkg2".to_string(), "pkg3".to_string()];
+        let args = vec![
+            "core".to_string(),
+            "pkg1".to_string(),
+            "pkg2".to_string(),
+            "pkg3".to_string(),
+        ];
         let (repo, patterns) = parse_pin_args(&args, &known_repos).unwrap();
         assert_eq!(repo, "core");
         assert_eq!(patterns, vec!["pkg1", "pkg2", "pkg3"]);
@@ -2550,7 +2805,11 @@ mod tests {
         let tmp_file = std::env::temp_dir().join("pacpin_test_pkgs.txt");
         std::fs::write(&tmp_file, "pkgA\n# comment\npkgB\n\npkgC\n").unwrap();
 
-        let args = vec!["core".to_string(), "-f".to_string(), tmp_file.to_str().unwrap().to_string()];
+        let args = vec![
+            "core".to_string(),
+            "-f".to_string(),
+            tmp_file.to_str().unwrap().to_string(),
+        ];
         let (repo, patterns) = parse_pin_args(&args, &known_repos).unwrap();
         assert_eq!(repo, "core");
         assert_eq!(patterns, vec!["pkgA", "pkgB", "pkgC"]);
@@ -2627,10 +2886,21 @@ mod tests {
         assert!(!is_upgrade_invocation(&to_vec(&["-Qu"])));
 
         // Upgrade with option-consuming flags
-        assert!(is_upgrade_invocation(&to_vec(&["-Syu", "--ignore", "linux"])));
+        assert!(is_upgrade_invocation(&to_vec(&[
+            "-Syu", "--ignore", "linux"
+        ])));
         assert!(is_upgrade_invocation(&to_vec(&["-Syu", "--ignore=linux"])));
-        assert!(is_upgrade_invocation(&to_vec(&["-S", "-u", "--overwrite", "/usr/*"])));
-        assert!(is_upgrade_invocation(&to_vec(&["-Syu", "--assume-installed", "foo:1.0"])));
+        assert!(is_upgrade_invocation(&to_vec(&[
+            "-S",
+            "-u",
+            "--overwrite",
+            "/usr/*"
+        ])));
+        assert!(is_upgrade_invocation(&to_vec(&[
+            "-Syu",
+            "--assume-installed",
+            "foo:1.0"
+        ])));
     }
 
     #[test]
@@ -2638,7 +2908,8 @@ mod tests {
         let to_vec = |slice: &[&str]| slice.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         // Separates option arguments from targets
-        let (targets, flags) = parse_pacman_cli_args(&to_vec(&["--ignore", "linux", "--noconfirm", "neovim"]));
+        let (targets, flags) =
+            parse_pacman_cli_args(&to_vec(&["--ignore", "linux", "--noconfirm", "neovim"]));
         assert_eq!(targets, vec!["neovim"]);
         assert_eq!(flags, vec!["--ignore", "linux", "--noconfirm"]);
 
@@ -2654,13 +2925,26 @@ mod tests {
 
         // Handles config, dbpath, root, overwrite flags consuming arguments
         let (targets, flags) = parse_pacman_cli_args(&to_vec(&[
-            "--config", "/etc/pacman.conf",
-            "-b", "/var/lib/pacman",
-            "--overwrite", "/usr/share/*",
-            "git"
+            "--config",
+            "/etc/pacman.conf",
+            "-b",
+            "/var/lib/pacman",
+            "--overwrite",
+            "/usr/share/*",
+            "git",
         ]));
         assert_eq!(targets, vec!["git"]);
-        assert_eq!(flags, vec!["--config", "/etc/pacman.conf", "-b", "/var/lib/pacman", "--overwrite", "/usr/share/*"]);
+        assert_eq!(
+            flags,
+            vec![
+                "--config",
+                "/etc/pacman.conf",
+                "-b",
+                "/var/lib/pacman",
+                "--overwrite",
+                "/usr/share/*"
+            ]
+        );
     }
 
     #[test]
@@ -2671,7 +2955,12 @@ mod tests {
         assert!(!pacman_files_needs_sudo(&to_vec(&["-F", "python"])));
         assert!(!pacman_files_needs_sudo(&to_vec(&["-Fl", "ripgrep"])));
         assert!(!pacman_files_needs_sudo(&to_vec(&["-Fs", "libssl.so"])));
-        assert!(!pacman_files_needs_sudo(&to_vec(&["-F", "-b", "/var/lib/pacman", "python"])));
+        assert!(!pacman_files_needs_sudo(&to_vec(&[
+            "-F",
+            "-b",
+            "/var/lib/pacman",
+            "python"
+        ])));
 
         // Sync / refresh actions DO require sudo
         assert!(pacman_files_needs_sudo(&to_vec(&["-Fy"])));
@@ -2679,5 +2968,21 @@ mod tests {
         assert!(pacman_files_needs_sudo(&to_vec(&["-F", "-y"])));
         assert!(pacman_files_needs_sudo(&to_vec(&["-F", "--refresh"])));
         assert!(pacman_files_needs_sudo(&to_vec(&["-Fy", "python"])));
+    }
+
+    #[test]
+    fn test_find_matching_pin_exact_and_wildcard() {
+        let mut pins = std::collections::BTreeMap::new();
+        pins.insert("linux-cachyos*".to_string(), "cachyos".to_string());
+        pins.insert("neovim".to_string(), "extra".to_string());
+
+        let res_exact = find_matching_pin("neovim", &pins);
+        assert_eq!(res_exact, Some(("neovim".to_string(), "extra".to_string(), true)));
+
+        let res_wildcard = find_matching_pin("linux-cachyos-headers", &pins);
+        assert_eq!(res_wildcard, Some(("linux-cachyos*".to_string(), "cachyos".to_string(), false)));
+
+        let res_none = find_matching_pin("ripgrep", &pins);
+        assert_eq!(res_none, None);
     }
 }

@@ -37,7 +37,13 @@ pub struct TransactionJournal;
 
 impl TransactionJournal {
     pub fn state_dir() -> Result<PathBuf, String> {
-        let home = std::env::var("HOME").map_err(|_| "Environment variable HOME is not set".to_string())?;
+        if let Ok(xdg_state) = std::env::var("XDG_STATE_HOME") {
+            if !xdg_state.trim().is_empty() {
+                return Ok(PathBuf::from(xdg_state).join("pacpin"));
+            }
+        }
+        let home = std::env::var("HOME")
+            .map_err(|_| "Environment variable HOME is not set".to_string())?;
         Ok(Path::new(&home).join(".local").join("state").join("pacpin"))
     }
 
@@ -92,20 +98,16 @@ impl TransactionJournal {
             let c_dir_canon = c_dir.canonicalize().unwrap_or_else(|_| c_dir.clone());
             for v in &versions_to_check {
                 for ext in &["zst", "xz", "gz"] {
-                    let pattern_str = format!(
-                        "{}/{}-{}-*.pkg.tar.{}",
-                        c_dir.display(),
-                        pkg_name,
-                        v,
-                        ext
-                    );
-                if let Ok(paths) = glob(&pattern_str) {
-                    for entry in paths.flatten() {
-                        let name_str = entry.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if !name_str.ends_with(".sig") {
-                            if let Ok(canon) = entry.canonicalize() {
-                                if canon.starts_with(&c_dir_canon) {
-                                    return Some(entry);
+                    let pattern_str =
+                        format!("{}/{}-{}-*.pkg.tar.{}", c_dir.display(), pkg_name, v, ext);
+                    if let Ok(paths) = glob(&pattern_str) {
+                        for entry in paths.flatten() {
+                            let name_str = entry.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                            if !name_str.ends_with(".sig") {
+                                if let Ok(canon) = entry.canonicalize() {
+                                    if canon.starts_with(&c_dir_canon) {
+                                        return Some(entry);
+                                    }
                                 }
                             }
                         }
@@ -113,8 +115,7 @@ impl TransactionJournal {
                 }
             }
         }
-    }
-    None
+        None
     }
 
     pub fn get_last_transaction_id(path: &Path) -> Option<usize> {
@@ -145,12 +146,16 @@ impl TransactionJournal {
         packages: Vec<serde_json::Value>,
         command: &str,
     ) -> Result<usize, std::io::Error> {
-        let state_dir = Self::state_dir().map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
+        let state_dir =
+            Self::state_dir().map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
         fs::create_dir_all(&state_dir)?;
-        let history_file = Self::history_file().map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
+        let history_file = Self::history_file()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
 
         let next_id = if history_file.exists() {
-            Self::get_last_transaction_id(&history_file).map(|id| id + 1).unwrap_or(1)
+            Self::get_last_transaction_id(&history_file)
+                .map(|id| id + 1)
+                .unwrap_or(1)
         } else {
             1
         };
@@ -169,7 +174,8 @@ impl TransactionJournal {
             .create(true)
             .append(true)
             .open(&history_file)?;
-        let line = serde_json::to_string(&record).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let line = serde_json::to_string(&record)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         writeln!(file, "{}", line)?;
 
         Ok(next_id)
@@ -184,21 +190,20 @@ impl TransactionJournal {
             return Vec::new();
         }
 
-        let mut txs = Vec::new();
+        let mut txs = std::collections::VecDeque::with_capacity(limit);
         if let Ok(file) = fs::File::open(&history_file) {
             let reader = BufReader::new(file);
             for line in reader.lines().flatten() {
                 if let Ok(record) = serde_json::from_str::<TransactionRecord>(&line) {
-                    txs.push(record);
+                    if txs.len() == limit {
+                        txs.pop_front();
+                    }
+                    txs.push_back(record);
                 }
             }
         }
 
-        if txs.len() > limit {
-            txs.split_off(txs.len() - limit)
-        } else {
-            txs
-        }
+        txs.into_iter().collect()
     }
 
     pub fn get_transaction(tx_id: usize) -> Option<TransactionRecord> {
@@ -226,7 +231,10 @@ impl TransactionJournal {
     pub fn rollback(tx_id: Option<usize>, dry_run: bool, allow_partial: bool) {
         let txs = Self::list_transactions(100);
         if txs.is_empty() {
-            println!("{}", "No transaction history found in history.jsonl.".yellow());
+            println!(
+                "{}",
+                "No transaction history found in history.jsonl.".yellow()
+            );
             return;
         }
 
@@ -273,7 +281,11 @@ impl TransactionJournal {
         if !missing.is_empty() {
             println!(
                 "\n{}",
-                format!("Warning: {} package archive(s) not found in cache:", missing.len()).yellow()
+                format!(
+                    "Warning: {} package archive(s) not found in cache:",
+                    missing.len()
+                )
+                .yellow()
             );
             for (name, ver) in &missing {
                 println!("  • {}", format!("{} {}", name, ver).red());
@@ -282,7 +294,9 @@ impl TransactionJournal {
             if !allow_partial {
                 eprintln!(
                     "\n{}",
-                    "Error: Rollback aborted to prevent broken dependencies and partial downgrade.".red().bold()
+                    "Error: Rollback aborted to prevent broken dependencies and partial downgrade."
+                        .red()
+                        .bold()
                 );
                 eprintln!(
                     "  {} package archive(s) are missing from the pacman cache.",
@@ -296,7 +310,11 @@ impl TransactionJournal {
         if pkgs_to_restore.is_empty() {
             eprintln!(
                 "\n{}",
-                format!("Error: No restorable cached package archives available for Transaction #{}.", t_id).red()
+                format!(
+                    "Error: No restorable cached package archives available for Transaction #{}.",
+                    t_id
+                )
+                .red()
             );
             return;
         }
@@ -307,19 +325,10 @@ impl TransactionJournal {
         );
         for (name, ver, path) in &pkgs_to_restore {
             let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            println!(
-                "  ✔ {:<28} ➔ {} ({})",
-                name.cyan(),
-                ver.green(),
-                fname
-            );
+            println!("  ✔ {:<28} ➔ {} ({})", name.cyan(), ver.green(), fname);
         }
 
-        let mut cmd_args: Vec<String> = vec![
-            "pacman".to_string(),
-            "-U".to_string(),
-            "--needed".to_string(),
-        ];
+        let mut cmd_args: Vec<String> = vec!["pacman".to_string(), "-U".to_string()];
         for (_, _, path) in &pkgs_to_restore {
             cmd_args.push(path.display().to_string());
         }
@@ -332,8 +341,16 @@ impl TransactionJournal {
             return;
         }
 
-        if Path::new("/var/lib/pacman/db.lck").exists() {
-            eprintln!("{}", "Error: Pacman database is locked (/var/lib/pacman/db.lck).".red());
+        let db_lock_path = crate::db::AlpmManager::get_dbpath().join("db.lck");
+        if db_lock_path.exists() {
+            eprintln!(
+                "{}",
+                format!(
+                    "Error: Pacman database is locked ({}).",
+                    db_lock_path.display()
+                )
+                .red()
+            );
             std::process::exit(1);
         }
 
@@ -346,16 +363,21 @@ impl TransactionJournal {
             return;
         }
 
-        println!("\n{} {}", ":: Executing rollback:".cyan(), "sudo pacman -U ...".bold());
-        let mut child_args = vec!["pacman", "-U", "--needed"];
-        let path_strs: Vec<String> = pkgs_to_restore.iter().map(|(_, _, p)| p.display().to_string()).collect();
+        println!(
+            "\n{} {}",
+            ":: Executing rollback:".cyan(),
+            "sudo pacman -U ...".bold()
+        );
+        let mut child_args = vec!["pacman", "-U"];
+        let path_strs: Vec<String> = pkgs_to_restore
+            .iter()
+            .map(|(_, _, p)| p.display().to_string())
+            .collect();
         for p in &path_strs {
             child_args.push(p);
         }
 
-        let status = Command::new("sudo")
-            .args(&child_args)
-            .status();
+        let status = Command::new("sudo").args(&child_args).status();
 
         match status {
             Ok(s) if s.success() => {
@@ -372,7 +394,11 @@ impl TransactionJournal {
                 let _ = Self::record_transaction("rollback", rollback_pkgs, &full_cmd);
                 println!(
                     "\n{}",
-                    format!("✔ Rollback of Transaction #{} completed successfully.", t_id).green()
+                    format!(
+                        "✔ Rollback of Transaction #{} completed successfully.",
+                        t_id
+                    )
+                    .green()
                 );
             }
             Ok(s) => {
@@ -433,7 +459,13 @@ mod tests {
     #[test]
     fn test_find_cached_package_rejection() {
         // Non-existent or traversal versions/names are rejected immediately
-        assert_eq!(TransactionJournal::find_cached_package("../etc", "1.0"), None);
-        assert_eq!(TransactionJournal::find_cached_package("pacpin-nonexistent-xyz-pkg", "99.99"), None);
+        assert_eq!(
+            TransactionJournal::find_cached_package("../etc", "1.0"),
+            None
+        );
+        assert_eq!(
+            TransactionJournal::find_cached_package("pacpin-nonexistent-xyz-pkg", "99.99"),
+            None
+        );
     }
 }
