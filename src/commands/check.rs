@@ -111,6 +111,20 @@ pub fn cmd_check(config: &Config, args: &[String]) {
                 "ℹ Vendor Stickiness: ACTIVE (packages stay bound to originating repository unless pinned)".blue()
             );
         }
+
+        let check_scope = if repo_only {
+            "official repositories"
+        } else if aur_only {
+            "AUR"
+        } else if no_flatpak {
+            "repositories and AUR"
+        } else {
+            "repositories, AUR, and Flatpak"
+        };
+        println!(
+            "\n{}",
+            format!(":: Checking updates across {}...", check_scope).cyan()
+        );
     }
 
     let mut res = resolver.resolve_with_options(config, skip_aur);
@@ -123,6 +137,13 @@ pub fn cmd_check(config: &Config, args: &[String]) {
                 .unwrap_or(false)
         });
     }
+
+    // Pre-calculate orphans immediately on CPU while ext_handle (Flatpak) is running in the background
+    let orphans = if config.features.smart_orphans && !quiet {
+        manager.get_orphans(&[])
+    } else {
+        Vec::new()
+    };
 
     let external_updates = ext_handle
         .map(|h| h.join().unwrap_or_default())
@@ -138,22 +159,19 @@ pub fn cmd_check(config: &Config, args: &[String]) {
     } else {
         render_transaction_view(&res, &config.options.helper, &external_updates);
 
-        if config.features.smart_orphans {
-            let orphans = manager.get_orphans(&[]);
-            if !orphans.is_empty() {
-                let tot_size: i64 = orphans.iter().map(|o| o.isize).sum();
-                println!(
-                    "\n{} {}",
-                    format!(
-                        "🧹 {} orphaned package(s) detected ({})",
-                        orphans.len(),
-                        ui::format_size(tot_size)
-                    )
-                    .yellow()
-                    .bold(),
-                    "— run 'pacpin orphans -c' to remove unneeded dependencies".dimmed()
-                );
-            }
+        if config.features.smart_orphans && !orphans.is_empty() {
+            let tot_size: i64 = orphans.iter().map(|o| o.isize).sum();
+            println!(
+                "\n{} {}",
+                format!(
+                    "🧹 {} orphaned package(s) detected ({})",
+                    orphans.len(),
+                    ui::format_size(tot_size)
+                )
+                .yellow()
+                .bold(),
+                "— run 'pacpin orphans -c' to remove unneeded dependencies".dimmed()
+            );
         }
     }
 }

@@ -101,13 +101,13 @@ pub fn cmd_upgrade(
     }
     let resolver = ResolverEngine::new(&manager);
     let res = resolver.resolve_all(config);
-    let external_updates = ext_handle.join().unwrap_or_default();
-    let updates = render_transaction_view(&res, &config.options.helper, &external_updates);
     let orphans = if config.features.smart_orphans {
-        manager.get_orphans(&updates)
+        manager.get_orphans(&res.updates)
     } else {
         Vec::new()
     };
+    let external_updates = ext_handle.join().unwrap_or_default();
+    let updates = render_transaction_view(&res, &config.options.helper, &external_updates);
     let orphan_list_changed = if config.features.smart_orphans {
         OrphanManager::has_changed(&orphans)
     } else {

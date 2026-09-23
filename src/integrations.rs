@@ -60,6 +60,8 @@ impl IntegrationProvider for FlatpakProvider {
     }
 
     fn refresh_metadata(&self) -> Result<(), std::io::Error> {
+        let cache_file = std::env::temp_dir().join(format!("pacpin_flatpak_cache_{}.json", unsafe { libc::getuid() }));
+        let _ = std::fs::remove_file(cache_file);
         let _ = Command::new("flatpak")
             .args(["update", "--appstream"])
             .output()?;
@@ -67,6 +69,21 @@ impl IntegrationProvider for FlatpakProvider {
     }
 
     fn check_updates(&self) -> Vec<ExternalUpdate> {
+        let cache_file = std::env::temp_dir().join(format!("pacpin_flatpak_cache_{}.json", unsafe { libc::getuid() }));
+        if let Ok(metadata) = std::fs::metadata(&cache_file) {
+            if let Ok(mtime) = metadata.modified() {
+                if let Ok(elapsed) = mtime.elapsed() {
+                    if elapsed.as_secs() < 120 {
+                        if let Ok(content) = std::fs::read_to_string(&cache_file) {
+                            if let Ok(cached) = serde_json::from_str::<Vec<ExternalUpdate>>(&content) {
+                                return cached;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let output = Command::new("flatpak")
             .args([
                 "remote-ls",
@@ -111,6 +128,9 @@ impl IntegrationProvider for FlatpakProvider {
                     }
                 }
             }
+        }
+        if let Ok(serialized) = serde_json::to_string(&results) {
+            let _ = std::fs::write(&cache_file, serialized);
         }
         results
     }
