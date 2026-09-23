@@ -482,31 +482,50 @@ impl IntegrationsManager {
     }
 
     pub fn execute_cleanups(providers: &[Arc<dyn IntegrationProvider>]) {
-        for p in providers {
-            if !p.supports_clean() {
-                continue;
-            }
-            println!(
-                "\n{} Cleaning {} unused packages ({})...",
-                "::".cyan(),
-                p.name().bold(),
-                p.clean_command_str().dimmed()
-            );
-            match p.execute_clean() {
-                Ok(true) => {
-                    println!("✔ {} cleanup completed successfully.", p.name().green());
-                }
-                Ok(false) => {
-                    eprintln!(
-                        "{}",
-                        format!("Warning: {} cleanup exited with errors.", p.name()).yellow()
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{}",
-                        format!("Failed to run {} cleanup: {}", p.name(), e).red()
-                    );
+        let active_cleaners: Vec<_> = providers
+            .iter()
+            .filter(|p| p.supports_clean())
+            .cloned()
+            .collect();
+        if active_cleaners.is_empty() {
+            return;
+        }
+
+        let mut handles = Vec::new();
+        for p in active_cleaners {
+            let provider = Arc::clone(&p);
+            handles.push(thread::spawn(move || {
+                let name = provider.name();
+                let cmd_str = provider.clean_command_str();
+                let res = provider.execute_clean();
+                (name, cmd_str, res)
+            }));
+        }
+
+        for h in handles {
+            if let Ok((name, cmd_str, res)) = h.join() {
+                println!(
+                    "\n{} Cleaning {} unused packages ({})...",
+                    "::".cyan(),
+                    name.bold(),
+                    cmd_str.dimmed()
+                );
+                match res {
+                    Ok(true) => {
+                        println!("✔ {} cleanup completed successfully.", name.green());
+                    }
+                    Ok(false) => {
+                        eprintln!(
+                            "{}",
+                            format!("Warning: {} cleanup exited with errors.", name).yellow()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "{}",
+                            format!("Failed to run {} cleanup: {}", name, e).red()
+                        );
+                    }
                 }
             }
         }

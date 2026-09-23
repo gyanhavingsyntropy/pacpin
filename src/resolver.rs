@@ -324,9 +324,6 @@ impl<'a> ResolverEngine<'a> {
         let installed_dbs = installed_dbs_handle
             .map(|h| h.join().unwrap_or_default())
             .unwrap_or_default();
-        let aur_data = aur_handle
-            .map(|h| h.join().unwrap_or_default())
-            .unwrap_or_default();
 
         let syncdbs_list: Vec<&alpm::Db> = alpm.syncdbs().into_iter().collect();
         let syncdb_map: HashMap<&str, &alpm::Db> =
@@ -338,6 +335,19 @@ impl<'a> ResolverEngine<'a> {
             Vec::new()
         };
 
+        struct PendingAurPackage {
+            pkg_name: String,
+            inst_ver: String,
+            inst_size: i64,
+            installed_db: String,
+            pinned_repo: Option<String>,
+            state: String,
+            natural_top_repo: Option<String>,
+            is_custom: bool,
+            is_sticky: bool,
+        }
+
+        let mut pending_aur: Vec<PendingAurPackage> = Vec::new();
         let mut resolved: HashMap<String, ResolvedPackage> = HashMap::new();
         let mut unresolved_pins: Vec<(String, String)> = Vec::new();
 
@@ -401,11 +411,18 @@ impl<'a> ResolverEngine<'a> {
 
                 let target_repo = pinned_repo.as_ref().unwrap();
                 if target_repo.eq_ignore_ascii_case("aur") {
-                    if let Some(aur_pkg) = aur_data.get(pkg_name) {
-                        candidate = Some(CandidatePackage::from_aur(aur_pkg));
-                    } else {
-                        unresolved_pins.push((pkg_name.to_string(), target_repo.clone()));
-                    }
+                    pending_aur.push(PendingAurPackage {
+                        pkg_name: pkg_name.to_string(),
+                        inst_ver: inst_ver.to_string(),
+                        inst_size,
+                        installed_db,
+                        pinned_repo,
+                        state,
+                        natural_top_repo,
+                        is_custom: true,
+                        is_sticky: false,
+                    });
+                    continue;
                 } else if let Some(&db) = syncdb_map.get(target_repo.as_str()) {
                     if let Ok(p) = db.pkg(pkg_name) {
                         candidate = Some(CandidatePackage {
@@ -443,10 +460,18 @@ impl<'a> ResolverEngine<'a> {
                     }
 
                     if installed_db.eq_ignore_ascii_case("aur") {
-                        if let Some(aur_pkg) = aur_data.get(pkg_name) {
-                            candidate = Some(CandidatePackage::from_aur(aur_pkg));
-                            is_sticky = true;
-                        }
+                        pending_aur.push(PendingAurPackage {
+                            pkg_name: pkg_name.to_string(),
+                            inst_ver: inst_ver.to_string(),
+                            inst_size,
+                            installed_db,
+                            pinned_repo,
+                            state,
+                            natural_top_repo,
+                            is_custom: false,
+                            is_sticky: true,
+                        });
+                        continue;
                     } else if let Some(&db) = syncdb_map.get(installed_db.as_str()) {
                         if let Ok(p) = db.pkg(pkg_name) {
                             candidate = Some(CandidatePackage {
@@ -500,9 +525,18 @@ impl<'a> ResolverEngine<'a> {
                     }
 
                     if candidate.is_none() {
-                        if let Some(aur_pkg) = aur_data.get(pkg_name) {
-                            candidate = Some(CandidatePackage::from_aur(aur_pkg));
-                        }
+                        pending_aur.push(PendingAurPackage {
+                            pkg_name: pkg_name.to_string(),
+                            inst_ver: inst_ver.to_string(),
+                            inst_size,
+                            installed_db,
+                            pinned_repo,
+                            state,
+                            natural_top_repo,
+                            is_custom: false,
+                            is_sticky: false,
+                        });
+                        continue;
                     }
                 }
             }
@@ -562,6 +596,99 @@ impl<'a> ResolverEngine<'a> {
                     installed_db,
                     candidate,
                     natural_top_repo,
+                    diverted_from_top,
+                    needs_update,
+                    update_type,
+                    is_downgrade,
+                    net_delta,
+                    held: false,
+                    hold_reason: String::new(),
+                },
+            );
+        }
+
+        // Join the concurrent AUR query thread
+        let aur_data = aur_handle
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
+
+        // Resolve pending packages requiring AUR inspection
+        for p in pending_aur {
+            let mut candidate: Option<CandidatePackage> = None;
+            let is_sticky = p.is_sticky;
+
+            if p.is_custom {
+                if let Some(aur_pkg) = aur_data.get(&p.pkg_name) {
+                    candidate = Some(CandidatePackage::from_aur(aur_pkg));
+                } else {
+                    unresolved_pins.push((
+                        p.pkg_name.clone(),
+                        p.pinned_repo.clone().unwrap_or_default(),
+                    ));
+                }
+            } else if p.is_sticky {
+                if let Some(aur_pkg) = aur_data.get(&p.pkg_name) {
+                    candidate = Some(CandidatePackage::from_aur(aur_pkg));
+                }
+            } else if let Some(aur_pkg) = aur_data.get(&p.pkg_name) {
+                candidate = Some(CandidatePackage::from_aur(aur_pkg));
+            }
+
+            let mut needs_update = false;
+            let mut update_type = "up_to_date".to_string();
+            let mut is_downgrade = false;
+
+            if let Some(ref cand) = candidate {
+                let cmp = vercmp(cand.version.as_str(), p.inst_ver.as_str());
+                match cmp {
+                    Ordering::Greater => {
+                        needs_update = true;
+                        update_type = "upgrade".to_string();
+                    }
+                    Ordering::Less => {
+                        if p.state == "custom" {
+                            needs_update = true;
+                            update_type = "downgrade".to_string();
+                            is_downgrade = true;
+                        }
+                    }
+                    Ordering::Equal => {
+                        if p.state == "custom" && cand.version != p.inst_ver.as_str() {
+                            needs_update = true;
+                            update_type = "pin_sync".to_string();
+                        }
+                    }
+                }
+            }
+
+            let net_delta = candidate
+                .as_ref()
+                .and_then(|cand| cand.compute_net_delta(p.inst_size));
+
+            let final_state = if p.state == "custom" {
+                "custom".to_string()
+            } else if is_sticky && candidate.is_some() {
+                "sticky".to_string()
+            } else {
+                "default".to_string()
+            };
+
+            let diverted_from_top = final_state == "default"
+                && candidate.is_some()
+                && p.natural_top_repo.is_some()
+                && candidate.as_ref().unwrap().repo != *p.natural_top_repo.as_ref().unwrap();
+
+            resolved.insert(
+                p.pkg_name.clone(),
+                ResolvedPackage {
+                    name: p.pkg_name,
+                    state: final_state,
+                    pinned_repo: p.pinned_repo,
+                    installed_ver: p.inst_ver,
+                    installed_size: p.inst_size,
+                    installed_db: p.installed_db,
+                    candidate,
+                    natural_top_repo: p.natural_top_repo,
                     diverted_from_top,
                     needs_update,
                     update_type,

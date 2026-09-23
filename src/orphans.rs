@@ -130,13 +130,28 @@ impl OrphanManager {
             }
         }
 
+        // Pre-index virtual provides mapping for fast O(1) dependency resolution
+        let mut provides_map: HashMap<String, String> = HashMap::new();
+        for pkg in local.pkgs() {
+            let pkg_name = pkg.name();
+            for prov in pkg.provides() {
+                provides_map.insert(prov.name().to_string(), pkg_name.to_string());
+            }
+        }
+
         while let Some(pkg_name) = queue.pop_front() {
             if let Ok(pkg) = local.pkg(pkg_name.as_str()) {
                 for dep in pkg.depends() {
+                    let dep_name = dep.name();
                     let satisfier = local
-                        .pkg(dep.name())
+                        .pkg(dep_name)
                         .ok()
-                        .or_else(|| local.pkgs().find_satisfier(dep.name()));
+                        .or_else(|| {
+                            provides_map
+                                .get(dep_name)
+                                .and_then(|pn| local.pkg(pn.as_str()).ok())
+                        })
+                        .or_else(|| local.pkgs().find_satisfier(dep_name));
                     if let Some(sat) = satisfier {
                         let sat_name = sat.name().to_string();
                         if reachable_from_explicit.insert(sat_name.clone()) {
