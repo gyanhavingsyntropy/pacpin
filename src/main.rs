@@ -804,7 +804,7 @@ fn main() {
                     .bold()
             );
             eprintln!("Usage: pacpin try [options] [repo/]package [arguments...]");
-            eprintln!("Runs a package inside an isolated, air-gapped Bubblewrap container.");
+            eprintln!("Runs native Arch packages in a Bubblewrap container; Flatpak uses its own sandbox.");
             eprintln!();
             eprintln!("Options:");
             eprintln!("  --no-sandbox, --bare   Bypass Bubblewrap containerization and run directly on host");
@@ -818,7 +818,7 @@ fn main() {
             eprintln!("Examples:");
             eprintln!("  pacpin try jq . foo.json");
             eprintln!("  pacpin try --gui flatpak/org.gnome.Calculator");
-            eprintln!("  pacpin try --net nix/ripgrep -i 'foo'");
+            eprintln!("  pacpin run nix/ripgrep -i 'foo'  # Nix executes on the host");
             exit(1);
         }
 
@@ -1224,6 +1224,18 @@ mod tests {
                 "/usr/share/*"
             ]
         );
+
+        let args = to_vec(&[
+            "--ignore", "linux", "--overwrite", "*", "--assume-installed", "foo=1.0",
+            "--noconfirm", "bar",
+        ]);
+        let (targets, flags) = parse_pacman_cli_args(&args);
+        assert_eq!(targets, vec!["bar"]);
+        assert_eq!(flags, args[..7]);
+        assert!(!is_upgrade_invocation(&to_vec(&[
+            "-Syu", "--ignore", "linux", "--overwrite", "*",
+            "--assume-installed", "foo=1.0", "bar",
+        ])));
     }
 
     #[test]

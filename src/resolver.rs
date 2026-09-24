@@ -66,8 +66,8 @@ impl CandidatePackage {
     }
 
     pub fn compute_net_delta(&self, installed_size: i64) -> Option<i64> {
-        if self.isize > 0 {
-            Some(self.isize - installed_size)
+        if !self.is_aur && self.isize > 0 {
+            self.isize.checked_sub(installed_size)
         } else {
             None
         }
@@ -942,7 +942,7 @@ mod tests {
         let antigravity_inst_size = 507 * 1024 * 1024;
         assert_eq!(aur_cand.compute_net_delta(antigravity_inst_size), None);
 
-        // Built/cached AUR candidate: has real isize, computes exact delta
+        // A cached AUR build is still not a reliable remote upgrade size.
         let aur_cand_cached = CandidatePackage {
             name: "antigravity".to_string(),
             version: "2.16.0-1".to_string(),
@@ -955,10 +955,7 @@ mod tests {
             is_aur: true,
             depends: Vec::new(),
         };
-        assert_eq!(
-            aur_cand_cached.compute_net_delta(507 * 1024 * 1024),
-            Some(-12 * 1024 * 1024)
-        );
+        assert_eq!(aur_cand_cached.compute_net_delta(507 * 1024 * 1024), None);
 
         // Repo candidate: size increases
         let repo_cand_growth = CandidatePackage {
@@ -998,6 +995,7 @@ mod tests {
             depends: Vec::new(),
         };
         assert_eq!(missing_meta_cand.compute_net_delta(1024), None);
+        assert_eq!(repo_cand_growth.compute_net_delta(i64::MIN), None);
     }
 
     #[test]

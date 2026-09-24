@@ -1,6 +1,6 @@
 [package]
 name = "pacpin"
-version = "3.1.0"
+version = "3.2.0-alpha.1"
 edition = "2021"
 authors = ["Gyan <330976822+gyanhavingsyntropy@users.noreply.github.com>"]
 description = "Declarative Package Resolver & Upgrade Engine for Arch Linux / CachyOS"
@@ -19,4 +19,4 @@ terminal_size = "0.4.4"
 crossterm = "0.28"
 libc = "0.2"
 tar = "0.4"
-ctrlc = "3.4"
+ctrlc = { version = "3.4", features = ["termination"] }

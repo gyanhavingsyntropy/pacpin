@@ -94,9 +94,16 @@ pub fn format_version_diff(old_ver: &str, new_ver: &str, max_w: usize) -> String
 }
 
 pub fn print_banner() {
+    let version = format!("pacpin v{}", env!("CARGO_PKG_VERSION"));
+    let channel = if env!("CARGO_PKG_VERSION").contains('-') {
+        " [EXPERIMENTAL]".yellow().bold().to_string()
+    } else {
+        String::new()
+    };
     println!(
-        "\n{} • {} {}",
-        "pacpin v3.1".bold().cyan(),
+        "\n{}{} • {} {}",
+        version.bold().cyan(),
+        channel,
         "Declarative Package Resolver & Upgrade Engine".dimmed(),
         "(GPLv3)".dimmed()
     );
@@ -770,17 +777,18 @@ pub fn render_transaction_view(
             let ver_raw = format_version_diff(&p.installed_ver, &cand.version, ver_w);
             let ver_str = format!("{:<vw$}", ver_raw, vw = ver_w);
 
-            let csize_str = if cand.csize > 0 {
+            let csize_str = if !cand.is_aur && cand.csize > 0 {
                 format_size(cand.csize)
             } else {
                 "-".to_string()
             };
-            let isize_str = if cand.isize > 0 {
+            let isize_str = if !cand.is_aur && cand.isize > 0 {
                 format_size(cand.isize)
             } else {
                 "-".to_string()
             };
-            let (delta_raw, delta_color) = if let Some(delta) = p.net_delta {
+            let display_delta = if cand.is_aur { None } else { p.net_delta };
+            let (delta_raw, delta_color) = if let Some(delta) = display_delta {
                 format_delta_text(delta)
             } else {
                 ("-".to_string(), colored::Color::BrightBlack)
@@ -788,21 +796,23 @@ pub fn render_transaction_view(
 
             let csize_padded = format!("{:>10}", csize_str).dimmed();
             let isize_padded = format!("{:>10}", isize_str).dimmed();
-            let delta_11 = if p.net_delta.is_some() {
+            let delta_11 = if display_delta.is_some() {
                 format!("{:>11}", delta_raw).color(delta_color)
             } else {
                 format!("{:>11}", delta_raw).dimmed()
             };
-            let delta_10 = if p.net_delta.is_some() {
+            let delta_10 = if display_delta.is_some() {
                 format!("{:>10}", delta_raw).color(delta_color)
             } else {
                 format!("{:>10}", delta_raw).dimmed()
             };
 
-            tot_csize += cand.csize;
-            tot_isize += cand.isize;
-            if let Some(delta) = p.net_delta {
-                tot_delta += delta;
+            if !cand.is_aur {
+                tot_csize = tot_csize.saturating_add(cand.csize.max(0));
+                tot_isize = tot_isize.saturating_add(cand.isize.max(0));
+            }
+            if let Some(delta) = display_delta {
+                tot_delta = tot_delta.saturating_add(delta);
                 has_known_delta = true;
             }
 

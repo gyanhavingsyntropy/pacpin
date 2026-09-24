@@ -2,6 +2,13 @@
 
 **Declarative Package Resolver & Upgrade Engine for Arch Linux / CachyOS**
 
+> [!WARNING]
+> **Experimental pre-release (`3.2.0-alpha.1`).** Known bugs remain, and the
+> published `v3.1.0` build should not be considered stable. Pacpin has not
+> completed a release-grade security review. Avoid unattended upgrades and
+> running untrusted packages with `pin try` or `pin run`; test in a disposable
+> VM, inspect each proposed transaction, and keep system backups.
+
 `pacpin` is a high-performance native package resolver, system upgrade engine, and package sandboxing tool written in Rust for Arch Linux and CachyOS. It combines declarative repository pinning, repo-level exclusions, stability delay buffers, companion split-package cascades, vendor stickiness, multi-package manager unification, post-upgrade restart inspection, ephemeral sandboxing, and transaction snapshot rollback journaling directly on top of `libalpm` via zero-copy C FFI.
 
 ---
@@ -12,7 +19,7 @@
 2. **True Resolver Engine**: Synthesizes explicit qualified package targets (`repo/pkg`) instead of blind `pacman -Su` commands, preventing unexpected repository hopping.
 3. **Opt-In Vendor Stickiness**: Keep packages bound to their originating repository (`%INSTALLED_DB%`) during upgrades so they don't unexpectedly jump between sync repositories (e.g. `core` ➔ `cachyos`), displaying a distinct `[sticky]` badge in transactions.
 4. **BIOS-Style Repository Priority Menu**: Interactively reorder your system's repository search priority using arrow keys and instant promotion/demotion (`pacpin repos`).
-5. **Ephemeral Package Sandbox (`pacpin try [repo/]pkg [args...]`)**: Like `nix run`, download and execute tools in a kernel-isolated container using Bubblewrap (`bwrap`) with unshared namespaces, read-only system mounts, private in-memory `/tmp`, fail-closed SHA256 integrity verification, archive traversal guards, and zero host residue upon exit (supports native Arch repos, `flatpak/<app-id>`, `nix/<pkg>`, and `pipx/<pkg>`).
+5. **Ephemeral Package Sandbox (`pacpin try [repo/]pkg [args...]`)**: Download and execute native Arch packages in a Bubblewrap (`bwrap`) container with unshared namespaces, read-only system mounts, private in-memory `/tmp`, SHA256 verification, and archive traversal guards. Flatpak apps use Flatpak's own sandbox; Nix and Pipx execute on the host only with explicit `pin run` or `--no-sandbox`.
 6. **Post-Upgrade Restart Inspector (`needrestart`)**: Automatically inspect running processes holding deleted `.so` libraries in RAM (`/proc/*/maps`) and verify running kernel vs installed modules (supporting Arch, CachyOS, XanMod, RT, TKG, and Bochs kernels), advising on exact service restart commands (`sudo systemctl restart <srv>`) with zero noise when nothing needs restarting.
 7. **Scrollable Checkbox TUI with Batch Shortcuts**: Interactive viewport checklist (`Space` toggle, `Enter` confirm) with one-key batch actions (`[a]` All, `[n]` None, `[p]` Pure Only, `[i]` Invert, `/` Search) for orphan management and setup.
 8. **Unified Multi-Package Manager Integrations**: Simultaneously check, refresh, and execute updates for Flatpak, Nix, and Pipx alongside Pacman and AUR in a single transaction view.
@@ -99,7 +106,7 @@ pipx = true
 ### Power Tools & Sandboxing
 | Command | Description |
 | :--- | :--- |
-| `pacpin try [--no-sandbox] [repo/]pkg [args...]` (`pin run`) | Run package in an ephemeral Bubblewrap container (`--no-sandbox` / `--bare` runs with host environment isolation) |
+| `pacpin try [--no-sandbox] [repo/]pkg [args...]` (`pin run`) | Run native Arch packages in an ephemeral Bubblewrap container (`--no-sandbox` / `--bare` runs on the host) |
 | `pacpin history [id]` | View transaction history timeline or inspect full package diff |
 | `pacpin rollback [id] [-n]` | Restore previous package versions from pacman cache |
 

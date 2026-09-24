@@ -120,6 +120,7 @@ impl OrphanManager {
         // are orphaned (including cyclic required dependency clusters).
         let mut reachable_from_explicit: HashSet<String> = HashSet::new();
         let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let mut satisfier_cache: HashMap<String, Option<String>> = HashMap::new();
 
         for pkg in local.pkgs() {
             if pkg.reason() == alpm::PackageReason::Explicit {
@@ -130,30 +131,17 @@ impl OrphanManager {
             }
         }
 
-        // Pre-index virtual provides mapping for fast O(1) dependency resolution
-        let mut provides_map: HashMap<String, String> = HashMap::new();
-        for pkg in local.pkgs() {
-            let pkg_name = pkg.name();
-            for prov in pkg.provides() {
-                provides_map.insert(prov.name().to_string(), pkg_name.to_string());
-            }
-        }
-
         while let Some(pkg_name) = queue.pop_front() {
             if let Ok(pkg) = local.pkg(pkg_name.as_str()) {
                 for dep in pkg.depends() {
-                    let dep_name = dep.name();
-                    let satisfier = local
-                        .pkg(dep_name)
-                        .ok()
-                        .or_else(|| {
-                            provides_map
-                                .get(dep_name)
-                                .and_then(|pn| local.pkg(pn.as_str()).ok())
+                    // ALPM checks version constraints and all virtual providers here.
+                    let sat_name = satisfier_cache
+                        .entry(dep.to_string())
+                        .or_insert_with_key(|spec| {
+                            local.pkgs().find_satisfier(spec.as_str()).map(|p| p.name().to_string())
                         })
-                        .or_else(|| local.pkgs().find_satisfier(dep_name));
-                    if let Some(sat) = satisfier {
-                        let sat_name = sat.name().to_string();
+                        .clone();
+                    if let Some(sat_name) = sat_name {
                         if reachable_from_explicit.insert(sat_name.clone()) {
                             queue.push_back(sat_name);
                         }
@@ -280,7 +268,14 @@ impl OrphanManager {
     }
 
     pub fn has_changed(current: &[OrphanPackage]) -> bool {
-        match Self::load_known() {
+        Self::has_changed_from_known(current, Self::load_known().as_ref())
+    }
+
+    fn has_changed_from_known(
+        current: &[OrphanPackage],
+        known: Option<&HashMap<String, KnownOrphan>>,
+    ) -> bool {
+        match known {
             Some(known) => current.iter().any(|o| match known.get(&o.name) {
                 None => true,
                 Some(record) => record.is_pure != o.is_pure(),
@@ -289,9 +284,9 @@ impl OrphanManager {
         }
     }
 
-    pub fn execute_removal(selected: &[String]) {
+    pub fn execute_removal(selected: &[String]) -> bool {
         if selected.is_empty() {
-            return;
+            return true;
         }
 
         println!(
@@ -326,6 +321,7 @@ impl OrphanManager {
                     )
                     .green()
                 );
+                true
             }
             Ok(s) => {
                 eprintln!(
@@ -336,9 +332,11 @@ impl OrphanManager {
                     )
                     .yellow()
                 );
+                false
             }
             Err(e) => {
                 eprintln!("{}", format!("Failed to run sudo pacman: {}", e).red());
+                false
             }
         }
     }
@@ -412,10 +410,7 @@ mod tests {
                 optional_for: Vec::new(),
             },
         ];
-        let has_change = current_identical.iter().any(|o| match known.get(&o.name) {
-            None => true,
-            Some(r) => r.is_pure != o.is_pure(),
-        });
+        let has_change = OrphanManager::has_changed_from_known(&current_identical, Some(&known));
         assert!(!has_change);
 
         // 2. 'ladspa' converts from optional to pure -> MUST detect change!
@@ -439,10 +434,7 @@ mod tests {
                 optional_for: Vec::new(),
             },
         ];
-        let has_change_converted = current_converted.iter().any(|o| match known.get(&o.name) {
-            None => true,
-            Some(r) => r.is_pure != o.is_pure(),
-        });
+        let has_change_converted = OrphanManager::has_changed_from_known(&current_converted, Some(&known));
         assert!(has_change_converted);
 
         // 3. Brand new orphan appears -> MUST detect change!
@@ -457,11 +449,28 @@ mod tests {
                 optional_for: Vec::new(),
             },
         ];
-        let has_change_new = current_new_orphan.iter().any(|o| match known.get(&o.name) {
-            None => true,
-            Some(r) => r.is_pure != o.is_pure(),
-        });
+        let has_change_new = OrphanManager::has_changed_from_known(&current_new_orphan, Some(&known));
         assert!(has_change_new);
+    }
+
+    #[test]
+    fn test_multi_step_optional_parent_transitions() {
+        let mut known = HashMap::from([(
+            "plugin".to_string(),
+            KnownOrphan { is_pure: false, optional_for: vec!["parent-a".into(), "parent-b".into()] },
+        )]);
+        let mut plugin = OrphanPackage {
+            name: "plugin".into(), version: "1".into(), isize: 1, desc: String::new(),
+            is_projected: false, dropped_by: Vec::new(),
+            optional_for: vec!["parent-b".into()],
+        };
+        assert!(!OrphanManager::has_changed_from_known(&[plugin.clone()], Some(&known)));
+        plugin.optional_for.clear();
+        assert!(OrphanManager::has_changed_from_known(&[plugin.clone()], Some(&known)));
+        known.get_mut("plugin").unwrap().is_pure = true;
+        assert!(!OrphanManager::has_changed_from_known(&[plugin.clone()], Some(&known)));
+        plugin.optional_for.push("parent-c".into());
+        assert!(OrphanManager::has_changed_from_known(&[plugin], Some(&known)));
     }
 
     #[test]
@@ -643,4 +652,3 @@ mod tests {
         assert_eq!(orphans[2].optional_for, vec!["vlc".to_string()]);
     }
 }
-

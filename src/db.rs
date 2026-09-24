@@ -72,7 +72,7 @@ impl AlpmManager {
         let handle = Alpm::new(root.as_ref(), dbpath.as_ref())?;
         let repos = Self::resolve_repo_order(repo_order);
         for repo in &repos {
-            let _ = handle.register_syncdb(repo.as_str(), SigLevel::USE_DEFAULT);
+            handle.register_syncdb(repo.as_str(), SigLevel::USE_DEFAULT)?;
         }
         Ok(Self { handle, repos })
     }
@@ -102,8 +102,12 @@ impl AlpmManager {
                     db_file.display()
                 ));
             } else if let Some(db) = self.handle.syncdbs().into_iter().find(|d| d.name() == repo) {
-                // Ensure the database can be enumerated without error
-                let _ = db.pkgs().len();
+                if let Err(e) = db.is_valid() {
+                    warnings.push(format!(
+                        "Repository '[{}]' sync database failed ALPM validation ({}). Run 'pin -Sy' or 'pacman -Sy' to synchronize.",
+                        repo, e
+                    ));
+                }
             }
         }
         warnings
@@ -122,9 +126,10 @@ impl AlpmManager {
         let mut result = Vec::new();
         let mut seen = HashSet::new();
 
-        // 1. Add configured repos in order
+        // Only configured pacman repositories can be registered with ALPM.
+        let available: HashSet<&str> = discovered.iter().map(String::as_str).collect();
         for r in repo_order {
-            if !seen.contains(r) {
+            if available.contains(r.as_str()) && !seen.contains(r) {
                 result.push(r.clone());
                 seen.insert(r.clone());
             }
@@ -253,14 +258,14 @@ impl AlpmManager {
             get_servers: &mut dyn FnMut(&str) -> Result<Vec<String>, String>,
         ) -> Result<(), String> {
             for dep in pkg.depends() {
-                let dep_name = dep.name();
-                if visited_deps.contains(dep_name) {
+                let dep_spec = dep.to_string();
+                if visited_deps.contains(&dep_spec) {
                     continue;
                 }
-                visited_deps.insert(dep_name.to_string());
+                visited_deps.insert(dep_spec.clone());
 
                 // Check if already satisfied locally
-                if local_db.pkgs().find_satisfier(dep_name).is_some() {
+                if local_db.pkgs().find_satisfier(dep_spec.as_str()).is_some() {
                     continue;
                 }
 
@@ -268,7 +273,7 @@ impl AlpmManager {
                 let mut found = None;
                 for r in &manager.repos {
                     if let Some(db) = syncdb_map.get(r.as_str()) {
-                        if let Some(p) = db.pkgs().find_satisfier(dep_name) {
+                        if let Some(p) = db.pkgs().find_satisfier(dep_spec.as_str()) {
                             found = Some((r.clone(), p));
                             break;
                         }
@@ -307,6 +312,11 @@ impl AlpmManager {
                             sha256,
                         });
                     }
+                } else {
+                    return Err(format!(
+                        "Unsatisfied dependency '{}' required by '{}' in available repositories",
+                        dep_spec, pkg.name()
+                    ));
                 }
             }
             Ok(())
@@ -536,7 +546,7 @@ mod tests {
         let discovered = vec!["core".to_string(), "extra".to_string()];
         let repo_order = vec!["custom-repo".to_string(), "core".to_string()];
         let order = AlpmManager::order_repos(&discovered, &repo_order);
-        assert_eq!(order, vec!["custom-repo", "core", "extra"]);
+        assert_eq!(order, vec!["core", "extra"]);
     }
 
     #[test]
@@ -546,7 +556,7 @@ mod tests {
         // check if find_satisfier exists
         if let Some(pkg) = local_db.pkgs().first() {
             for dep in pkg.depends() {
-                let _sat = local_db.pkgs().find_satisfier(dep.name());
+                let _sat = local_db.pkgs().find_satisfier(dep.to_string());
             }
         }
 
@@ -564,8 +574,21 @@ mod tests {
         println!("sha256: {:?}", pkg.sha256sum());
         println!("md5: {:?}", pkg.md5sum());
         for dep in pkg.depends() {
-            let sat_local = local_db.pkgs().find_satisfier(dep.name()).is_some();
-            println!("  dep {}: satisfied locally = {}", dep.name(), sat_local);
+            let sat_local = local_db.pkgs().find_satisfier(dep.to_string()).is_some();
+            println!("  dep {}: satisfied locally = {}", dep, sat_local);
+        }
+    }
+
+    #[test]
+    fn test_alpm_full_dependency_expression_respects_versions_and_providers() {
+        let manager = AlpmManager::new().unwrap();
+        let local = manager.handle().localdb();
+        if local.pkg("glibc").is_ok() {
+            assert!(local.pkgs().find_satisfier("glibc>=0").is_some());
+            assert!(local.pkgs().find_satisfier("glibc<0").is_none());
+        }
+        if local.pkg("bash").is_ok() {
+            assert!(local.pkgs().find_satisfier("sh").is_some());
         }
     }
 

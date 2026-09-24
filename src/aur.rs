@@ -58,6 +58,21 @@ pub struct AurRpcResponse {
     pub error: Option<String>,
 }
 
+fn parse_aur_rpc_response(body: &str) -> Result<Vec<AurItem>, String> {
+    let rpc: AurRpcResponse = serde_json::from_str(body)
+        .map_err(|e| format!("Invalid AUR RPC JSON: {}", e))?;
+    if let Some(error) = rpc.error {
+        return Err(format!("AUR RPC returned error: {}", error));
+    }
+    if rpc.version != Some(5) || rpc.response_type.as_deref() != Some("multiinfo") {
+        return Err("Unexpected AUR RPC response version or type".to_string());
+    }
+    if rpc.resultcount != Some(rpc.results.len() as u32) {
+        return Err("AUR RPC result count does not match response data".to_string());
+    }
+    Ok(rpc.results)
+}
+
 fn query_aur_chunk(chunk: &[String]) -> HashMap<String, AurItem> {
     let mut results = HashMap::new();
     let agent = ureq::AgentBuilder::new()
@@ -98,33 +113,24 @@ fn query_aur_chunk(chunk: &[String]) -> HashMap<String, AurItem> {
                     continue;
                 }
 
-                match serde_json::from_str::<AurRpcResponse>(&text) {
-                    Ok(rpc) => {
-                        if let Some(ref err_msg) = rpc.error {
-                            if attempts == max_attempts {
-                                eprintln!(
-                                    "{}",
-                                    format!(":: Warning: AUR RPC returned error: {}", err_msg).yellow()
-                                );
-                            }
-                        } else {
-                            for mut item in rpc.results {
-                                item.name = crate::utils::sanitize_display_text(&item.name);
-                                item.description = item
-                                    .description
-                                    .as_ref()
-                                    .map(|d| crate::utils::sanitize_display_text(d));
-                                results.insert(item.name.clone(), item);
-                            }
-                            success = true;
+                match parse_aur_rpc_response(&text) {
+                    Ok(items) => {
+                        for mut item in items {
+                            item.name = crate::utils::sanitize_display_text(&item.name);
+                            item.description = item
+                                .description
+                                .as_ref()
+                                .map(|d| crate::utils::sanitize_display_text(d));
+                            results.insert(item.name.clone(), item);
                         }
+                        success = true;
                     }
                     Err(e) => {
                         if attempts == max_attempts {
                             eprintln!(
                                 "{}",
                                 format!(
-                                    ":: Warning: Failed to parse AUR RPC response JSON (attempt {}/{}): {}",
+                                    ":: Warning: AUR RPC response rejected (attempt {}/{}): {}",
                                     attempts, max_attempts, e
                                 )
                                 .yellow()
@@ -279,5 +285,14 @@ mod tests {
         assert_eq!(rpc.resultcount, Some(0));
         assert!(rpc.results.is_empty());
         assert!(rpc.error.is_none());
+    }
+
+    #[test]
+    fn test_aur_rpc_rejects_malformed_and_inconsistent_responses() {
+        assert!(parse_aur_rpc_response("not json").is_err());
+        assert!(parse_aur_rpc_response("{}").is_err());
+        assert!(parse_aur_rpc_response(r#"{"version":5,"type":"error","error":"rate limited"}"#).is_err());
+        assert!(parse_aur_rpc_response(r#"{"version":5,"type":"multiinfo","resultcount":1,"results":[]}"#).is_err());
+        assert!(parse_aur_rpc_response(r#"{"version":5,"type":"multiinfo","resultcount":0,"results":[]}"#).unwrap().is_empty());
     }
 }

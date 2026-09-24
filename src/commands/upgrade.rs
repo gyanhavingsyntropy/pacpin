@@ -114,31 +114,22 @@ pub fn cmd_upgrade(
         false
     };
 
-    // Only show up when something changed (or if user explicitly requested autoremove)
-    if autoremove || orphan_list_changed {
-        ui::render_orphans_summary(&orphans);
-    }
-
     if updates.is_empty() && external_updates.is_empty() {
+        if autoremove || orphan_list_changed {
+            println!("\n{}", ":: No package updates; orphan cleanup is a separate action.".cyan());
+            ui::render_orphans_summary(&orphans);
+        }
         if (autoremove || orphan_list_changed) && !dry_run && !orphans.is_empty() {
             let selected_orphans = if !noconfirm {
                 ui::prompt_orphan_selection(&orphans, false)
-            } else if autoremove {
-                orphans
-                    .iter()
-                    .filter(|o| o.is_pure())
-                    .map(|o| o.name.clone())
-                    .collect()
             } else {
-                Vec::new()
+                noconfirm_orphan_selection(&orphans, autoremove)
             };
 
-            if !selected_orphans.is_empty() {
-                OrphanManager::execute_removal(&selected_orphans);
-            }
+            let removed = OrphanManager::execute_removal(&selected_orphans);
             let remaining: Vec<OrphanPackage> = orphans
                 .iter()
-                .filter(|o| !selected_orphans.contains(&o.name))
+                .filter(|o| !removed || !selected_orphans.contains(&o.name))
                 .cloned()
                 .collect();
             OrphanManager::save_known(&remaining);
@@ -224,18 +215,16 @@ pub fn cmd_upgrade(
     if dry_run {
         println!("{}", "Dry-Run: Synthesized Upgrade Commands:".bold());
         println!("  ➔ {}\n", full_cmd.cyan());
-        let empty_orphans: Vec<crate::db::OrphanPackage> = Vec::new();
-        let targets_to_show = if autoremove || orphan_list_changed {
-            &orphans
-        } else {
-            &empty_orphans
-        };
-        if !targets_to_show.is_empty() {
-            let names: Vec<String> = targets_to_show.iter().map(|o| o.name.clone()).collect();
-            println!("{}", "Dry-Run: Projected Orphan Removal Command:".bold());
+        if (autoremove || orphan_list_changed) && !orphans.is_empty() {
+            println!("{}", "Dry-Run: Separate orphan cleanup review:".bold());
+            ui::render_orphans_summary(&orphans);
+        }
+        let automatic_orphans = noconfirm_orphan_selection(&orphans, autoremove);
+        if !automatic_orphans.is_empty() {
+            println!("\n{}", "Dry-Run: Orphan removal only if --autoremove is selected and upgrade succeeds:".bold());
             println!(
                 "  ➔ {}\n",
-                format!("sudo pacman -Rns --noconfirm {}", names.join(" ")).cyan()
+                format!("sudo pacman -Rns --noconfirm {}", automatic_orphans.join(" ")).cyan()
             );
         }
         return;
@@ -282,14 +271,16 @@ pub fn cmd_upgrade(
         }
 
         if (autoremove || orphan_list_changed) && !orphans.is_empty() {
+            println!("\n{}", ":: Upgrade accepted. Orphan cleanup is optional and separate; selected packages are removed only after a successful upgrade.".cyan());
+            ui::render_orphans_summary(&orphans);
             selected_orphans = ui::prompt_orphan_selection(&orphans, true);
         }
-    } else if autoremove && !orphans.is_empty() {
-        selected_orphans = orphans
-            .iter()
-            .filter(|o| o.is_pure())
-            .map(|o| o.name.clone())
-            .collect();
+    } else {
+        if (autoremove || orphan_list_changed) && !orphans.is_empty() {
+            println!("\n{}", ":: Orphans are separate from the update transaction.".cyan());
+            ui::render_orphans_summary(&orphans);
+        }
+        selected_orphans = noconfirm_orphan_selection(&orphans, autoremove);
     }
 
     let mut applied_updates: Vec<ResolvedPackage> = Vec::new();
@@ -401,18 +392,24 @@ pub fn cmd_upgrade(
     }
 
     if all_success {
-        // Execute orphan removal ONLY AFTER full successful upgrade
-        if !selected_orphans.is_empty() {
-            OrphanManager::execute_removal(&selected_orphans);
+        // Recheck the installed graph: projected orphans may still be required
+        // (or may no longer be installed) after the real transaction.
+        match AlpmManager::with_repo_order(&config.repo_order) {
+            Ok(fresh_manager) => {
+                let actual_orphans = fresh_manager.get_orphans(&[]);
+                let safe_selection = revalidate_orphan_selection(&selected_orphans, &actual_orphans, noconfirm);
+                if safe_selection.len() != selected_orphans.len() {
+                    eprintln!("{}", ":: Some projected orphans are still required or were already removed; skipping those selections.".yellow());
+                }
+                let removed = OrphanManager::execute_removal(&safe_selection);
+                let remaining: Vec<OrphanPackage> = actual_orphans
+                    .into_iter()
+                    .filter(|o| !removed || !safe_selection.contains(&o.name))
+                    .collect();
+                OrphanManager::save_known(&remaining);
+            }
+            Err(e) => eprintln!("{}", format!(":: Cannot recheck orphans after upgrade; skipping cleanup: {e}").yellow()),
         }
-
-        // Update known orphans state after transaction & removals
-        let remaining_orphans: Vec<OrphanPackage> = orphans
-            .iter()
-            .filter(|o| !selected_orphans.contains(&o.name))
-            .cloned()
-            .collect();
-        OrphanManager::save_known(&remaining_orphans);
     } else {
         match exit_status {
             Ok(s) => exit(s.code().unwrap_or(1)),
@@ -422,6 +419,23 @@ pub fn cmd_upgrade(
             }
         }
     }
+}
+
+fn noconfirm_orphan_selection(orphans: &[OrphanPackage], autoremove: bool) -> Vec<String> {
+    if !autoremove {
+        return Vec::new();
+    }
+    orphans.iter().filter(|o| o.is_pure()).map(|o| o.name.clone()).collect()
+}
+
+fn revalidate_orphan_selection(
+    selected: &[String],
+    actual: &[OrphanPackage],
+    noconfirm: bool,
+) -> Vec<String> {
+    selected.iter().filter(|name| {
+        actual.iter().any(|orphan| orphan.name == **name && (!noconfirm || orphan.is_pure()))
+    }).cloned().collect()
 }
 
 pub fn parse_install_flags(flags: &[String]) -> pm::InstallOptions {
@@ -491,5 +505,27 @@ pub fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
             eprintln!("{}", format!("Error: {}", e).red());
             exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn noconfirm_only_autoremoves_pure_orphans_when_requested() {
+        let make_orphan = |name: &str, optional_for: Vec<String>| OrphanPackage {
+            name: name.into(), version: "1".into(), isize: 1,
+            desc: String::new(), is_projected: false, dropped_by: Vec::new(), optional_for,
+        };
+        let orphans = vec![
+            make_orphan("pure", Vec::new()),
+            make_orphan("plugin", vec!["installed-parent".into()]),
+        ];
+        assert!(noconfirm_orphan_selection(&orphans, false).is_empty());
+        assert_eq!(noconfirm_orphan_selection(&orphans, true), vec!["pure"]);
+        let selected = vec!["pure".into(), "plugin".into(), "no-longer-orphan".into()];
+        assert_eq!(revalidate_orphan_selection(&selected, &orphans, false), vec!["pure", "plugin"]);
+        assert_eq!(revalidate_orphan_selection(&selected, &orphans, true), vec!["pure"]);
     }
 }

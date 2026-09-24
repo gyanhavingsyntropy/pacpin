@@ -20,16 +20,70 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static CLEANUP_TARGETS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+static ACTIVE_CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static TERMINATING: AtomicBool = AtomicBool::new(false);
+
+pub fn is_terminating() -> bool {
+    TERMINATING.load(Ordering::SeqCst)
+}
+
+pub fn run_tracked_command(command: &mut Command) -> io::Result<std::process::ExitStatus> {
+    if is_terminating() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "pacpin is terminating"));
+    }
+    let mut child = command.spawn()?;
+    let pid = child.id();
+    if let Ok(mut lock) = ACTIVE_CHILDREN.lock() {
+        lock.push(pid);
+    }
+    if is_terminating() {
+        let _ = child.kill();
+    }
+    let status = child.wait();
+    if let Ok(mut lock) = ACTIVE_CHILDREN.lock() {
+        lock.retain(|&active| active != pid);
+    }
+    if is_terminating() {
+        Err(io::Error::new(io::ErrorKind::Interrupted, "pacpin is terminating"))
+    } else {
+        status
+    }
+}
+
+fn kill_active_children() {
+    if let Ok(mut lock) = ACTIVE_CHILDREN.lock() {
+        for pid in lock.drain(..) {
+            #[cfg(unix)]
+            unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+        }
+    }
+}
 
 pub fn register_cleanup_target(path: PathBuf) {
+    if is_terminating() {
+        remove_cleanup_path(&path);
+        return;
+    }
     if let Ok(mut lock) = CLEANUP_TARGETS.lock() {
-        if !lock.contains(&path) {
+        if is_terminating() {
+            drop(lock);
+            remove_cleanup_path(&path);
+        } else if !lock.contains(&path) {
             lock.push(path);
         }
+    }
+}
+
+fn remove_cleanup_path(path: &Path) {
+    if path.is_dir() {
+        let _ = fs::remove_dir_all(path);
+    } else if path.is_file() {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -40,13 +94,9 @@ pub fn unregister_cleanup_target(path: &Path) {
 }
 
 pub fn cleanup_active_targets() {
-    if let Ok(mut lock) = CLEANUP_TARGETS.try_lock() {
+    if let Ok(mut lock) = CLEANUP_TARGETS.lock() {
         for path in lock.drain(..) {
-            if path.is_dir() {
-                let _ = fs::remove_dir_all(&path);
-            } else if path.is_file() {
-                let _ = fs::remove_file(&path);
-            }
+            remove_cleanup_path(&path);
         }
     }
 }
@@ -58,7 +108,7 @@ pub fn clean_stale_sandboxes() {
             if let Ok(entries) = fs::read_dir(&dir) {
                 for entry in entries.flatten() {
                     let p = entry.path();
-                    if p.is_dir() {
+                    if p.is_dir() && should_clean_stale_sandbox(&p) {
                         let _ = fs::remove_dir_all(&p);
                     }
                 }
@@ -71,7 +121,10 @@ pub fn clean_stale_sandboxes() {
         for entry in entries.flatten() {
             let p = entry.path();
             if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if (name.starts_with("pacpin-run-") || name.starts_with("pacpin-try-")) && p.is_dir() {
+                if (name.starts_with("pacpin-run-") || name.starts_with("pacpin-try-"))
+                    && p.is_dir()
+                    && should_clean_stale_sandbox(&p)
+                {
                     let _ = fs::remove_dir_all(&p);
                 }
             }
@@ -79,10 +132,37 @@ pub fn clean_stale_sandboxes() {
     }
 }
 
+fn should_clean_stale_sandbox(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !name.starts_with("pacpin-run-") && !name.starts_with("pacpin-try-") {
+        return false;
+    }
+    if let Some((_, suffix)) = name.rsplit_once("-pid") {
+        if let Some(pid) = suffix.split('-').next().and_then(|s| s.parse::<i32>().ok()) {
+            if pid > 0 {
+                #[cfg(unix)]
+                return unsafe { libc::kill(pid, 0) != 0 }
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            }
+        }
+    }
+    // Older pacpin directories have no PID. Leave recent ones alone because they
+    // may still belong to a live process.
+    path.metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age >= std::time::Duration::from_secs(24 * 60 * 60))
+}
+
 pub fn init_signal_handlers() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = ctrlc::set_handler(move || {
+            TERMINATING.store(true, Ordering::SeqCst);
+            kill_active_children();
             cleanup_active_targets();
             std::process::exit(130);
         });
@@ -105,9 +185,8 @@ impl SandboxGuard {
 
     pub fn register_tarball(&mut self, tarball: &Path) {
         let p = tarball.to_path_buf();
-        register_cleanup_target(p.clone());
-        if !self.downloaded_tarballs.contains(&p) {
-            self.downloaded_tarballs.push(p);
+        if self.downloaded_tarballs.contains(&p) {
+            register_cleanup_target(p);
         }
     }
 }
@@ -173,6 +252,10 @@ pub fn cmd_try(target: &str, args: &[String], options: &TryOptions) {
 
     let res = match prefix {
         Some("flatpak") => try_flatpak(pkg, args),
+        provider if host_only_provider(provider) && !options.no_sandbox => Err(
+            "Nix and Pipx run their programs on the host. Use 'pin run' or pass --no-sandbox to opt in to host execution."
+                .to_string(),
+        ),
         Some("nix") | Some("nixpkgs") => try_nix(pkg, args),
         Some("pipx") => try_pipx(pkg, args),
         Some(repo) => try_pacman(Some(repo), pkg, args, options),
@@ -186,6 +269,10 @@ pub fn cmd_try(target: &str, args: &[String], options: &TryOptions) {
             exit(1);
         }
     }
+}
+
+fn host_only_provider(prefix: Option<&str>) -> bool {
+    matches!(prefix, Some("nix" | "nixpkgs" | "pipx"))
 }
 
 fn try_flatpak(app_id: &str, args: &[String]) -> Result<i32, String> {
@@ -219,14 +306,8 @@ fn try_flatpak(app_id: &str, args: &[String]) -> Result<i32, String> {
                 let _ = Command::new("flatpak")
                     .args(["uninstall", "--user", "-y", self.app_id])
                     .status();
-
-                if let Ok(home) = env::var("HOME") {
-                    let app_data = Path::new(&home).join(".var").join("app").join(self.app_id);
-                    if app_data.exists() {
-                        let _ = fs::remove_dir_all(&app_data);
-                    }
-                }
-                println!("✔ Ephemeral Flatpak '{}' removed.", self.app_id.green());
+                // Flatpak app data may predate this invocation. Never delete it here.
+                println!("✔ Ephemeral Flatpak '{}' uninstalled.", self.app_id.green());
             }
         }
     }
@@ -358,17 +439,9 @@ fn try_pipx(pkg: &str, args: &[String]) -> Result<i32, String> {
 
 fn create_secure_temp_dir(prefix: &str) -> Result<PathBuf, String> {
     let sub = if prefix.starts_with("pacpin-run") { "run" } else { "try" };
-    let base_dir = if let Ok(xdg_runtime) = env::var("XDG_RUNTIME_DIR") {
-        let p = PathBuf::from(xdg_runtime).join("pacpin").join(sub);
-        let _ = fs::create_dir_all(&p);
-        if p.is_dir() {
-            p
-        } else {
-            env::temp_dir()
-        }
-    } else {
-        env::temp_dir()
-    };
+    let base_dir = env::var_os("XDG_RUNTIME_DIR")
+        .and_then(|runtime| private_runtime_subdir(Path::new(&runtime), sub).ok())
+        .unwrap_or_else(env::temp_dir);
 
     #[cfg(unix)]
     use std::os::unix::fs::DirBuilderExt;
@@ -387,7 +460,7 @@ fn create_secure_temp_dir(prefix: &str) -> Result<PathBuf, String> {
             random_bytes = (nanos ^ (pid << 64)).to_le_bytes();
         }
         let hex = random_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-        let target = base_dir.join(format!("{}-{}", prefix, hex));
+        let target = base_dir.join(format!("{}-pid{}-{}", prefix, std::process::id(), hex));
 
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
@@ -400,11 +473,150 @@ fn create_secure_temp_dir(prefix: &str) -> Result<PathBuf, String> {
     Err("Failed to create secure sandbox directory with exclusive permissions".to_string())
 }
 
+fn private_runtime_subdir(runtime: &Path, sub: &str) -> Result<PathBuf, String> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    #[cfg(unix)]
+    fn private_owned_dir(path: &Path) -> bool {
+        let Ok(meta) = fs::symlink_metadata(path) else { return false; };
+        meta.is_dir()
+            && !meta.file_type().is_symlink()
+            && meta.uid() == unsafe { libc::geteuid() }
+            && meta.permissions().mode() & 0o077 == 0
+    }
+
+    #[cfg(not(unix))]
+    fn private_owned_dir(path: &Path) -> bool {
+        path.is_dir()
+    }
+
+    if !runtime.is_absolute() || !private_owned_dir(runtime) {
+        return Err("XDG_RUNTIME_DIR must be a private directory owned by the current user".into());
+    }
+    let parent = runtime.join("pacpin");
+    let child = parent.join(sub);
+    for dir in [&parent, &child] {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match builder.create(dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(format!("Cannot create private runtime directory: {err}")),
+        }
+        if !private_owned_dir(dir) {
+            return Err(format!("Unsafe runtime directory: {}", dir.display()));
+        }
+    }
+    Ok(child)
+}
+
+fn safe_wayland_socket(runtime: &Path, display: &str) -> Option<PathBuf> {
+    #[cfg(unix)]
+    use std::os::unix::fs::FileTypeExt;
+
+    if display.is_empty() || display == "." || display == ".." || display.contains(['/', '\\', '\0']) {
+        return None;
+    }
+    // Validate the runtime directory without creating anything in it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = fs::symlink_metadata(runtime).ok()?;
+        if !meta.is_dir() || meta.file_type().is_symlink()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.permissions().mode() & 0o077 != 0
+        {
+            return None;
+        }
+    }
+    let path = runtime.join(display);
+    let meta = fs::symlink_metadata(&path).ok()?;
+    #[cfg(unix)]
+    if !meta.file_type().is_socket() { return None; }
+    #[cfg(not(unix))]
+    if !meta.is_file() { return None; }
+    Some(path)
+}
+
+fn should_bind_cwd(cwd: &Path, home: &Path) -> bool {
+    let (Ok(cwd), Ok(home)) = (cwd.canonicalize(), home.canonicalize()) else {
+        return false;
+    };
+    if cwd == Path::new("/") || cwd.starts_with(&home) || home.starts_with(&cwd) {
+        return false;
+    }
+    let protected = [
+        "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc", "/run",
+        "/sbin", "/sys", "/tmp", "/usr", "/var",
+    ];
+    !protected.iter().any(|path| cwd.starts_with(path))
+}
+
 #[allow(unused_imports)]
 pub use crate::download::{
     compute_sha256, create_secure_temp_file, extract_archive, is_safe_link_destination,
     is_safe_tar_entry, is_safe_tar_listing_line, MAX_ARCHIVE_ENTRIES, MAX_UNPACKED_BYTES,
 };
+
+fn add_host_runtime_mounts(command: &mut Command) {
+    for dir in &["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"] {
+        let path = Path::new(dir);
+        if path.exists() {
+            command.arg("--ro-bind").arg(path).arg(path);
+        }
+    }
+}
+
+fn supports_ro_overlay() -> bool {
+    let mut probe = Command::new("bwrap");
+    probe.args(["--unshare-all", "--die-with-parent", "--new-session"]);
+    add_host_runtime_mounts(&mut probe);
+    probe.args([
+        "--overlay-src", "/usr/share", "--overlay-src", "/etc",
+        "--ro-overlay", "/usr/share", "--proc", "/proc", "--dev", "/dev",
+        "--tmpfs", "/tmp", "--", "/usr/bin/true",
+    ]);
+    probe.output().is_ok_and(|output| output.status.success())
+}
+
+fn add_package_data_mounts(
+    command: &mut Command,
+    sandbox_dir: &Path,
+    overlay_supported: bool,
+) -> Result<(), String> {
+    // Keep host /usr and /etc available for system libraries, but make data and
+    // configuration shipped by the ephemeral package visible at their normal
+    // absolute paths (many binaries have these paths compiled in).
+    for relative in ["usr/share", "usr/libexec", "etc"] {
+        let source = sandbox_dir.join(relative);
+        let target = Path::new("/").join(relative);
+        if source.is_dir() && target.is_dir() {
+            if overlay_supported {
+                command.arg("--overlay-src").arg(&target);
+                command.arg("--overlay-src").arg(source);
+                command.arg("--ro-overlay").arg(target);
+            } else if relative != "etc" {
+                // Bubblewrap cannot mkdir a new target beneath a read-only /usr bind.
+                command.arg("--ro-bind").arg(source).arg(target);
+            }
+        }
+    }
+    if !overlay_supported {
+        let source_dir = sandbox_dir.join("etc");
+        if let Ok(entries) = fs::read_dir(&source_dir) {
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("Cannot inspect package config: {e}"))?;
+                let target = Path::new("/etc").join(entry.file_name());
+                if target.exists() {
+                    command.arg("--ro-bind").arg(entry.path()).arg(target);
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Checks if bubblewrap is installed and functional with unprivileged user namespaces.
 pub fn check_bwrap_capability() -> Result<(), String> {
@@ -412,8 +624,11 @@ pub fn check_bwrap_capability() -> Result<(), String> {
         return Err("Bubblewrap ('bwrap') is not installed.".to_string());
     }
 
-    let test_res = Command::new("bwrap")
-        .args(["--unshare-user", "--ro-bind", "/usr", "/usr", "--", "/bin/true"])
+    let mut probe = Command::new("bwrap");
+    probe.args(["--unshare-all", "--die-with-parent", "--new-session"]);
+    add_host_runtime_mounts(&mut probe);
+    let test_res = probe
+        .args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--", "/usr/bin/true"])
         .output();
 
     match test_res {
@@ -541,21 +756,23 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
         );
     }
 
-    // 1. Download, verify, and safely inspect archives before extraction
-    for target in &resolved {
-        let candidate_urls = if target.candidate_urls.is_empty() {
+    // Downloads are independent; extraction stays ordered so dependencies cannot
+    // race while writing into the same root.
+    let archives = download_targets_parallel(&resolved, options.allow_unverified, &mut guard, |target, allow_unverified, downloaded| {
+        let urls = if target.candidate_urls.is_empty() {
             vec![target.url.clone()]
         } else {
             target.candidate_urls.clone()
         };
-        let tarball_path = get_or_download_package(
+        crate::download::fetch_package_archive(
             &target.name,
-            &candidate_urls,
+            &urls,
             target.sha256.as_deref(),
-            options.allow_unverified,
-            &mut guard,
-        )?;
-
+            allow_unverified,
+            downloaded,
+        )
+    })?;
+    for tarball_path in archives {
         crate::download::extract_archive(&tarball_path, &sandbox_dir)?;
     }
 
@@ -571,6 +788,7 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
 
     let current_path = env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
     let new_path = format!("{}:{}:{}", usr_bin.display(), usr_sbin.display(), current_path);
+    let sandbox_path = format!("{}:{}:/usr/local/bin:/usr/bin:/bin", usr_bin.display(), usr_sbin.display());
 
     let current_ld = env::var("LD_LIBRARY_PATH").unwrap_or_default();
     let new_ld = if current_ld.is_empty() {
@@ -578,9 +796,11 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
     } else {
         format!("{}:{}:{}", usr_lib.display(), usr_lib64.display(), current_ld)
     };
+    let sandbox_ld = format!("{}:{}", usr_lib.display(), usr_lib64.display());
 
     let current_xdg = env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
     let new_xdg = format!("{}:{}", usr_share.display(), current_xdg);
+    let sandbox_xdg = format!("{}:/usr/local/share:/usr/share", usr_share.display());
 
     if options.no_sandbox {
         if options.is_run_mode {
@@ -626,6 +846,7 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
 
         // 1. Clear full environment for security
         bwrap_cmd.arg("--clearenv");
+        bwrap_cmd.args(["--die-with-parent", "--new-session"]);
 
         // 2. Unshare all namespaces by default (IPC, PID, Net, UTS, Cgroup)
         bwrap_cmd.arg("--unshare-all");
@@ -636,12 +857,8 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
         }
 
         // 4. Mount essential host directories read-only
-        for dir in &["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"] {
-            let p = Path::new(dir);
-            if p.exists() {
-                bwrap_cmd.arg("--ro-bind").arg(p).arg(p);
-            }
-        }
+        add_host_runtime_mounts(&mut bwrap_cmd);
+        add_package_data_mounts(&mut bwrap_cmd, &sandbox_dir, supports_ro_overlay())?;
 
         // Virtual filesystems
         bwrap_cmd
@@ -655,21 +872,19 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
             bwrap_cmd.arg("--tmpfs").arg(&home);
         }
 
-        // 6. Current working directory: read-only by default, read-write only if --rw
-        let cwd_is_home = home_path.exists()
-            && cwd.canonicalize().ok() == home_path.canonicalize().ok();
-
-        if cwd.exists() && !cwd.starts_with("/tmp") && !cwd_is_home {
+        // 6. Never mount home or system directories through the current directory.
+        if should_bind_cwd(&cwd, home_path) {
             if options.rw_cwd {
                 bwrap_cmd.arg("--bind").arg(&cwd).arg(&cwd);
             } else {
                 bwrap_cmd.arg("--ro-bind").arg(&cwd).arg(&cwd);
             }
-        } else if cwd_is_home {
+            bwrap_cmd.arg("--chdir").arg(&cwd);
+        } else {
+            bwrap_cmd.args(["--chdir", "/tmp"]);
             eprintln!(
                 "{}",
-                ":: Note: Running from $HOME — working directory will not be bind-mounted \
-into the sandbox to keep your home directory isolated."
+                ":: Note: Current directory is not mounted into the sandbox; using private /tmp."
                     .yellow()
             );
         }
@@ -690,13 +905,13 @@ into the sandbox to keep your home directory isolated."
             if let Ok(disp) = env::var("DISPLAY") {
                 bwrap_cmd.args(["--setenv", "DISPLAY", &disp]);
             }
-            if let Ok(wayland_disp) = env::var("WAYLAND_DISPLAY") {
-                bwrap_cmd.args(["--setenv", "WAYLAND_DISPLAY", &wayland_disp]);
-            }
-            if let Ok(xdg_runtime) = env::var("XDG_RUNTIME_DIR") {
-                let wl_sock = Path::new(&xdg_runtime).join(env::var("WAYLAND_DISPLAY").unwrap_or_default());
-                if wl_sock.exists() {
-                    bwrap_cmd.arg("--ro-bind").arg(&wl_sock).arg(&wl_sock);
+            if let (Ok(runtime), Ok(display)) = (env::var("XDG_RUNTIME_DIR"), env::var("WAYLAND_DISPLAY")) {
+                if let Some(socket) = safe_wayland_socket(Path::new(&runtime), &display) {
+                    bwrap_cmd.arg("--ro-bind").arg(&socket).arg(Path::new("/tmp").join(&display));
+                    bwrap_cmd.args(["--setenv", "XDG_RUNTIME_DIR", "/tmp"]);
+                    bwrap_cmd.args(["--setenv", "WAYLAND_DISPLAY", &display]);
+                } else {
+                    eprintln!("{}", ":: Warning: Wayland socket was not shared; its path or permissions are unsafe.".yellow());
                 }
             }
         }
@@ -710,9 +925,9 @@ into the sandbox to keep your home directory isolated."
         }
 
         // 10. Pass strictly allowlisted environment variables
-        bwrap_cmd.args(["--setenv", "PATH", &new_path]);
-        bwrap_cmd.args(["--setenv", "LD_LIBRARY_PATH", &new_ld]);
-        bwrap_cmd.args(["--setenv", "XDG_DATA_DIRS", &new_xdg]);
+        bwrap_cmd.args(["--setenv", "PATH", &sandbox_path]);
+        bwrap_cmd.args(["--setenv", "LD_LIBRARY_PATH", &sandbox_ld]);
+        bwrap_cmd.args(["--setenv", "XDG_DATA_DIRS", &sandbox_xdg]);
         bwrap_cmd.args(["--setenv", "USER", &user]);
         bwrap_cmd.args(["--setenv", "LOGNAME", &logname]);
         bwrap_cmd.args(["--setenv", "HOME", &home]);
@@ -725,38 +940,76 @@ into the sandbox to keep your home directory isolated."
         bwrap_cmd.arg(&binary_path).args(args);
         bwrap_cmd.status()
     } else {
-        Command::new(&binary_path)
-            .args(args)
-            .env("PATH", &new_path)
-            .env("LD_LIBRARY_PATH", &new_ld)
-            .env("XDG_DATA_DIRS", &new_xdg)
-            .status()
+        run_tracked_command(
+            Command::new(&binary_path)
+                .args(args)
+                .env("PATH", &new_path)
+                .env("LD_LIBRARY_PATH", &new_ld)
+                .env("XDG_DATA_DIRS", &new_xdg)
+        )
     };
 
     drop(guard);
 
     match child_status {
-        Ok(s) => Ok(s.code().unwrap_or(0)),
+        Ok(s) => Ok(s.code().unwrap_or(1)),
         Err(e) => Err(format!("Execution failed: {}", e)),
     }
 }
 
-fn get_or_download_package(
-    pkg: &str,
-    candidate_urls: &[String],
-    expected_sha: Option<&str>,
+fn download_targets_parallel<F>(
+    targets: &[crate::db::DownloadTarget],
     allow_unverified: bool,
     guard: &mut SandboxGuard,
-) -> Result<PathBuf, String> {
-    let p = crate::download::fetch_package_archive(
-        pkg,
-        candidate_urls,
-        expected_sha,
-        allow_unverified,
-        &mut guard.downloaded_tarballs,
-    )?;
-    guard.register_tarball(&p);
-    Ok(p)
+    fetch: F,
+) -> Result<Vec<PathBuf>, String>
+where
+    F: Fn(&crate::db::DownloadTarget, bool, &mut Vec<PathBuf>) -> Result<PathBuf, String> + Sync,
+{
+    const MAX_PARALLEL_DOWNLOADS: usize = 2;
+    let mut archives = Vec::with_capacity(targets.len());
+    for batch in targets.chunks(MAX_PARALLEL_DOWNLOADS) {
+        let mut first_error = None;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|target| {
+                    let fetch = &fetch;
+                    scope.spawn(move || {
+                        let mut downloaded = Vec::new();
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            fetch(target, allow_unverified, &mut downloaded)
+                        }))
+                        .unwrap_or_else(|_| Err("Package download worker panicked".to_string()));
+                        (result, downloaded)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                match handle.join() {
+                    Ok((result, downloaded)) => {
+                        for path in downloaded {
+                            guard.downloaded_tarballs.push(path.clone());
+                            guard.register_tarball(&path);
+                        }
+                        match result {
+                            Ok(path) => archives.push(path),
+                            Err(error) if first_error.is_none() => first_error = Some(error),
+                            Err(_) => {}
+                        }
+                    }
+                    Err(_) if first_error.is_none() => {
+                        first_error = Some("Package download worker panicked".to_string());
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+    }
+    Ok(archives)
 }
 
 fn find_executable(sandbox_dir: &Path, pkg: &str, requested_bin: Option<&str>) -> Result<PathBuf, String> {
@@ -764,6 +1017,14 @@ fn find_executable(sandbox_dir: &Path, pkg: &str, requested_bin: Option<&str>) -
     let usr_sbin = sandbox_dir.join("usr").join("sbin");
 
     if let Some(bin_name) = requested_bin {
+        if bin_name.is_empty()
+            || bin_name == "."
+            || bin_name == ".."
+            || bin_name.starts_with('-')
+            || bin_name.contains(['/', '\\', '\0'])
+        {
+            return Err("--bin must name a single executable within the package".to_string());
+        }
         let p1 = usr_bin.join(bin_name);
         if is_executable_file(&p1) {
             return Ok(p1);
@@ -868,6 +1129,15 @@ mod tests {
         assert_eq!(parse_target("pipx:cowsay"), (Some("pipx"), "cowsay"));
         assert_eq!(parse_target("extra/tree"), (Some("extra"), "tree"));
         assert_eq!(parse_target("tree"), (None, "tree"));
+    }
+
+    #[test]
+    fn test_host_only_providers_require_explicit_opt_in() {
+        for target in ["nix/fastfetch", "nixpkgs#ripgrep", "pipx/cowsay"] {
+            assert!(host_only_provider(parse_target(target).0));
+        }
+        assert!(!host_only_provider(parse_target("flatpak/org.gnome.Calculator").0));
+        assert!(!host_only_provider(parse_target("extra/jq").0));
     }
 
     #[test]
@@ -988,6 +1258,170 @@ mod tests {
         cleanup_active_targets();
 
         assert!(!temp_dir.exists());
+    }
+
+    #[test]
+    fn test_guard_preserves_cached_archive() {
+        let sandbox_dir = create_secure_temp_dir("pacpin-try-cache-test").unwrap();
+        let cached = crate::download::create_secure_temp_file(&env::temp_dir(), "pacpin-cache-test", "pkg.tar.zst").unwrap();
+        let mut guard = SandboxGuard::new(sandbox_dir.clone());
+        guard.register_tarball(&cached);
+        drop(guard);
+        assert!(cached.exists());
+        assert!(!sandbox_dir.exists());
+        fs::remove_file(cached).unwrap();
+    }
+
+    #[test]
+    fn test_stale_cleanup_keeps_live_sandbox() {
+        let live = create_secure_temp_dir("pacpin-run-live-test").unwrap();
+        assert!(!should_clean_stale_sandbox(&live));
+        fs::remove_dir_all(live).unwrap();
+
+        let dead = env::temp_dir().join(format!("pacpin-run-dead-test-pid{}-123", i32::MAX));
+        fs::create_dir(&dead).unwrap();
+        assert!(should_clean_stale_sandbox(&dead));
+        fs::remove_dir_all(dead).unwrap();
+    }
+
+    #[test]
+    fn test_cwd_mount_policy_protects_home_and_system() {
+        let home = env::temp_dir().join(format!("pacpin-home-policy-{}", std::process::id()));
+        let nested = home.join("private");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(!should_bind_cwd(Path::new("/"), &home));
+        assert!(!should_bind_cwd(Path::new("/etc"), &home));
+        assert!(!should_bind_cwd(&home, &home));
+        assert!(!should_bind_cwd(&nested, &home));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn test_package_data_mounts_preserve_absolute_lookup_paths() {
+        let root = create_secure_temp_dir("pacpin-data-mount-test").unwrap();
+        fs::create_dir_all(root.join("usr/share/figlet")).unwrap();
+        fs::create_dir_all(root.join("etc/figlet")).unwrap();
+        let mut command = Command::new("bwrap");
+        add_package_data_mounts(&mut command, &root, false).unwrap();
+        let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(3).any(|w| w[0] == "--ro-bind" && w[2] == "/usr/share"));
+        assert!(!args.windows(3).any(|w| w[0] == "--ro-bind" && w[2] == "/etc/figlet"));
+        let mut overlay = Command::new("bwrap");
+        add_package_data_mounts(&mut overlay, &root, true).unwrap();
+        let overlay_args: Vec<_> = overlay.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert!(overlay_args.windows(2).any(|w| w == ["--ro-overlay", "/usr/share"]));
+        assert!(overlay_args.windows(2).any(|w| w == ["--ro-overlay", "/etc"]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_runtime_directory_rejects_symlink_and_public_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let runtime = create_secure_temp_dir("pacpin-runtime-test").unwrap();
+        let private = private_runtime_subdir(&runtime, "run").unwrap();
+        assert!(private.is_dir());
+
+        let link = runtime.with_extension("link");
+        symlink(&runtime, &link).unwrap();
+        assert!(private_runtime_subdir(&link, "run").is_err());
+        fs::remove_file(link).unwrap();
+
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_runtime_subdir(&runtime, "run").is_err());
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_wayland_socket_must_be_real_socket_with_safe_basename() {
+        use std::os::unix::net::UnixListener;
+        use std::os::unix::fs::symlink;
+        let runtime = create_secure_temp_dir("pacpin-wayland-test").unwrap();
+        let socket = runtime.join("wayland-0");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        assert_eq!(safe_wayland_socket(&runtime, "wayland-0"), Some(socket.clone()));
+        for display in ["", ".", "..", "../passwd", "/etc/passwd", "nested/wayland-0"] {
+            assert_eq!(safe_wayland_socket(&runtime, display), None);
+        }
+        symlink(&socket, runtime.join("wayland-link")).unwrap();
+        assert_eq!(safe_wayland_socket(&runtime, "wayland-link"), None);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_active_download_children_are_killed_before_cleanup() {
+        let worker = std::thread::spawn(|| {
+            run_tracked_command(Command::new("sleep").arg("30")).unwrap()
+        });
+        for _ in 0..100 {
+            if ACTIVE_CHILDREN.lock().unwrap().len() == 1 { break; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(ACTIVE_CHILDREN.lock().unwrap().len(), 1);
+        kill_active_children();
+        assert!(!worker.join().unwrap().success());
+        assert!(ACTIVE_CHILDREN.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_downloads_overlap_but_preserve_extraction_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let targets: Vec<crate::db::DownloadTarget> = (0..3)
+            .map(|i| crate::db::DownloadTarget {
+                name: format!("pkg-{}", i), url: String::new(),
+                candidate_urls: Vec::new(), sha256: None,
+            })
+            .collect();
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let mut guard = SandboxGuard::new(create_secure_temp_dir("pacpin-run-parallel-test").unwrap());
+        let archives = download_targets_parallel(&targets, false, &mut guard, |target, _, _| {
+            let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(count, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(PathBuf::from(&target.name))
+        }).unwrap();
+        assert_eq!(archives, vec![PathBuf::from("pkg-0"), PathBuf::from("pkg-1"), PathBuf::from("pkg-2")]);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_parallel_download_error_cleans_owned_files() {
+        let sandbox = create_secure_temp_dir("pacpin-run-download-error-test").unwrap();
+        let mut guard = SandboxGuard::new(sandbox.clone());
+        let target = crate::db::DownloadTarget {
+            name: "broken".into(), url: String::new(), candidate_urls: Vec::new(), sha256: None,
+        };
+        let mut downloaded_path = None;
+        let result = download_targets_parallel(&[target], false, &mut guard, |_, _, downloaded| {
+            let temp = crate::download::create_secure_temp_file(&env::temp_dir(), "pacpin-download-error-test", "pkg.tar.zst")?;
+            downloaded.push(temp.clone());
+            Err(format!("test failure at {}", temp.display()))
+        });
+        if let Err(message) = &result {
+            downloaded_path = message.strip_prefix("test failure at ").map(PathBuf::from);
+        }
+        assert!(result.is_err());
+        let downloaded_path = downloaded_path.unwrap();
+        assert!(downloaded_path.exists());
+        drop(guard);
+        assert!(!downloaded_path.exists());
+        assert!(!sandbox.exists());
+    }
+
+    #[test]
+    fn test_requested_binary_cannot_escape_package_root() {
+        let root = create_secure_temp_dir("pacpin-try-bin-test").unwrap();
+        for name in ["/bin/sh", "../../bin/sh", "../sh", "-sh", "\\bin\\sh"] {
+            assert!(find_executable(&root, "test", Some(name))
+                .unwrap_err()
+                .contains("single executable"));
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

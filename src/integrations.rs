@@ -21,6 +21,25 @@ use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 
+fn flatpak_cache_file() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    flatpak_cache_file_in(std::path::Path::new(&home))
+}
+
+fn flatpak_cache_file_in(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = home.join(".cache").join("pacpin");
+    std::fs::create_dir_all(&dir).ok()?;
+    if std::fs::symlink_metadata(&dir).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    }
+    Some(dir.join("flatpak_updates.json"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalUpdate {
     pub runner: String,  // e.g. "Flatpak", "Nix"
@@ -60,8 +79,9 @@ impl IntegrationProvider for FlatpakProvider {
     }
 
     fn refresh_metadata(&self) -> Result<(), std::io::Error> {
-        let cache_file = std::env::temp_dir().join(format!("pacpin_flatpak_cache_{}.json", unsafe { libc::getuid() }));
-        let _ = std::fs::remove_file(cache_file);
+        if let Some(cache_file) = flatpak_cache_file() {
+            let _ = std::fs::remove_file(cache_file);
+        }
         let _ = Command::new("flatpak")
             .args(["update", "--appstream"])
             .output()?;
@@ -69,14 +89,16 @@ impl IntegrationProvider for FlatpakProvider {
     }
 
     fn check_updates(&self) -> Vec<ExternalUpdate> {
-        let cache_file = std::env::temp_dir().join(format!("pacpin_flatpak_cache_{}.json", unsafe { libc::getuid() }));
-        if let Ok(metadata) = std::fs::metadata(&cache_file) {
-            if let Ok(mtime) = metadata.modified() {
-                if let Ok(elapsed) = mtime.elapsed() {
-                    if elapsed.as_secs() < 120 {
-                        if let Ok(content) = std::fs::read_to_string(&cache_file) {
-                            if let Ok(cached) = serde_json::from_str::<Vec<ExternalUpdate>>(&content) {
-                                return cached;
+        let cache_file = flatpak_cache_file();
+        if let Some(path) = cache_file.as_ref() {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                if let Ok(mtime) = metadata.modified() {
+                    if let Ok(elapsed) = mtime.elapsed() {
+                        if elapsed.as_secs() < 120 {
+                            if let Ok(content) = std::fs::read_to_string(path) {
+                                if let Ok(cached) = serde_json::from_str::<Vec<ExternalUpdate>>(&content) {
+                                    return cached;
+                                }
                             }
                         }
                     }
@@ -92,45 +114,35 @@ impl IntegrationProvider for FlatpakProvider {
             ])
             .output();
 
+        let Ok(out) = output else {
+            return Vec::new();
+        };
+        if !out.status.success() {
+            return Vec::new();
+        }
         let mut results = Vec::new();
-        if let Ok(out) = output {
-            if out.status.success() {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                for line in stdout.lines() {
-                    let parts: Vec<&str> = line.split('\t').collect();
-                    if parts.len() >= 4 {
-                        let name = crate::utils::sanitize_display_text(parts[0].trim());
-                        let app_id = crate::utils::sanitize_display_text(parts[1].trim());
-                        let ver = crate::utils::sanitize_display_text(parts[2].trim());
-                        let origin = crate::utils::sanitize_display_text(parts[3].trim());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() >= 4 {
+                let name = crate::utils::sanitize_display_text(parts[0].trim());
+                let app_id = crate::utils::sanitize_display_text(parts[1].trim());
+                let ver = crate::utils::sanitize_display_text(parts[2].trim());
+                let origin = crate::utils::sanitize_display_text(parts[3].trim());
 
-                        if !app_id.is_empty() {
-                            results.push(ExternalUpdate {
-                                runner: "Flatpak".to_string(),
-                                id: app_id.clone(),
-                                name: if name.is_empty() {
-                                    app_id
-                                } else {
-                                    name
-                                },
-                                repo: if origin.is_empty() {
-                                    "flathub".to_string()
-                                } else {
-                                    origin
-                                },
-                                version: if ver.is_empty() {
-                                    "update".to_string()
-                                } else {
-                                    ver
-                                },
-                            });
-                        }
-                    }
+                if !app_id.is_empty() {
+                    results.push(ExternalUpdate {
+                        runner: "Flatpak".to_string(),
+                        id: app_id.clone(),
+                        name: if name.is_empty() { app_id } else { name },
+                        repo: if origin.is_empty() { "flathub".to_string() } else { origin },
+                        version: if ver.is_empty() { "update".to_string() } else { ver },
+                    });
                 }
             }
         }
-        if let Ok(serialized) = serde_json::to_string(&results) {
-            let _ = std::fs::write(&cache_file, serialized);
+        if let (Some(path), Ok(serialized)) = (cache_file, serde_json::to_string(&results)) {
+            let _ = std::fs::write(path, serialized);
         }
         results
     }
@@ -385,27 +397,33 @@ impl IntegrationsManager {
         let mut providers: Vec<Arc<dyn IntegrationProvider>> = Vec::new();
 
         if config.integrations.flatpak {
-            let fp = FlatpakProvider;
-            if fp.is_available() {
-                providers.push(Arc::new(fp));
-            }
+            providers.push(Arc::new(FlatpakProvider));
         }
 
         if config.integrations.nix {
-            let nix = NixProvider;
-            if nix.is_available() {
-                providers.push(Arc::new(nix));
-            }
+            providers.push(Arc::new(NixProvider));
         }
 
         if config.integrations.pipx {
-            let pipx = PipxProvider;
-            if pipx.is_available() {
-                providers.push(Arc::new(pipx));
-            }
+            providers.push(Arc::new(PipxProvider));
         }
 
-        providers
+        Self::filter_available_parallel(providers)
+    }
+
+    fn filter_available_parallel(
+        providers: Vec<Arc<dyn IntegrationProvider>>,
+    ) -> Vec<Arc<dyn IntegrationProvider>> {
+        if providers.len() < 2 {
+            return providers.into_iter().filter(|provider| provider.is_available()).collect();
+        }
+        let handles: Vec<_> = providers
+            .into_iter()
+            .map(|provider| thread::spawn(move || {
+                provider.is_available().then_some(provider)
+            }))
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
     }
 
     pub fn refresh_all_parallel(providers: &[Arc<dyn IntegrationProvider>]) {
@@ -556,6 +574,8 @@ impl IntegrationsManager {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     #[test]
     fn test_external_update_struct() {
         let update = ExternalUpdate {
@@ -595,5 +615,57 @@ mod tests {
         assert!(flatpak.supports_clean());
         assert!(nix.supports_clean());
         assert!(!pipx.supports_clean());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_flatpak_cache_is_private_and_rejects_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let home = std::env::temp_dir().join(format!("pacpin-flatpak-cache-test-{}", std::process::id()));
+        std::fs::create_dir(&home).unwrap();
+        let cache = flatpak_cache_file_in(&home).unwrap();
+        assert_eq!(std::fs::metadata(cache.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        std::fs::remove_dir(cache.parent().unwrap()).unwrap();
+        symlink(&home, cache.parent().unwrap()).unwrap();
+        assert!(flatpak_cache_file_in(&home).is_none());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    struct MockProvider {
+        label: &'static str,
+        available: bool,
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl IntegrationProvider for MockProvider {
+        fn name(&self) -> &'static str { self.label }
+        fn is_available(&self) -> bool {
+            let count = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(count, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.available
+        }
+        fn refresh_metadata(&self) -> Result<(), std::io::Error> { Ok(()) }
+        fn check_updates(&self) -> Vec<ExternalUpdate> { Vec::new() }
+        fn upgrade_command_str(&self, _: &[ExternalUpdate]) -> String { String::new() }
+        fn execute_upgrade(&self, _: &[ExternalUpdate]) -> Result<bool, std::io::Error> { Ok(true) }
+        fn clean_command_str(&self) -> String { String::new() }
+        fn execute_clean(&self) -> Result<bool, std::io::Error> { Ok(true) }
+    }
+
+    #[test]
+    fn test_provider_detection_overlaps_and_preserves_order() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let providers: Vec<Arc<dyn IntegrationProvider>> = [
+            ("one", true), ("two", false), ("three", true),
+        ].into_iter().map(|(label, available)| Arc::new(MockProvider {
+            label, available, active: Arc::clone(&active), peak: Arc::clone(&peak),
+        }) as Arc<dyn IntegrationProvider>).collect();
+        let selected = IntegrationsManager::filter_available_parallel(providers);
+        assert_eq!(selected.iter().map(|p| p.name()).collect::<Vec<_>>(), vec!["one", "three"]);
+        assert!(peak.load(Ordering::SeqCst) >= 2);
     }
 }

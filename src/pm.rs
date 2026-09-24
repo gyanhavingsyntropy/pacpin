@@ -298,7 +298,7 @@ pub fn install(
             )?;
 
             if repo.eq_ignore_ascii_case("aur") {
-                let companions = if io::stdin().is_terminal() {
+                let companions = if io::stdin().is_terminal() && !options.noconfirm {
                     manager.find_companions(pkg, "aur", &config.pins)
                 } else {
                     Vec::new()
@@ -317,7 +317,7 @@ pub fn install(
                     aur_targets.push(p);
                 }
             } else {
-                let companions = if io::stdin().is_terminal() {
+                let companions = if io::stdin().is_terminal() && !options.noconfirm {
                     manager.find_companions(pkg, repo, &config.pins)
                 } else {
                     Vec::new()
@@ -724,6 +724,10 @@ pub struct LockInfo {
 /// Inspects the pacman database lock file and the process holding it (if any).
 pub fn get_lock_info() -> Option<LockInfo> {
     let lock_path = AlpmManager::get_dbpath().join("db.lck");
+    get_lock_info_at(lock_path)
+}
+
+fn get_lock_info_at(lock_path: std::path::PathBuf) -> Option<LockInfo> {
     if !lock_path.exists() {
         return None;
     }
@@ -919,24 +923,28 @@ pub fn check_package_conflicts(manager: &AlpmManager, targets: &[String]) -> Vec
     }
 
     for target in targets {
-        let pkg_clean = if let Some((_, p)) = target.split_once('/') {
-            p
-        } else {
-            target.as_str()
+        let (requested_repo, pkg_clean) = match target.split_once('/') {
+            Some((repo, pkg)) => (Some(repo), pkg),
+            None => (None, target.as_str()),
         };
 
-        let pkg_opt = manager.handle().syncdbs().into_iter().find_map(|db| {
-            db.pkg(pkg_clean)
-                .ok()
-                .or_else(|| db.pkgs().find_satisfier(pkg_clean))
-        });
+        let pkg_opt = manager
+            .handle()
+            .syncdbs()
+            .into_iter()
+            .filter(|db| requested_repo.is_none_or(|repo| db.name() == repo))
+            .find_map(|db| {
+                db.pkg(pkg_clean)
+                    .ok()
+                    .or_else(|| db.pkgs().find_satisfier(pkg_clean))
+            });
 
         if let Some(pkg) = pkg_opt {
             let pkg_name = pkg.name();
 
             // 1. Check if candidate package declares conflicts with any installed package
             for conflict_dep in pkg.conflicts() {
-                if let Some(inst) = local_db.pkgs().find_satisfier(conflict_dep.name()) {
+                if let Some(inst) = local_db.pkgs().find_satisfier(conflict_dep.to_string()) {
                     if inst.name() != pkg_name
                         && conflict_set.insert((pkg_name.to_string(), inst.name().to_string()))
                     {
@@ -1205,6 +1213,21 @@ mod tests {
             assert!(check_lock().is_ok());
             assert!(get_lock_info().is_none());
         }
+    }
+
+    #[test]
+    fn test_lock_inspection_live_and_stale_pids() {
+        let lock_path = std::env::temp_dir().join(format!("pacpin-lock-test-{}", std::process::id()));
+        std::fs::write(&lock_path, format!("{}\n", std::process::id())).unwrap();
+        let live = get_lock_info_at(lock_path.clone()).unwrap();
+        assert_eq!(live.pid, Some(std::process::id() as i32));
+        assert!(live.is_alive);
+
+        std::fs::write(&lock_path, format!("{}\n", i32::MAX)).unwrap();
+        let stale = get_lock_info_at(lock_path.clone()).unwrap();
+        assert_eq!(stale.pid, Some(i32::MAX));
+        assert!(!stale.is_alive);
+        std::fs::remove_file(lock_path).unwrap();
     }
 
     #[test]

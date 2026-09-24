@@ -20,10 +20,7 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute, queue,
     style::Print,
-    terminal::{
-        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
-        LeaveAlternateScreen,
-    },
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 use std::io::{self, stdout, IsTerminal, Write};
 
@@ -60,8 +57,23 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut out = stdout();
-        let _ = execute!(out, LeaveAlternateScreen, Show);
+        // Keep the menu in scrollback and leave the cursor below it.
+        let _ = execute!(out, Show, Print("\r\n"));
     }
+}
+
+const MENU_FIXED_ROWS: usize = 12;
+
+fn menu_layout(term_height: usize, item_count: usize) -> (usize, u16) {
+    // Preserve at least a third of the screen for the update plan above the menu.
+    let history_rows = (term_height / 3).max(4);
+    let visible = item_count.min(18).min(
+        term_height
+            .saturating_sub(history_rows + MENU_FIXED_ROWS)
+            .max(1),
+    );
+    let start_row = term_height.saturating_sub(MENU_FIXED_ROWS + visible) as u16;
+    (visible, start_row)
 }
 
 pub fn run_checkbox_menu(
@@ -69,7 +81,7 @@ pub fn run_checkbox_menu(
     subtitle: &str,
     initial_items: &[CheckboxItem],
 ) -> Option<Vec<String>> {
-    if !io::stdin().is_terminal() || initial_items.is_empty() {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() || initial_items.is_empty() {
         return None;
     }
 
@@ -84,11 +96,26 @@ pub fn run_checkbox_menu(
         return None;
     }
     let mut out = stdout();
-    if execute!(out, EnterAlternateScreen, Hide).is_err() {
+    if execute!(out, Hide).is_err() {
         let _ = disable_raw_mode();
         return None;
     }
     let _guard = TerminalGuard;
+
+    // Allocate space in the primary screen so the preceding update summary
+    // remains above the selector and can still be reached via scrollback.
+    let (_, initial_height) = terminal_size::terminal_size()
+        .map(|(w, h)| (w.0 as usize, h.0 as usize))
+        .unwrap_or((80, 24));
+    if initial_height < MENU_FIXED_ROWS + 1 {
+        return None;
+    }
+    let (initial_visible, _) = menu_layout(initial_height, items.len());
+    for _ in 0..MENU_FIXED_ROWS + initial_visible {
+        let _ = queue!(out, Print("\r\n"));
+    }
+    let _ = out.flush();
+    let mut previous_region: Option<(u16, usize)> = None;
 
     loop {
         // Filter items if searching
@@ -113,7 +140,7 @@ pub fn run_checkbox_menu(
             .map(|(w, h)| (w.0 as usize, h.0 as usize))
             .unwrap_or((80, 24));
         let box_width = term_width.clamp(72, 100).min(term_width);
-        let max_visible = (term_height.saturating_sub(13)).clamp(5, 18);
+        let (max_visible, start_row) = menu_layout(term_height, items.len());
 
         // Adjust viewport offset
         if selected < viewport_offset {
@@ -122,8 +149,13 @@ pub fn run_checkbox_menu(
             viewport_offset = selected - max_visible + 1;
         }
 
-        // Render UI
-        let _ = queue!(out, MoveTo(0, 0), Clear(ClearType::All));
+        // Erase only the previous selector, never the update summary above it.
+        if let Some((old_start, old_height)) = previous_region {
+            for row in old_start as usize..(old_start as usize + old_height).min(term_height) {
+                let _ = queue!(out, MoveTo(0, row as u16), Clear(ClearType::CurrentLine));
+            }
+        }
+        let _ = queue!(out, MoveTo(0, start_row));
 
         render_checkbox_ui(
             &mut out,
@@ -139,124 +171,129 @@ pub fn run_checkbox_menu(
             &search_query,
         );
         let _ = out.flush();
+        previous_region = Some((start_row, MENU_FIXED_ROWS + max_visible));
 
         // Read event
-        if let Ok(Event::Key(KeyEvent {
-            code, modifiers, ..
-        })) = event::read()
-        {
-            if modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(code, KeyCode::Char('c') | KeyCode::Char('C'))
-            {
-                return None;
-            }
-            if search_mode {
-                match code {
-                    KeyCode::Enter => {
-                        search_mode = false;
-                    }
-                    KeyCode::Esc => {
-                        search_mode = false;
-                        search_query.clear();
-                        selected = 0;
-                        viewport_offset = 0;
-                    }
-                    KeyCode::Backspace => {
-                        search_query.pop();
-                        selected = 0;
-                        viewport_offset = 0;
-                    }
-                    KeyCode::Char(c) => {
-                        if search_query.len() < 32 {
-                            search_query.push(c);
+        match event::read() {
+            Ok(Event::Key(KeyEvent {
+                code, modifiers, ..
+            })) => {
+                if modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(code, KeyCode::Char('c') | KeyCode::Char('C'))
+                {
+                    return None;
+                }
+                if search_mode {
+                    match code {
+                        KeyCode::Enter => {
+                            search_mode = false;
+                        }
+                        KeyCode::Esc => {
+                            search_mode = false;
+                            search_query.clear();
                             selected = 0;
                             viewport_offset = 0;
                         }
-                    }
-                    _ => {}
-                }
-            } else {
-                match code {
-                    // Navigation Up
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        selected = selected.saturating_sub(1);
-                    }
-                    // Navigation Down
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if !matching_indices.is_empty() && selected + 1 < matching_indices.len() {
-                            selected += 1;
+                        KeyCode::Backspace => {
+                            search_query.pop();
+                            selected = 0;
+                            viewport_offset = 0;
                         }
-                    }
-                    // Page Up
-                    KeyCode::PageUp => {
-                        selected = selected.saturating_sub(max_visible);
-                    }
-                    // Page Down
-                    KeyCode::PageDown => {
-                        if !matching_indices.is_empty() {
-                            selected = (selected + max_visible).min(matching_indices.len() - 1);
+                        KeyCode::Char(c) => {
+                            if search_query.len() < 32 {
+                                search_query.push(c);
+                                selected = 0;
+                                viewport_offset = 0;
+                            }
                         }
+                        _ => {}
                     }
-                    // Home
-                    KeyCode::Home => {
-                        selected = 0;
-                    }
-                    // End
-                    KeyCode::End => {
-                        if !matching_indices.is_empty() {
-                            selected = matching_indices.len() - 1;
+                } else {
+                    match code {
+                        // Navigation Up
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            selected = selected.saturating_sub(1);
                         }
-                    }
-                    // Toggle Space
-                    KeyCode::Char(' ') => {
-                        if let Some(&real_idx) = matching_indices.get(selected) {
-                            items[real_idx].checked = !items[real_idx].checked;
+                        // Navigation Down
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if !matching_indices.is_empty() && selected + 1 < matching_indices.len()
+                            {
+                                selected += 1;
+                            }
                         }
-                    }
-                    // Select All: 'a'
-                    KeyCode::Char('a') | KeyCode::Char('A') => {
-                        for &idx in &matching_indices {
-                            items[idx].checked = true;
+                        // Page Up
+                        KeyCode::PageUp => {
+                            selected = selected.saturating_sub(max_visible);
                         }
-                    }
-                    // Select None: 'n'
-                    KeyCode::Char('n') | KeyCode::Char('N') => {
-                        for &idx in &matching_indices {
-                            items[idx].checked = false;
+                        // Page Down
+                        KeyCode::PageDown => {
+                            if !matching_indices.is_empty() {
+                                selected = (selected + max_visible).min(matching_indices.len() - 1);
+                            }
                         }
-                    }
-                    // Select Pure/Safe Only: 'p'
-                    KeyCode::Char('p') | KeyCode::Char('P') => {
-                        for &idx in &matching_indices {
-                            items[idx].checked = items[idx].is_pure;
+                        // Home
+                        KeyCode::Home => {
+                            selected = 0;
                         }
-                    }
-                    // Invert Selection: 'i'
-                    KeyCode::Char('i') | KeyCode::Char('I') => {
-                        for &idx in &matching_indices {
-                            items[idx].checked = !items[idx].checked;
+                        // End
+                        KeyCode::End => {
+                            if !matching_indices.is_empty() {
+                                selected = matching_indices.len() - 1;
+                            }
                         }
+                        // Toggle Space
+                        KeyCode::Char(' ') => {
+                            if let Some(&real_idx) = matching_indices.get(selected) {
+                                items[real_idx].checked = !items[real_idx].checked;
+                            }
+                        }
+                        // Select All: 'a'
+                        KeyCode::Char('a') | KeyCode::Char('A') => {
+                            for &idx in &matching_indices {
+                                items[idx].checked = true;
+                            }
+                        }
+                        // Select None: 'n'
+                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                            for &idx in &matching_indices {
+                                items[idx].checked = false;
+                            }
+                        }
+                        // Select Pure/Safe Only: 'p'
+                        KeyCode::Char('p') | KeyCode::Char('P') => {
+                            for &idx in &matching_indices {
+                                items[idx].checked = items[idx].is_pure;
+                            }
+                        }
+                        // Invert Selection: 'i'
+                        KeyCode::Char('i') | KeyCode::Char('I') => {
+                            for &idx in &matching_indices {
+                                items[idx].checked = !items[idx].checked;
+                            }
+                        }
+                        // Search / Filter: '/'
+                        KeyCode::Char('/') => {
+                            search_mode = true;
+                        }
+                        // Confirm: Enter
+                        KeyCode::Enter => {
+                            let selected_ids: Vec<String> = items
+                                .iter()
+                                .filter(|item| item.checked)
+                                .map(|item| item.id.clone())
+                                .collect();
+                            return Some(selected_ids);
+                        }
+                        // Cancel: Esc or 'q'
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            return None;
+                        }
+                        _ => {}
                     }
-                    // Search / Filter: '/'
-                    KeyCode::Char('/') => {
-                        search_mode = true;
-                    }
-                    // Confirm: Enter
-                    KeyCode::Enter => {
-                        let selected_ids: Vec<String> = items
-                            .iter()
-                            .filter(|item| item.checked)
-                            .map(|item| item.id.clone())
-                            .collect();
-                        return Some(selected_ids);
-                    }
-                    // Cancel: Esc or 'q'
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
-                        return None;
-                    }
-                    _ => {}
                 }
             }
+            Ok(_) => {}
+            Err(_) => return None,
         }
     }
 }
@@ -281,7 +318,10 @@ pub(crate) fn render_checkbox_ui<W: Write>(
     let has_purity = items.iter().any(|i| !i.is_pure) || title.to_lowercase().contains("orphan");
 
     // Top border
-    let top = format!("{}\r\n", border_color(&format!("┌{}┐", "─".repeat(inner_width))));
+    let top = format!(
+        "{}\r\n",
+        border_color(&format!("┌{}┐", "─".repeat(inner_width)))
+    );
     let _ = queue!(out, Print(top));
 
     // Header Title
@@ -318,7 +358,10 @@ pub(crate) fn render_checkbox_ui<W: Write>(
     let _ = queue!(out, Print(sub_line));
 
     // Divider
-    let div = format!("{}\r\n", border_color(&format!("├{}┤", "─".repeat(inner_width))));
+    let div = format!(
+        "{}\r\n",
+        border_color(&format!("├{}┤", "─".repeat(inner_width)))
+    );
     let _ = queue!(out, Print(div.clone()));
 
     // Shortcuts Bar
@@ -431,7 +474,12 @@ pub(crate) fn render_checkbox_ui<W: Write>(
         };
 
         // Calculate available description width
-        let prefix_w = 3 + 4 + 4 + (if has_purity { 7 } else { 0 }) + label_width + (if is_cursor { 2 } else { 0 });
+        let prefix_w = 3
+            + 4
+            + 4
+            + (if has_purity { 7 } else { 0 })
+            + label_width
+            + (if is_cursor { 2 } else { 0 });
         let desc_max = inner_width.saturating_sub(prefix_w + 1);
         let desc_str = if crate::ui::str_width(&item.description) > desc_max && desc_max > 3 {
             crate::ui::truncate_str(&item.description, desc_max)
@@ -439,9 +487,8 @@ pub(crate) fn render_checkbox_ui<W: Write>(
             item.description.clone()
         };
 
-        let content_raw = format!(
-            "{pointer}{box_raw}{num_raw}{badge_raw}{label_str}{desc_str}{tag_raw}"
-        );
+        let content_raw =
+            format!("{pointer}{box_raw}{num_raw}{badge_raw}{label_str}{desc_str}{tag_raw}");
         let used_w = crate::ui::str_width(&content_raw);
         let pad_len = inner_width.saturating_sub(used_w);
         let pad_spaces = " ".repeat(pad_len);
@@ -578,13 +625,20 @@ pub(crate) fn render_checkbox_ui<W: Write>(
     }
 
     // Bottom border
-    let bottom = format!("{}\r\n", border_color(&format!("└{}┘", "─".repeat(inner_width))));
+    let bottom = border_color(&format!("└{}┘", "─".repeat(inner_width)));
     let _ = queue!(out, Print(bottom));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_menu_keeps_history_visible() {
+        assert_eq!(menu_layout(24, 50), (4, 8));
+        assert_eq!(menu_layout(40, 50), (15, 13));
+        assert_eq!(menu_layout(24, 2), (2, 10));
+    }
 
     #[test]
     fn test_checkbox_item_creation() {
@@ -648,7 +702,13 @@ mod tests {
     #[test]
     fn test_render_checkbox_ui_box_alignment() {
         let items = vec![
-            CheckboxItem::new("libyaml", "libyaml", "0.8 MiB — YAML 1.1 parser", true, true),
+            CheckboxItem::new(
+                "libyaml",
+                "libyaml",
+                "0.8 MiB — YAML 1.1 parser",
+                true,
+                true,
+            ),
             CheckboxItem::new(
                 "python-pillow",
                 "python-pillow",
@@ -683,6 +743,8 @@ mod tests {
             );
 
             let output = String::from_utf8(buf).expect("valid utf8");
+            assert_eq!(output.lines().count(), MENU_FIXED_ROWS + 5);
+            assert!(!output.ends_with("\r\n"));
             if box_width == 88 {
                 println!("\n--- RENDERED CHECKBOX UI (WIDTH 88) ---\n{}", output);
             }

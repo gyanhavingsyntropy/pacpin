@@ -54,13 +54,13 @@ pub fn cmd_orphans(clean: bool, noconfirm: bool) {
                 .map(|o| o.name.clone())
                 .collect()
         };
-        if !selected.is_empty() {
+        let removed = if !selected.is_empty() {
             check_pacman_lock();
-            OrphanManager::execute_removal(&selected);
-        }
+            OrphanManager::execute_removal(&selected)
+        } else { false };
         let remaining: Vec<OrphanPackage> = orphans
             .iter()
-            .filter(|o| !selected.contains(&o.name))
+            .filter(|o| !removed || !selected.contains(&o.name))
             .cloned()
             .collect();
         OrphanManager::save_known(&remaining);
