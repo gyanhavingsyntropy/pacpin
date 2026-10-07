@@ -126,58 +126,6 @@ pub fn is_safe_link_destination(src: &str, dst: &str) -> bool {
     true
 }
 
-/// Validates a single line of `tar -tvf` output.
-#[allow(dead_code)]
-pub fn is_safe_tar_listing_line(line: &str) -> Result<(String, u64), String> {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    if tokens.is_empty() {
-        return Ok((String::new(), 0));
-    }
-    if tokens.len() < 6 {
-        // Shorter output: fallback to raw entry check
-        let entry = tokens.last().unwrap_or(&"");
-        if !is_safe_tar_entry(entry) {
-            return Err(format!("Unsafe archive path: {}", entry));
-        }
-        return Ok((entry.to_string(), 0));
-    }
-
-    let mode = tokens[0];
-    let size = tokens[2].parse::<u64>().unwrap_or(0);
-    let full_path = tokens[5..].join(" ");
-
-    // Symlinks in tar -tvf start with 'l'
-    if mode.starts_with('l') {
-        if let Some((src, dst)) = full_path.rsplit_once(" -> ") {
-            if !is_safe_tar_entry(src) {
-                return Err(format!("Unsafe symlink source entry: {}", src));
-            }
-            if !is_safe_link_destination(src, dst) {
-                return Err(format!("Unsafe symlink destination '{}' points outside sandbox root", dst));
-            }
-            return Ok((src.to_string(), size));
-        }
-    }
-
-    // Hardlinks in tar -tvf start with 'h'
-    if mode.starts_with('h') {
-        if let Some((src, dst)) = full_path.rsplit_once(" link to ") {
-            if !is_safe_tar_entry(src) {
-                return Err(format!("Unsafe hardlink source entry: {}", src));
-            }
-            if !is_safe_tar_entry(dst) || !is_safe_link_destination(src, dst) {
-                return Err(format!("Unsafe hardlink destination '{}' points outside sandbox root", dst));
-            }
-            return Ok((src.to_string(), size));
-        }
-    }
-
-    // Regular file or directory: even if it contains " -> " or " link to " in its name, it's not a link
-    if !is_safe_tar_entry(&full_path) {
-        return Err(format!("Unsafe path traversal entry: {}", full_path));
-    }
-    Ok((full_path, size))
-}
 
 /// Parses the package name from an Arch Linux package archive filename.
 /// Follows standard format: `<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.<ext>`.
@@ -290,11 +238,7 @@ pub fn fetch_package_archive(
             println!("{} Fetching '{}' from {}...", "::".cyan(), pkg, url.dimmed());
         }
 
-        let ext = if url.ends_with(".pkg.tar.xz") {
-            "pkg.tar.xz"
-        } else {
-            "pkg.tar.zst"
-        };
+        let ext = archive_extension(url);
 
         let temp_download = create_secure_temp_file(
             &env::temp_dir(),
@@ -306,7 +250,7 @@ pub fn fetch_package_archive(
 
         // -f (--fail) ensures curl fails on HTTP 4xx/5xx rather than writing HTML error pages
         let curl_status = crate::sandbox::run_tracked_command(
-            Command::new("curl").args(["-sSLf", "-o"]).arg(&temp_download).arg(url)
+            &mut package_download_command(url, &temp_download)
         );
         if crate::sandbox::is_terminating() {
             return Err("Download interrupted during shutdown".into());
@@ -372,7 +316,7 @@ pub const MAX_ARCHIVE_ENTRIES: usize = 50_000;
 pub const MAX_UNPACKED_BYTES: u64 = 5 * 1024 * 1024 * 1024; // 5 GB limit
 
 /// An archive member must not be unpacked through a symlink left by an earlier member.
-fn reject_existing_symlink_components(root: &Path, relative: &Path) -> Result<(), String> {
+pub(crate) fn reject_existing_symlink_components(root: &Path, relative: &Path) -> Result<(), String> {
     let mut current = root.to_path_buf();
     for component in relative.components() {
         match component {
@@ -392,164 +336,38 @@ fn reject_existing_symlink_components(root: &Path, relative: &Path) -> Result<()
     Ok(())
 }
 
+fn archive_extension(url: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    if path.ends_with(".pkg.tar.xz") {
+        "pkg.tar.xz"
+    } else if path.ends_with(".pkg.tar.gz") {
+        "pkg.tar.gz"
+    } else {
+        "pkg.tar.zst"
+    }
+}
+
+fn package_download_command(url: &str, output: &Path) -> Command {
+    let mut command = Command::new("curl");
+    // Ignore curlrc and URL globbing: one requested mirror must write one owned
+    // file. A mirror string must never be interpreted as a curl option.
+    command.args(["-q", "-g", "-sSLf", "--connect-timeout", "15", "--speed-time", "60", "--speed-limit", "1", "-o"])
+        .arg(output).arg("--").arg(url);
+    command
+}
+
 /// Safely inspects and extracts a package tarball into a destination directory.
 pub fn extract_archive(archive_path: &Path, target_dir: &Path) -> Result<(), String> {
-    let archive_str = archive_path
-        .to_str()
-        .ok_or_else(|| "Invalid archive path encoding".to_string())?;
-
-    let mut decompressor = if archive_str.ends_with(".zst") {
-        Command::new("zstd")
-            .args(["-dc", archive_str])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn zstd decompressor: {}", e))?
-    } else if archive_str.ends_with(".xz") {
-        Command::new("xz")
-            .args(["-dc", archive_str])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn xz decompressor: {}", e))?
-    } else if archive_str.ends_with(".gz") {
-        Command::new("gzip")
-            .args(["-dc", archive_str])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn gzip decompressor: {}", e))?
-    } else {
-        Command::new("cat")
-            .arg(archive_str)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to read archive: {}", e))?
-    };
-
-    let stdout = decompressor
-        .stdout
-        .take()
-        .ok_or_else(|| "Failed to capture decompressor stdout".to_string())?;
-    let mut archive = tar::Archive::new(stdout);
-    archive.set_preserve_permissions(false);
-    archive.set_unpack_xattrs(false);
-
-    let mut total_entries = 0usize;
-    let mut total_size = 0u64;
-
-    let extract_result = (|| -> Result<(), String> {
-        for entry_res in archive
-            .entries()
-            .map_err(|e| format!("Failed to read tar entries: {}", e))?
-        {
-            let mut entry = entry_res.map_err(|e| format!("Corrupt archive entry: {}", e))?;
-
-            total_entries += 1;
-            if total_entries > MAX_ARCHIVE_ENTRIES {
-                return Err(format!(
-                    "Security violation: archive '{}' exceeds maximum allowed file count ({})",
-                    archive_path.display(),
-                    MAX_ARCHIVE_ENTRIES
-                ));
-            }
-
-            let path_str = entry
-                .path()
-                .map_err(|e| format!("Unreadable archive entry path: {}", e))?
-                .to_string_lossy()
-                .to_string();
-            if !is_safe_tar_entry(&path_str) {
-                return Err(format!(
-                    "Security violation in archive '{}': Unsafe archive path '{}'. Extraction aborted.",
-                    archive_path.display(),
-                    path_str
-                ));
-            }
-
-            let entry_type = entry.header().entry_type();
-            if !(entry_type.is_file()
-                || entry_type.is_dir()
-                || entry_type.is_symlink()
-                || entry_type.is_hard_link())
-            {
-                return Err(format!(
-                    "Security violation: unsupported archive entry type for '{}'",
-                    path_str
-                ));
-            }
-
-            reject_existing_symlink_components(target_dir, Path::new(&path_str))?;
-
-            let link_opt = entry
-                .link_name()
-                .map_err(|e| format!("Unreadable link target: {}", e))?
-                .map(|l| l.to_string_lossy().to_string());
-
-            if let Some(ref link_str) = link_opt {
-                // Tar hardlink names are relative to the archive root, unlike symlink names.
-                let safe_link = if entry_type.is_hard_link() {
-                    is_safe_tar_entry(link_str)
-                        && reject_existing_symlink_components(target_dir, Path::new(link_str)).is_ok()
-                } else {
-                    is_safe_link_destination(&path_str, link_str)
-                };
-                if !safe_link {
-                    return Err(format!(
-                        "Security violation in archive '{}': Unsafe link target '{}' for entry '{}'. Extraction aborted.",
-                        archive_path.display(),
-                        link_str,
-                        path_str
-                    ));
-                }
-            }
-
-            total_size = total_size.saturating_add(entry.size());
-            if total_size > MAX_UNPACKED_BYTES {
-                return Err(format!(
-                    "Security violation: archive '{}' uncompressed size exceeds safety limit of 5 GB. Extraction aborted.",
-                    archive_path.display()
-                ));
-            }
-
-            if !entry
-                .unpack_in(target_dir)
-                .map_err(|e| format!("Failed to unpack entry '{}': {}", path_str, e))?
-            {
-                return Err(format!(
-                    "Archive entry '{}' would escape the extraction root",
-                    path_str
-                ));
-            }
-        }
-        Ok(())
-    })();
-
-    drop(archive);
-    if extract_result.is_err() {
-        let _ = decompressor.kill();
-    }
-    let status = decompressor.wait().map_err(|e| format!("Failed to wait for archive decompressor: {}", e))?;
-    extract_result?;
-
-    if !status.success() {
-        return Err(format!("Archive decompression failed for '{}'", archive_path.display()));
-    }
+    crate::archive::extract(archive_path, target_dir, MAX_ARCHIVE_ENTRIES, MAX_UNPACKED_BYTES)?;
 
     // Verify uncompressed size on disk does not exceed safety limit (decompression bomb protection)
     fn verify_disk_size(dir: &Path, current_total: &mut u64, limit: u64) -> Result<(), String> {
-        let entries = match fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return Ok(()),
-        };
-        for entry in entries.flatten() {
-            let ft = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
+        let entries = fs::read_dir(dir).map_err(|e| format!("Cannot verify extracted directory: {e}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Cannot verify extracted entry: {e}"))?;
+            let ft = entry.file_type().map_err(|e| format!("Cannot verify extracted file type: {e}"))?;
             if ft.is_file() {
-                let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let sz = entry.metadata().map_err(|e| format!("Cannot verify extracted file size: {e}"))?.len();
                 *current_total = current_total.saturating_add(sz);
                 if *current_total > limit {
                     return Err(format!(
@@ -720,6 +538,58 @@ mod tests {
     }
 
     #[test]
+    fn download_urls_cannot_be_options_and_compression_suffix_is_preserved() {
+        let command = package_download_command("--config=/tmp/hostile", Path::new("/tmp/archive"));
+        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(args[0], "-q");
+        assert_eq!(&args[args.len() - 2..], &["--", "--config=/tmp/hostile"]);
+        assert!(args.windows(2).any(|w| w == ["--connect-timeout", "15"]));
+        assert_eq!(archive_extension("https://mirror/pkg.pkg.tar.gz?download=1"), "pkg.tar.gz");
+        assert_eq!(archive_extension("https://mirror/pkg.pkg.tar.xz"), "pkg.tar.xz");
+        assert_eq!(archive_extension("https://mirror/pkg.pkg.tar.zst"), "pkg.tar.zst");
+    }
+
+    #[test]
+    fn structured_extraction_rejects_disguised_hardlink_escape() {
+        let root = test_dir("hardlink-header-escape");
+        let archive_path = root.join("hostile.tar");
+        fs::write(root.join("outside"), "unchanged").unwrap();
+        let mut builder = tar::Builder::new(fs::File::create(&archive_path).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_cksum();
+        builder.append_link(&mut header, "a link to b", "../outside").unwrap();
+        builder.finish().unwrap();
+        let dest = root.join("out");
+        fs::create_dir(&dest).unwrap();
+        assert!(extract_archive(&archive_path, &dest).unwrap_err().contains("Unsafe link target"));
+        assert_eq!(fs::read_to_string(root.join("outside")).unwrap(), "unchanged");
+        assert!(!dest.join("a link to b").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn extraction_strips_setuid_and_setgid_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = test_dir("archive-privileged-mode");
+        let archive_path = root.join("mode.tar");
+        let mut builder = tar::Builder::new(fs::File::create(&archive_path).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o6755);
+        header.set_size(1);
+        header.set_cksum();
+        builder.append_data(&mut header, "program", &b"x"[..]).unwrap();
+        builder.finish().unwrap();
+        let dest = root.join("out");
+        fs::create_dir(&dest).unwrap();
+        extract_archive(&archive_path, &dest).unwrap();
+        assert_eq!(fs::metadata(dest.join("program")).unwrap().permissions().mode() & 0o6000, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn test_extract_rejects_malformed_archive() {
         let root = test_dir("bad-archive");
         let archive_path = root.join("bad.tar");
@@ -869,32 +739,4 @@ mod tests {
         assert_eq!(parse_pkgname_from_filename("malformed"), None);
     }
 
-    #[test]
-    fn test_hardlink_escape_rejected() {
-        // In tar files, hardlink destinations with .. or leading / escape the root
-        let bad_hl = "hrw-r--r-- 0/0 0 1970-01-01 05:30 usr/bin/bad link to ../etc/shadow";
-        assert!(is_safe_tar_listing_line(bad_hl).is_err());
-
-        let bad_hl_abs = "hrw-r--r-- 0/0 0 1970-01-01 05:30 usr/bin/bad link to /etc/shadow";
-        assert!(is_safe_tar_listing_line(bad_hl_abs).is_err());
-
-        let good_hl = "hrw-r--r-- 0/0 0 1970-01-01 05:30 usr/bin/good link to usr/bin/orig";
-        assert!(is_safe_tar_listing_line(good_hl).is_ok());
-    }
-
-    #[test]
-    fn test_tar_trick_names_rejected() {
-        // Claude audit Finding S3: member names containing " -> " or " link to "
-        let tricky_symlink = "lrwxrwxrwx 0/0 0 1970-01-01 05:30 a -> b -> ../etc/passwd";
-        assert!(is_safe_tar_listing_line(tricky_symlink).is_err());
-
-        let tricky_symlink_deep = "lrwxrwxrwx 0/0 0 1970-01-01 05:30 usr/share/x -> y -> ../../../etc/shadow";
-        assert!(is_safe_tar_listing_line(tricky_symlink_deep).is_err());
-
-        let tricky_hardlink = "hrw-r--r-- 0/0 0 1970-01-01 05:30 a link to b link to /etc/shadow";
-        assert!(is_safe_tar_listing_line(tricky_hardlink).is_err());
-
-        let tricky_regular = "-rw-r--r-- 0/0 0 1970-01-01 05:30 usr/share/doc/a -> b.txt";
-        assert!(is_safe_tar_listing_line(tricky_regular).is_ok());
-    }
 }

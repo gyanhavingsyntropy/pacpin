@@ -6,16 +6,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use colored::*;
 
 use crate::aur;
-use crate::config::{save_config, Config};
+use crate::config::{mutate_config, Config};
 use crate::db::AlpmManager;
 use crate::journal::TransactionJournal;
-use crate::resolver::ResolverEngine;
+use crate::resolver::{ResolvedPackage, ResolverEngine};
 use crate::ui::prompt_multiselect;
 
 #[derive(Debug, Clone)]
@@ -26,6 +26,8 @@ pub struct InstallOptions {
     pub sysupgrade: bool,
     pub dry_run: bool,
     pub forwarded_flags: Vec<String>,
+    pub channel: Option<crate::sources::Channel>,
+    pub no_cache: bool,
 }
 
 impl Default for InstallOptions {
@@ -37,6 +39,8 @@ impl Default for InstallOptions {
             sysupgrade: false,
             dry_run: false,
             forwarded_flags: Vec::new(),
+            channel: None,
+            no_cache: false,
         }
     }
 }
@@ -45,6 +49,7 @@ pub fn build_install_commands(
     pacman_targets: &[String],
     aur_targets: &[String],
     helper: &str,
+    privilege_tool: &str,
     options: &InstallOptions,
     sysupgrade: bool,
 ) -> (Vec<String>, &'static str, &'static str) {
@@ -56,11 +61,11 @@ pub fn build_install_commands(
 
     let mut command_strs = Vec::new();
     if options.dry_run && options.refresh && !sysupgrade {
-        command_strs.push("sudo pacman -Sy".to_string());
+        command_strs.push(format!("{privilege_tool} pacman -Sy"));
     }
 
     if !pacman_targets.is_empty() {
-        let mut cmd = vec!["sudo", "pacman", pacman_op];
+        let mut cmd = vec![privilege_tool, "pacman", pacman_op];
         if options.needed {
             cmd.push("--needed");
         }
@@ -95,11 +100,17 @@ pub fn build_install_commands(
 
     if !aur_targets.is_empty() {
         let mut cmd = vec![helper, aur_op, "--aur"];
+        if privilege_tool != "sudo" && std::path::Path::new(helper).file_name().is_some_and(|name| name == "paru") {
+            cmd.extend(["--sudo", privilege_tool]);
+        }
         if options.needed {
             cmd.push("--needed");
         }
         if options.noconfirm {
             cmd.push("--noconfirm");
+        }
+        if options.no_cache {
+            cmd.push("--cleanafter");
         }
         for f in &options.forwarded_flags {
             cmd.push(f.as_str());
@@ -134,8 +145,36 @@ pub fn install(
         return Err("No package targets specified.".to_string());
     }
 
+    let direct_targets: Vec<_> = targets.iter().filter(|target| crate::sources::is_direct_syntax(target)).collect();
+    if !direct_targets.is_empty() {
+        if direct_targets.len() != targets.len() || direct_targets.len() != 1 {
+            return Err("Install one direct upstream source separately from native, AUR, or other source targets".into());
+        }
+        let result = crate::sources::install_direct(config, direct_targets[0], options.channel.clone().unwrap_or(crate::sources::Channel::Stable), options);
+        transaction_cache_cleanup(config, options.no_cache, None, None);
+        return result;
+    }
+    if options.channel.is_some() {
+        return Err("--channel is only valid with a direct github:/gitlab: source target".into());
+    }
     if let Some(bad) = targets.iter().find(|t| !crate::utils::is_safe_install_target(t)) {
         return Err(format!("Refusing unsafe package target '{}'.", bad));
+    }
+
+    let source_targets: Vec<String> = targets.iter().filter_map(|target| {
+        if target.split_once('/').is_some_and(|(alias, _)| config.sources.contains_key(alias)) {
+            Some(target.clone())
+        } else if !target.contains('/') {
+            crate::sources::owner(config, target).map(|alias| format!("{alias}/{target}"))
+        } else { None }
+    }).collect();
+    if !source_targets.is_empty() {
+        if source_targets.len() != targets.len() {
+            return Err("Install upstream-source targets separately from native/AUR targets (transactions have different verification policies)".into());
+        }
+        let result = crate::sources::install_targets(config, &source_targets, options);
+        transaction_cache_cleanup(config, options.no_cache, None, None);
+        return result;
     }
 
     let wait_secs = options
@@ -234,9 +273,9 @@ pub fn install(
     if options.refresh && !options.dry_run {
         println!(
             "{}",
-            ":: Refreshing package databases (sudo pacman -Sy)...".cyan()
+            format!(":: Refreshing package databases ({} pacman -Sy)...", config.options.privilege_tool).cyan()
         );
-        let status = Command::new("sudo").args(["pacman", "-Sy"]).status();
+        let status = crate::privilege::command(&config.options.privilege_tool).args(["pacman", "-Sy"]).status();
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => {
@@ -246,12 +285,12 @@ pub fn install(
                 ));
             }
             Err(e) => {
-                return Err(format!("Failed to run sudo pacman: {}", e));
+                return Err(format!("Failed to run {} pacman: {}", config.options.privilege_tool, e));
             }
         }
     }
 
-    let manager = AlpmManager::with_repo_order(&config.repo_order)
+    let mut manager = AlpmManager::with_repo_order(&config.repo_order)
         .map_err(|e| format!("Error initializing ALPM: {}", e))?;
 
     let mut pacman_targets = Vec::new();
@@ -278,7 +317,13 @@ pub fn install(
             let repo = parts[0];
             let pkg = parts[1];
 
-            if !known_repos.iter().any(|r| r == repo) {
+            // Native repository names stay case-sensitive (pacman semantics);
+            // only the pseudo-repository `aur` folds case, matching the
+            // routing below.
+            let repo_known = known_repos.iter().any(|r| r == repo)
+                || (repo.eq_ignore_ascii_case("aur")
+                    && known_repos.iter().any(|r| r == "aur"));
+            if !repo_known {
                 return Err(format!(
                     "Repository '[{}]' is not recognized. Configured repositories: {}",
                     repo,
@@ -383,17 +428,22 @@ pub fn install(
         println!("{}", ":: Note: Potential package conflict(s) detected:".yellow().bold());
         for (cand, inst) in &conflicts {
             println!(
-                "   - '{}' conflicts with installed package '{}' (may require replacement)",
+                "   - '{}' conflicts with package '{}' (may require replacement)",
                 cand.cyan(),
                 inst.yellow()
             );
         }
     }
 
+    let helper_flags = if aur_targets.is_empty() { Vec::new() } else { helper_privilege_args(&config.options.helper, &config.options.privilege_tool)? };
+    if !aur_targets.is_empty() && !options.dry_run {
+        crate::preview::check_package_root_capacity(0, 0)?;
+    }
     let (command_strs, pacman_op, aur_op) = build_install_commands(
         &pacman_targets,
         &aur_targets,
         &config.options.helper,
+        &config.options.privilege_tool,
         options,
         sysupgrade,
     );
@@ -403,17 +453,38 @@ pub fn install(
     if options.dry_run {
         println!("\n{}", "Dry-Run: Synthesized Installation Commands:".bold());
         println!("  ➔ {}", full_cmd.cyan());
+        if options.no_cache {
+            println!("{}", "Dry-Run: Cache Cleanup Action (--no-cache):".bold());
+            let has_native = !pacman_targets.is_empty();
+            let has_aur = !aur_targets.is_empty();
+            if has_native && has_aur {
+                println!("  ➔ Purge both native pacman cache and AUR build cache\n");
+            } else if has_native {
+                println!("  ➔ Purge native pacman cache only ({} pacman -Scc); AUR cache preserved\n", config.options.privilege_tool);
+            } else if has_aur {
+                println!("  ➔ Purge AUR build cache only ({} -Scc --aur); native pacman cache preserved\n", config.options.helper);
+            } else {
+                println!("  ➔ No pacman or AUR caches to purge\n");
+            }
+        }
         return Ok(targets.to_vec());
     }
 
+    if !pacman_targets.is_empty() && !sysupgrade {
+        let preview = crate::preview::prepare_native_preview(&mut manager, &pacman_targets)?;
+        crate::preview::check_native_capacity(&preview)?;
+    }
     println!("\n{} {}", ":: Executing:".cyan(), full_cmd.bold());
     let mut installed_targets: Vec<String> = Vec::new();
     let mut executed_commands: Vec<String> = Vec::new();
     let mut exit_status = Ok(std::process::ExitStatus::default());
     let mut all_success = true;
+    let mut native_ok = false;
+    let mut aur_ok = false;
 
     if !pacman_targets.is_empty() {
         let mut args = vec!["pacman", pacman_op];
+        args.extend(crate::progress::pacman_progress_args());
         if options.needed {
             args.push("--needed");
         }
@@ -425,11 +496,18 @@ pub fn install(
         }
         args.push("--");
         args.extend(pacman_targets.iter().map(|s| s.as_str()));
-        let status = Command::new("sudo").args(&args).status();
+        let status = crate::progress::run(
+            crate::privilege::command(&config.options.privilege_tool).args(&args),
+            crate::progress::Manager::Native,
+            "Resolving / installing repository packages",
+            || {},
+        );
         match status {
             Ok(s) if s.success() => {
+                native_ok = true;
+                crate::progress::completed(crate::progress::Manager::Native);
                 installed_targets.extend(pacman_targets.clone());
-                let mut cmd_parts = vec!["sudo", "pacman", pacman_op];
+                let mut cmd_parts = vec![config.options.privilege_tool.as_str(), "pacman", pacman_op];
                 if options.needed {
                     cmd_parts.push("--needed");
                 }
@@ -459,22 +537,34 @@ pub fn install(
     if all_success && !aur_targets.is_empty() {
         let helper = &config.options.helper;
         let mut args = vec![aur_op, "--aur"];
+        args.extend(helper_flags.iter().copied());
         if options.needed {
             args.push("--needed");
         }
         if options.noconfirm {
             args.push("--noconfirm");
         }
+        if options.no_cache {
+            args.push("--cleanafter");
+        }
         for f in &options.forwarded_flags {
             args.push(f.as_str());
         }
         args.push("--");
         args.extend(aur_targets.iter().map(|s| s.as_str()));
-        let status = Command::new(helper).args(&args).status();
+        let status = crate::privilege::prepare(&config.options.privilege_tool).and_then(|()| crate::progress::run(
+            Command::new(helper).args(&args),
+            crate::progress::Manager::Aur,
+            "Building / installing AUR packages",
+            || {},
+        ));
         match status {
             Ok(s) if s.success() => {
+                aur_ok = true;
+                crate::progress::completed(crate::progress::Manager::Aur);
                 installed_targets.extend(aur_targets.clone());
                 let mut cmd_parts = vec![helper.as_str(), aur_op, "--aur"];
+                cmd_parts.extend(helper_flags.iter().copied());
                 if options.needed {
                     cmd_parts.push("--needed");
                 }
@@ -502,19 +592,22 @@ pub fn install(
     }
 
     if !installed_targets.is_empty() {
-        let mut confirmed_pins_added = false;
+        let mut confirmed_pins = Vec::new();
         for (pkg_name, repo_name) in pending_pins {
             let was_installed = installed_targets
                 .iter()
                 .any(|t| t == &pkg_name || t == &format!("{}/{}", repo_name, pkg_name));
             if was_installed {
-                config.pins.insert(pkg_name, repo_name);
-                confirmed_pins_added = true;
+                config.pins.insert(pkg_name.clone(), repo_name.clone());
+                confirmed_pins.push((pkg_name, repo_name));
             }
         }
 
-        if confirmed_pins_added && !options.dry_run {
-            if let Err(e) = save_config(config) {
+        if !confirmed_pins.is_empty() && !options.dry_run {
+            if let Err(e) = mutate_config(|current| {
+                current.pins.extend(confirmed_pins);
+                Ok(())
+            }) {
                 eprintln!(
                     "{}",
                     format!("Warning: Failed to save pins to configuration: {}", e).yellow()
@@ -544,6 +637,10 @@ pub fn install(
         let _ = TransactionJournal::record_transaction("install", tx_packages, &cmd_to_record);
     }
 
+    let cleanup_ok = transaction_cache_cleanup(config, options.no_cache,
+        (!pacman_targets.is_empty()).then_some(native_ok),
+        if !aur_targets.is_empty() && (pacman_targets.is_empty() || native_ok) { Some(aur_ok) } else { None });
+
     if !all_success {
         match exit_status {
             Ok(s) => Err(format!(
@@ -552,6 +649,8 @@ pub fn install(
             )),
             Err(e) => Err(format!("Installation execution failed: {}", e)),
         }
+    } else if !cleanup_ok {
+        Err("Packages installed, but requested cache cleanup failed.".into())
     } else {
         Ok(installed_targets)
     }
@@ -566,6 +665,16 @@ pub fn remove(config: &mut Config, targets: &[String], flags: &[String]) -> Resu
     if let Some(bad) = targets.iter().find(|t| !crate::utils::is_safe_install_target(t)) {
         return Err(format!("Refusing unsafe package target for removal: '{}'.", bad));
     }
+
+    // `-n` / `--dry-run` only ever previews here: forwarded to `pacman -R`
+    // it would mean `--nosave`, so it is consumed and never forwarded.
+    // (Bundled short flags such as `-Rns` keep their pacman meaning.)
+    let dry_run = flags.iter().any(|f| f == "-n" || f == "--dry-run");
+    let forwarded: Vec<&str> = flags
+        .iter()
+        .filter(|f| f.as_str() != "-n" && f.as_str() != "--dry-run")
+        .map(|s| s.as_str())
+        .collect();
 
     let wait_secs = flags
         .iter()
@@ -586,23 +695,37 @@ pub fn remove(config: &mut Config, targets: &[String], flags: &[String]) -> Resu
         });
 
     if let Some(secs) = wait_secs {
-        wait_for_lock(secs)?;
-    } else {
+        if dry_run {
+            println!("{}", ":: Dry-run: skipping lock wait; no changes will be made.".cyan());
+        } else {
+            wait_for_lock(secs)?;
+        }
+    } else if !dry_run {
         check_lock()?;
     }
 
     let mut cmd_args = Vec::new();
-    cmd_args.extend(flags.iter().map(|s| s.as_str()));
+    cmd_args.extend(forwarded.iter().copied());
     cmd_args.push("--");
     cmd_args.extend(targets.iter().map(|s| s.as_str()));
 
+    if dry_run {
+        println!(
+            "{}",
+            "Dry-Run: Synthesized Removal Command (nothing will be removed):".bold()
+        );
+        println!("  ➔ {}", format!("{} pacman {}", config.options.privilege_tool, cmd_args.join(" ")).cyan());
+        return Ok(());
+    }
+
     println!(
-        "{} Removing package(s) via sudo pacman {}...",
+        "{} Removing package(s) via {} pacman {}...",
         "::".cyan(),
+        config.options.privilege_tool,
         cmd_args.join(" ")
     );
 
-    let status = Command::new("sudo").arg("pacman").args(&cmd_args).status();
+    let status = crate::privilege::command(&config.options.privilege_tool).arg("pacman").args(&cmd_args).status();
 
     match status {
         Ok(s) if s.success() => {
@@ -613,7 +736,7 @@ pub fn remove(config: &mut Config, targets: &[String], flags: &[String]) -> Resu
                 .iter()
                 .map(|name| serde_json::json!({ "name": name, "target": name }))
                 .collect();
-            let command = format!("sudo pacman {}", cmd_args.join(" "));
+            let command = format!("{} pacman {}", config.options.privilege_tool, cmd_args.join(" "));
             if let Err(e) = TransactionJournal::record_transaction("remove", packages, &command) {
                 eprintln!(
                     "{}",
@@ -641,7 +764,7 @@ pub fn search(config: &Config, query_args: &[String]) -> Result<i32, String> {
     };
 
     match status {
-        Ok(s) => Ok(s.code().unwrap_or(0)),
+        Ok(s) => Ok(s.code().unwrap_or(1)),
         Err(e) => Err(format!("Search execution failed: {}", e)),
     }
 }
@@ -660,53 +783,358 @@ pub fn info(config: &Config, pkg_args: &[String]) -> Result<i32, String> {
     };
 
     match status {
-        Ok(s) => Ok(s.code().unwrap_or(0)),
+        Ok(s) => Ok(s.code().unwrap_or(1)),
         Err(e) => Err(format!("Info query failed: {}", e)),
     }
 }
 
-/// Cleans package cache via AUR helper or pacman.
-pub fn clean(config: &Config, extra_args: &[String]) -> Result<i32, String> {
+/// Cleans package cache via AUR helper or pacman, with support for scoping to native-only or AUR-only.
+pub fn clean_scoped(
+    config: &Config,
+    full: bool,
+    extra_args: &[String],
+    force_native_only: bool,
+) -> Result<i32, String> {
+    // AUR helpers must never inherit a root pacpin process (e.g. `pkexec pin clean`).
+    if unsafe { libc::geteuid() } == 0 {
+        return Err("Do not run pacpin as root. Run `pin clean` as your user and set [options] privilege_tool = \"pkexec\" if needed.".into());
+    }
+    crate::config::validate_privilege_tool(&config.options.privilege_tool)?;
     check_lock()?;
+    let is_aur_only = extra_args.iter().any(|arg| arg == "--aur" || arg == "-a");
+    if !is_aur_only {
+        prune_stale_empty_download_directories(config);
+    }
     let helper = &config.options.helper;
-    let status = if crate::is_command_available(helper) {
-        println!(
-            "{} Cleaning package cache via {} -Sc...",
-            "::".cyan(),
-            helper
-        );
-        Command::new(helper).arg("-Sc").args(extra_args).status()
+    let use_helper = !force_native_only && crate::is_command_available(helper);
+    let flag = if full { "-Scc" } else { "-Sc" };
+    let mut cmd = build_clean_command(config, full, extra_args, use_helper)?;
+    if use_helper {
+        if is_aur_only {
+            println!(
+                "{} Cleaning AUR build cache via {} {} --aur...",
+                "::".cyan(),
+                helper,
+                flag
+            );
+        } else {
+            println!(
+                "{} Cleaning package cache via {} {}...",
+                "::".cyan(),
+                helper,
+                flag
+            );
+        }
     } else {
         println!(
-            "{} Cleaning package cache via sudo pacman -Sc...",
-            "::".cyan()
+            "{} Cleaning native package cache via {} pacman {}...",
+            "::".cyan(), config.options.privilege_tool, flag
         );
-        Command::new("sudo")
-            .arg("pacman")
-            .arg("-Sc")
-            .args(extra_args)
-            .status()
-    };
-
+    }
+    // `pacman -Scc --noconfirm` answers its destructive [y/N] prompt with No.
+    // Answer only the known cache-clean questions after pacpin's own approval.
+    if full {
+        // Queue the bounded answers before spawning. Writing to a child's
+        // pipe after it fails early could terminate pacpin with SIGPIPE,
+        // hiding the actual cleanup status and skipping restart advice.
+        let input = cache_input(&cache_answers(TransactionJournal::get_cache_dirs().len(), is_aur_only))
+            .map_err(|error| format!("Could not prepare cache-clean answers: {error}"))?;
+        cmd.stdin(Stdio::from(std::os::fd::OwnedFd::from(input)));
+    }
+    let status = cmd.status();
     match status {
-        Ok(s) => Ok(s.code().unwrap_or(0)),
+        Ok(s) => Ok(s.code().unwrap_or(1)),
         Err(e) => Err(format!("Clean execution failed: {}", e)),
     }
 }
 
+pub fn clean(config: &Config, full: bool, extra_args: &[String]) -> Result<i32, String> {
+    clean_scoped(config, full, extra_args, false)
+}
+
+fn cache_answers(native_dirs: usize, aur_only: bool) -> Vec<u8> {
+    if aur_only { return b"y\n".repeat(64); }
+    let mut answers = b"y\n".repeat(native_dirs);
+    // Cache cleanup must not also remove sync databases.
+    answers.extend_from_slice(b"n\n");
+    answers.extend_from_slice(&b"y\n".repeat(64));
+    answers
+}
+
+fn cache_input(answers: &[u8]) -> std::io::Result<std::os::unix::net::UnixStream> {
+    if answers.len() > 8192 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Too many cache-clean prompts"));
+    }
+    let (input, mut output) = std::os::unix::net::UnixStream::pair()?;
+    output.write_all(answers)?;
+    output.shutdown(std::net::Shutdown::Write)?;
+    Ok(input)
+}
+
+pub fn clean_preview(config: &Config, full: bool, extra_args: &[String]) -> Result<String, String> {
+    let flags: Vec<_> = extra_args.iter().filter(|s| s.as_str() != "--dry-run" && s.as_str() != "-n").cloned().collect();
+    let command = build_clean_command(config, full, &flags, crate::is_command_available(&config.options.helper))?;
+    Ok(std::iter::once(command.get_program()).chain(command.get_args()).map(|s| crate::utils::shell_quote(&s.to_string_lossy())).collect::<Vec<_>>().join(" "))
+}
+
+pub fn helper_privilege_args<'a>(helper: &str, tool: &'a str) -> Result<Vec<&'a str>, String> {
+    crate::config::validate_privilege_tool(tool)?;
+    if tool == "sudo" { return Ok(Vec::new()); }
+    if std::path::Path::new(helper).file_name().is_some_and(|name| name == "paru") {
+        Ok(vec!["--sudo", tool])
+    } else {
+        Err(format!("Cannot configure {tool} for AUR helper '{helper}'; paru supports --sudo, other helpers require their own configuration"))
+    }
+}
+
+/// Cleans only the caches affected by the completed transaction.
+/// If only AUR packages were installed, native pacman cache is untouched.
+/// If only native packages were installed, AUR cache is untouched.
+/// If neither was installed (e.g. only sources), neither cache is purged.
+pub fn clean_after_transaction(config: &Config, has_native: bool, has_aur: bool) -> Result<(), String> {
+    if !has_native && !has_aur {
+        return Ok(());
+    }
+
+    let clean_args = vec!["--noconfirm".to_string()];
+
+    if has_native {
+        println!("{}", "\n:: Purging native package cache (--no-cache)...".cyan());
+        cleanup_status("Native", clean_scoped(config, true, &clean_args, true)?)?;
+        println!("✔ Native cache cleaned successfully.");
+    }
+    if has_aur {
+        let helper = &config.options.helper;
+        if crate::is_command_available(helper) {
+            println!("{}", "\n:: Purging AUR build cache (--no-cache)...".cyan());
+            let aur_clean_args = vec!["--aur".to_string(), "--noconfirm".to_string()];
+            cleanup_status("AUR", clean_scoped(config, true, &aur_clean_args, false)?)?;
+            println!("✔ AUR cache cleaned successfully.");
+        } else {
+            return Err(format!("Cannot clean AUR cache: helper '{helper}' is unavailable"));
+        }
+    }
+
+    Ok(())
+}
+
+fn cleanup_status(manager: &str, code: i32) -> Result<(), String> {
+    if code == 0 { Ok(()) } else { Err(format!("{manager} cache cleanup exited with code {code}")) }
+}
+
+pub fn transaction_cache_cleanup(config: &Config, requested: bool, native: Option<bool>, aur: Option<bool>) -> bool {
+    if !requested { return true; }
+    let mut success = true;
+    for (manager, outcome) in [("Native", native), ("AUR", aur)] {
+        if outcome == Some(false) {
+            println!(":: {manager} cache cleanup skipped: transaction failed; cached packages preserved for recovery.");
+        }
+        if outcome == Some(true) {
+            if let Err(error) = clean_after_transaction(config, manager == "Native", manager == "AUR") {
+                eprintln!(":: Warning: {manager} cache cleanup failed: {error}");
+                success = false;
+            }
+        }
+    }
+    if native.is_none() && aur.is_none() {
+        println!(":: --no-cache: no native or AUR cache cleanup needed for this transaction.");
+    }
+    success
+}
+
+fn prune_stale_empty_download_directories(config: &Config) {
+    let Ok(output) = Command::new("pacman-conf").arg("CacheDir").output() else { return; };
+    if !output.status.success() { return; }
+    let mut stale = Vec::new();
+    let now = SystemTime::now();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let cache_dir = std::path::Path::new(line);
+        let Ok(entries) = std::fs::read_dir(cache_dir) else { continue; };
+        for entry in entries.flatten() {
+            if is_stale_download_directory(&entry, now) {
+                stale.push(entry.path());
+            }
+        }
+    }
+    if stale.is_empty() { return; }
+    // rmdir cannot remove non-empty directories, and the age/lock checks
+    // prevent us from touching a newly created ALPM download sandbox.
+    let _ = crate::privilege::command(&config.options.privilege_tool)
+        .arg("/usr/bin/rmdir")
+        .arg("--")
+        .args(&stale)
+        .status();
+    for path in stale {
+        if path.exists() {
+            eprintln!(":: Warning: {} remains in the pacman cache; inspect it when no package manager is active. pacman may report a cache scan error.", path.display());
+        } else {
+            println!(":: Removed stale, empty ALPM download directory {}", path.display());
+        }
+    }
+}
+
+fn is_stale_download_directory(entry: &std::fs::DirEntry, now: SystemTime) -> bool {
+    entry.file_name().to_string_lossy().starts_with("download-")
+        && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        && entry.metadata().ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age.as_secs() >= 120)
+}
+
+fn build_clean_command(config: &Config, full: bool, extra_args: &[String], use_helper: bool) -> Result<Command, String> {
+    let privilege_tool = crate::config::validate_privilege_tool(&config.options.privilege_tool)?;
+    if extra_args.iter().any(|arg| arg == "--confirm") {
+        return Err("--confirm conflicts with pacpin's single-confirmation clean flow".into());
+    }
+    let has_sudo_override = extra_args.iter().any(|arg| arg == "--sudo" || arg.starts_with("--sudo="));
+    if !use_helper && has_sudo_override {
+        return Err("--sudo is an AUR-helper option; set [options] privilege_tool for pacman fallback".into());
+    }
+    let flag = if full { "-Scc" } else { "-Sc" };
+    let is_aur_only = extra_args.iter().any(|arg| arg == "--aur" || arg == "-a");
+    let mut cmd = if use_helper {
+        let mut cmd = Command::new(&config.options.helper);
+        cmd.arg(flag);
+        if !is_aur_only && !has_sudo_override && privilege_tool != "sudo" {
+            let is_paru = std::path::Path::new(&config.options.helper).file_name()
+                .is_some_and(|name| name == "paru");
+            if !is_paru {
+                return Err(format!(
+                    "Cannot configure {privilege_tool} for helper '{}'; only paru's --sudo option is supported. Configure the helper itself or select paru.",
+                    config.options.helper
+                ));
+            }
+            cmd.args(["--sudo", privilege_tool]);
+        }
+        cmd
+    } else {
+        let mut cmd = crate::privilege::command(privilege_tool);
+        cmd.arg("/usr/bin/pacman").arg(flag);
+        cmd
+    };
+    cmd.args(extra_args.iter().filter(|arg| arg.as_str() != "--noconfirm"));
+    if !full { cmd.arg("--noconfirm"); }
+    Ok(cmd)
+}
+
+#[cfg(test)]
+mod clean_tests {
+    use super::*;
+    #[test]
+    fn aur_privilege_override_is_explicit_and_helper_specific() {
+        assert_eq!(helper_privilege_args("/usr/bin/paru", "pkexec").unwrap(), ["--sudo", "pkexec"]);
+        assert!(helper_privilege_args("yay", "pkexec").is_err());
+        assert!(helper_privilege_args("yay", "sudo").unwrap().is_empty());
+    }
+    #[test]
+    fn cache_confirmation_preserves_sync_databases() {
+        let answers = cache_answers(2, false);
+        assert!(answers.starts_with(b"y\ny\nn\n"));
+        assert!(!cache_answers(2, true).contains(&b'n'));
+    }
+
+    #[test]
+    fn cache_input_has_complete_answers_and_eof_before_a_child_exists() {
+        use std::io::Read;
+        let answers = cache_answers(2, false);
+        let mut input = cache_input(&answers).unwrap();
+        let mut read = Vec::new();
+        input.read_to_end(&mut read).unwrap();
+        assert_eq!(read, answers);
+        assert!(cache_input(&vec![0; 8193]).is_err());
+    }
+
+    #[test]
+    fn failed_cleanup_exit_status_is_never_success() {
+        assert!(cleanup_status("Native", 0).is_ok());
+        assert!(cleanup_status("Native", 255).unwrap_err().contains("255"));
+    }
+
+    fn argv(command: &Command) -> Vec<String> {
+        std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn normal_clean_uses_configured_escalation_and_no_second_prompt() {
+        let mut config = Config::default();
+        config.options.privilege_tool = "pkexec".into();
+        let helper = build_clean_command(&config, false, &[], true).unwrap();
+        assert_eq!(argv(&helper), ["paru", "-Sc", "--sudo", "pkexec", "--noconfirm"]);
+        let pacman = build_clean_command(&config, false, &[], false).unwrap();
+        assert_eq!(argv(&pacman), ["pkexec", "/usr/bin/pacman", "-Sc", "--noconfirm"]);
+    }
+
+    #[test]
+    fn full_clean_preserves_scc_and_does_not_choose_default_no() {
+        let config = Config::default();
+        let flags = vec!["--noconfirm".to_string()];
+        let helper = build_clean_command(&config, true, &flags, true).unwrap();
+        assert_eq!(argv(&helper), ["paru", "-Scc"]);
+        let pacman = build_clean_command(&config, true, &flags, false).unwrap();
+        assert_eq!(argv(&pacman), ["sudo", "/usr/bin/pacman", "-Scc"]);
+    }
+
+    #[test]
+    fn aur_clean_does_not_use_privilege_escalation() {
+        let mut config = Config::default();
+        config.options.privilege_tool = "pkexec".into();
+        let flags = vec!["--aur".to_string(), "--noconfirm".to_string()];
+        let helper = build_clean_command(&config, true, &flags, true).unwrap();
+        assert_eq!(argv(&helper), ["paru", "-Scc", "--aur"]);
+    }
+
+    #[test]
+    fn native_only_clean_runs_pacman_directly() {
+        let mut config = Config::default();
+        config.options.privilege_tool = "pkexec".into();
+        let flags = vec!["--noconfirm".to_string()];
+        let pacman = build_clean_command(&config, true, &flags, false).unwrap();
+        assert_eq!(argv(&pacman), ["pkexec", "/usr/bin/pacman", "-Scc"]);
+    }
+
+    #[test]
+    fn clean_rejects_conflicting_prompt_and_escalation_flags() {
+        let config = Config::default();
+        assert!(build_clean_command(&config, false, &["--confirm".into()], true).is_err());
+        assert!(build_clean_command(&config, false, &["--sudo=pkexec".into()], false).is_err());
+        assert!(crate::config::validate_privilege_tool("sudo --bad-flag").is_err());
+    }
+
+    #[test]
+    fn stale_download_dir_filter_ignores_new_dirs_and_files() {
+        let root = std::env::temp_dir().join(format!("pacpin_clean_dirs_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join("download-old")).unwrap();
+        std::fs::create_dir_all(root.join("ordinary")).unwrap();
+        std::fs::write(root.join("download-file"), b"not a directory").unwrap();
+        let entries = std::fs::read_dir(&root).unwrap().map(Result::unwrap).collect::<Vec<_>>();
+        let now = SystemTime::now();
+        assert!(entries.iter().all(|entry| !is_stale_download_directory(entry, now)));
+        let later = now + std::time::Duration::from_secs(121);
+        let matched = entries.iter().filter(|entry| is_stale_download_directory(entry, later))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(matched, ["download-old"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// Forwards arbitrary commands directly to pacman with database lock protection.
-pub fn forward_pacman(args: &[String], needs_sudo: bool) -> Result<i32, String> {
+pub fn forward_pacman(config: &Config, args: &[String], needs_sudo: bool) -> Result<i32, String> {
     if needs_sudo {
         check_lock()?;
-        let status = Command::new("sudo").arg("pacman").args(args).status();
+        let status = crate::privilege::command(&config.options.privilege_tool).arg("pacman").args(args).status();
         match status {
-            Ok(s) => Ok(s.code().unwrap_or(0)),
-            Err(e) => Err(format!("Failed to run sudo pacman: {}", e)),
+            Ok(s) => Ok(s.code().unwrap_or(1)),
+            Err(e) => Err(format!("Failed to run {} pacman: {}", config.options.privilege_tool, e)),
         }
     } else {
         let status = Command::new("pacman").args(args).status();
         match status {
-            Ok(s) => Ok(s.code().unwrap_or(0)),
+            Ok(s) => Ok(s.code().unwrap_or(1)),
             Err(e) => Err(format!("Failed to run pacman: {}", e)),
         }
     }
@@ -906,76 +1334,106 @@ pub fn wait_for_lock(max_wait_secs: u64) -> Result<(), String> {
 
 /// Inspects candidate packages against installed packages to identify potential conflicts.
 pub fn check_package_conflicts(manager: &AlpmManager, targets: &[String]) -> Vec<(String, String)> {
-    let local_db = manager.handle().localdb();
-    let mut conflicts = Vec::new();
-    let mut conflict_set: HashSet<(String, String)> = HashSet::new();
-
-    // Pre-index conflicts declared by installed packages:
-    // conflict_dep_name -> list of installed package names declaring it
-    let mut installed_conflicts: HashMap<String, Vec<String>> = HashMap::new();
-    for inst in local_db.pkgs() {
-        for conflict_dep in inst.conflicts() {
-            installed_conflicts
-                .entry(conflict_dep.name().to_string())
-                .or_default()
-                .push(inst.name().to_string());
-        }
-    }
-
-    for target in targets {
+    let candidates: Vec<&alpm::Package> = targets.iter().filter_map(|target| {
         let (requested_repo, pkg_clean) = match target.split_once('/') {
             Some((repo, pkg)) => (Some(repo), pkg),
             None => (None, target.as_str()),
         };
 
-        let pkg_opt = manager
-            .handle()
-            .syncdbs()
-            .into_iter()
-            .filter(|db| requested_repo.is_none_or(|repo| db.name() == repo))
-            .find_map(|db| {
-                db.pkg(pkg_clean)
-                    .ok()
-                    .or_else(|| db.pkgs().find_satisfier(pkg_clean))
-            });
+        // Let ALPM search all repositories for an exact package before considering
+        // providers. A provider in an earlier repository is not the upgrade target.
+        let syncdbs = manager.handle().syncdbs();
+        if let Some(repo) = requested_repo {
+            syncdbs.into_iter().find(|db| db.name() == repo)
+                .and_then(|db| db.pkgs().find_satisfier(pkg_clean))
+        } else {
+            syncdbs.find_satisfier(pkg_clean)
+        }
+    }).collect();
+    check_candidate_conflicts(manager, &candidates)
+}
 
-        if let Some(pkg) = pkg_opt {
-            let pkg_name = pkg.name();
+/// Checks the exact candidates in the upgrade plan without resolving their names again.
+pub fn check_resolved_package_conflicts(
+    manager: &AlpmManager,
+    updates: &[ResolvedPackage],
+) -> Vec<(String, String)> {
+    let candidates: Vec<&alpm::Package> = updates.iter().filter_map(|update| {
+        let candidate = update.candidate.as_ref().filter(|candidate| !candidate.is_aur)?;
+        manager.handle().syncdbs().into_iter()
+            .find(|db| db.name() == candidate.repo)
+            .and_then(|db| db.pkg(candidate.name.as_str()).ok())
+    }).collect();
+    check_candidate_conflicts(manager, &candidates)
+}
 
-            // 1. Check if candidate package declares conflicts with any installed package
-            for conflict_dep in pkg.conflicts() {
-                if let Some(inst) = local_db.pkgs().find_satisfier(conflict_dep.to_string()) {
-                    if inst.name() != pkg_name
-                        && conflict_set.insert((pkg_name.to_string(), inst.name().to_string()))
-                    {
-                        conflicts.push((pkg_name.to_string(), inst.name().to_string()));
-                    }
-                }
-            }
+fn check_candidate_conflicts(
+    manager: &AlpmManager,
+    candidates: &[&alpm::Package],
+) -> Vec<(String, String)> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let candidate_names: HashSet<&str> = candidates.iter().map(|pkg| pkg.name()).collect();
+    // Inspect the proposed versions, not old versions of packages being upgraded.
+    let packages: Vec<&alpm::Package> = candidates.iter().copied().chain(
+        manager.handle().localdb().pkgs().into_iter()
+            .filter(|pkg| !candidate_names.contains(pkg.name()))
+    ).collect();
+    let mut satisfiers: HashMap<&str, Vec<&alpm::Package>> = HashMap::new();
+    let mut reverse_conflicts: HashMap<&str, Vec<&alpm::Package>> = HashMap::new();
+    for pkg in &packages {
+        satisfiers.entry(pkg.name()).or_default().push(pkg);
+        for provide in pkg.provides() {
+            satisfiers.entry(provide.name()).or_default().push(pkg);
+        }
+        for conflict in pkg.conflicts() {
+            reverse_conflicts.entry(conflict.name()).or_default().push(pkg);
+        }
+    }
 
-            // 2. Check if any installed package declares a conflict with candidate package or what it provides
-            if let Some(inst_names) = installed_conflicts.get(pkg_name) {
-                for inst_name in inst_names {
-                    if inst_name != pkg_name
-                        && conflict_set.insert((pkg_name.to_string(), inst_name.clone()))
-                    {
-                        conflicts.push((pkg_name.to_string(), inst_name.clone()));
-                    }
-                }
-            }
-            for pr in pkg.provides() {
-                if let Some(inst_names) = installed_conflicts.get(pr.name()) {
-                    for inst_name in inst_names {
-                        if inst_name != pkg_name
-                            && conflict_set.insert((pkg_name.to_string(), inst_name.clone()))
-                        {
-                            conflicts.push((pkg_name.to_string(), inst_name.clone()));
-                        }
-                    }
+    let mut checked = HashSet::new();
+    let mut conflicts = Vec::new();
+    for candidate in candidates {
+        // Name indexes only narrow the possible pairs. ALPM alone decides whether
+        // versions, epochs and virtual provides satisfy the actual conflict.
+        let mut potential: HashMap<&str, &alpm::Package> = HashMap::new();
+        for conflict in candidate.conflicts() {
+            if let Some(packages) = satisfiers.get(conflict.name()) {
+                for pkg in packages {
+                    potential.insert(pkg.name(), pkg);
                 }
             }
         }
+        for name in std::iter::once(candidate.name()).chain(candidate.provides().into_iter().map(|p| p.name())) {
+            if let Some(packages) = reverse_conflicts.get(name) {
+                for pkg in packages {
+                    potential.insert(pkg.name(), pkg);
+                }
+            }
+        }
+        for other in potential.values() {
+            let name = candidate.name();
+            let other_name = other.name();
+            if name == other_name {
+                continue;
+            }
+            let key = if name < other_name { (name, other_name) } else { (other_name, name) };
+            if !checked.insert(key) {
+                continue;
+            }
+            let pair = [*candidate, *other];
+            if !manager.handle().check_conflicts(pair.iter()).is_empty() {
+                let pair = if candidate_names.contains(other_name) {
+                    key
+                } else {
+                    (name, other_name)
+                };
+                conflicts.push((pair.0.to_string(), pair.1.to_string()));
+            }
+        }
     }
+    conflicts.sort();
     conflicts
 }
 
@@ -1294,8 +1752,10 @@ mod tests {
             sysupgrade: false,
             dry_run: true,
             forwarded_flags: Vec::new(),
+            channel: None,
+            no_cache: false,
         };
-        let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", &opts_dry_sy, false);
+        let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", "sudo", &opts_dry_sy, false);
         assert_eq!(op, "-S");
         assert_eq!(
             cmds,
@@ -1314,8 +1774,10 @@ mod tests {
             sysupgrade: false,
             dry_run: false,
             forwarded_flags: Vec::new(),
+            channel: None,
+            no_cache: false,
         };
-        let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", &opts_sy, false);
+        let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", "sudo", &opts_sy, false);
         assert_eq!(op, "-S");
         assert_eq!(cmds, vec!["sudo pacman -S --needed -- ollama".to_string()]);
 
@@ -1327,8 +1789,10 @@ mod tests {
             sysupgrade: true,
             dry_run: false,
             forwarded_flags: Vec::new(),
+            channel: None,
+            no_cache: false,
         };
-        let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", &opts_syu, true);
+        let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", "sudo", &opts_syu, true);
         assert_eq!(op, "-Syu");
         assert_eq!(cmds, vec!["sudo pacman -Syu --needed -- ollama".to_string()]);
 
@@ -1340,14 +1804,16 @@ mod tests {
             sysupgrade: true,
             dry_run: false,
             forwarded_flags: Vec::new(),
+            channel: None,
+            no_cache: false,
         };
-        let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", &opts_su, true);
+        let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", "sudo", &opts_su, true);
         assert_eq!(op, "-Su");
         assert_eq!(cmds, vec!["sudo pacman -Su --needed -- ollama".to_string()]);
 
         // 5. AUR targets with sysupgrade when no repo targets:
         let aur_targets = vec!["google-chrome".to_string()];
-        let (cmds, _op, aur_op) = build_install_commands(&[], &aur_targets, "paru", &opts_syu, true);
+        let (cmds, _op, aur_op) = build_install_commands(&[], &aur_targets, "paru", "sudo", &opts_syu, true);
         assert_eq!(aur_op, "-Syu");
         assert_eq!(cmds, vec!["paru -Syu --aur --needed -- google-chrome".to_string()]);
     }
@@ -1380,5 +1846,168 @@ mod tests {
             let non_existent = check_package_conflicts(&manager, &["nonexistent_pkg_xyz_12345".to_string()]);
             assert!(non_existent.is_empty());
         }
+    }
+
+    #[test]
+    fn test_versioned_reverse_conflicts() {
+        use crate::db::test_support::{AlpmFixture, FixturePackage};
+        for (version, count) in [("37-1", 2), ("38-1", 0), ("42.1-1", 0)] {
+            let mut cryptsetup = FixturePackage::new("cryptsetup", "1-1");
+            cryptsetup.conflicts = &["mkinitcpio<38-1"];
+            let mut mdadm = FixturePackage::new("mdadm", "1-1");
+            mdadm.conflicts = &["mkinitcpio<38"];
+            let fixture = AlpmFixture::new(
+                &[cryptsetup, mdadm],
+                &[("core", &[FixturePackage::new("mkinitcpio", version)])],
+            );
+            assert_eq!(check_package_conflicts(&fixture.manager, &["mkinitcpio".into()]).len(), count);
+        }
+    }
+
+    fn firefox_provider_fixture() -> crate::db::test_support::AlpmFixture {
+        use crate::db::test_support::{AlpmFixture, FixturePackage};
+        let mut provider = FixturePackage::new("firefox-pure", "2.0-1");
+        provider.provides = &["firefox", "firefox=2.0"];
+        provider.conflicts = &["firefox"];
+        AlpmFixture::new(
+            &[FixturePackage::new("firefox", "1.0-1")],
+            &[
+                ("first", &[provider]),
+                ("second", &[FixturePackage::new("firefox", "2.0-1")]),
+            ],
+        )
+    }
+
+    #[test]
+    fn upgrade_conflicts_inspect_exact_package_before_earlier_repo_provider() {
+        let fixture = firefox_provider_fixture();
+        let result = ResolverEngine::new(&fixture.manager).resolve_with_options(&Config::default(), true);
+        assert_eq!(result.updates.len(), 1);
+        let candidate = result.updates[0].candidate.as_ref().unwrap();
+        assert_eq!(candidate.name, "firefox");
+        assert_eq!(candidate.repo, "second");
+        assert!(check_package_conflicts(&fixture.manager, &["firefox".into()]).is_empty());
+        assert!(check_resolved_package_conflicts(&fixture.manager, &result.updates).is_empty());
+    }
+
+    #[test]
+    fn explicit_provider_conflicts_and_repository_scope_are_preserved() {
+        let fixture = firefox_provider_fixture();
+        let expected = vec![("firefox-pure".to_string(), "firefox".to_string())];
+        assert_eq!(check_package_conflicts(&fixture.manager, &["firefox-pure".into()]), expected);
+        assert_eq!(check_package_conflicts(&fixture.manager, &["first/firefox".into()]), expected);
+        assert!(check_package_conflicts(&fixture.manager, &["second/firefox".into()]).is_empty());
+        assert!(check_package_conflicts(&fixture.manager, &["missing/firefox".into()]).is_empty());
+    }
+
+    #[test]
+    fn virtual_target_still_uses_provider_when_no_exact_sync_package_exists() {
+        use crate::db::test_support::{AlpmFixture, FixturePackage};
+        let mut provider = FixturePackage::new("firefox-pure", "2.0-1");
+        provider.provides = &["firefox"];
+        provider.conflicts = &["firefox"];
+        let fixture = AlpmFixture::new(
+            &[FixturePackage::new("firefox", "1.0-1")],
+            &[("first", &[provider])],
+        );
+        assert_eq!(
+            check_package_conflicts(&fixture.manager, &["firefox".into()]),
+            vec![("firefox-pure".to_string(), "firefox".to_string())],
+        );
+    }
+
+    #[test]
+    fn planned_repository_is_used_instead_of_resolving_the_name_again() {
+        use crate::db::test_support::{AlpmFixture, FixturePackage};
+        let mut first_firefox = FixturePackage::new("firefox", "2-1");
+        first_firefox.conflicts = &["plugin"];
+        let fixture = AlpmFixture::new(
+            &[FixturePackage::new("firefox", "1-1"), FixturePackage::new("plugin", "1-1")],
+            &[
+                ("first", &[first_firefox]),
+                ("second", &[FixturePackage::new("firefox", "3-1")]),
+            ],
+        );
+        let mut config = Config::default();
+        config.pins.insert("firefox".into(), "second".into());
+        let result = ResolverEngine::new(&fixture.manager).resolve_with_options(&config, true);
+        assert_eq!(result.updates.len(), 1);
+        assert_eq!(result.updates[0].candidate.as_ref().unwrap().repo, "second");
+        assert_eq!(check_package_conflicts(&fixture.manager, &["firefox".into()]).len(), 1);
+        assert!(check_resolved_package_conflicts(&fixture.manager, &result.updates).is_empty());
+    }
+
+    #[test]
+    fn native_conflict_rules_handle_versioned_and_unversioned_provides() {
+        use crate::db::test_support::{AlpmFixture, FixturePackage};
+        for (conflict, provides, expected) in [
+            (&["api>=1:2.0"][..], &["api=1:2.0"][..], 1),
+            (&["api>=1:2.0"][..], &["api=2.1"][..], 0),
+            (&["api>=1:2.0"][..], &["api"][..], 0),
+            (&["api"][..], &["api"][..], 1),
+        ] {
+            let mut consumer = FixturePackage::new("consumer", "1-1");
+            consumer.conflicts = conflict;
+            let mut provider = FixturePackage::new("provider", "99-1");
+            provider.provides = provides;
+            let fixture = AlpmFixture::new(&[consumer], &[("repo", &[provider])]);
+            assert_eq!(check_package_conflicts(&fixture.manager, &["provider".into()]).len(), expected);
+        }
+    }
+
+    #[test]
+    fn outdated_installed_conflict_is_removed_when_both_packages_are_upgraded() {
+        use crate::db::test_support::{AlpmFixture, FixturePackage};
+        let mut old_consumer = FixturePackage::new("consumer", "1-1");
+        old_consumer.conflicts = &["engine>=2"];
+        let fixture = AlpmFixture::new(
+            &[old_consumer, FixturePackage::new("engine", "1-1")],
+            &[("repo", &[FixturePackage::new("consumer", "2-1"), FixturePackage::new("engine", "2-1")])],
+        );
+        assert_eq!(check_package_conflicts(&fixture.manager, &["engine".into()]).len(), 1);
+        assert!(check_package_conflicts(&fixture.manager, &["engine".into(), "consumer".into()]).is_empty());
+    }
+
+    #[test]
+    fn all_installed_providers_are_checked_and_self_upgrades_are_excluded() {
+        use crate::db::test_support::{AlpmFixture, FixturePackage};
+        let mut first = FixturePackage::new("plugin-a", "1-1");
+        first.provides = &["api"];
+        let mut second = FixturePackage::new("plugin-b", "1-1");
+        second.provides = &["api"];
+        let mut candidate = FixturePackage::new("plugin-a", "2-1");
+        candidate.provides = &["api"];
+        candidate.conflicts = &["api"];
+        let fixture = AlpmFixture::new(&[first, second], &[("repo", &[candidate])]);
+        assert_eq!(
+            check_package_conflicts(&fixture.manager, &["plugin-a".into()]),
+            vec![("plugin-a".to_string(), "plugin-b".to_string())],
+        );
+    }
+
+    #[test]
+    fn conflicts_between_selected_candidates_are_reported_once() {
+        use crate::db::test_support::{AlpmFixture, FixturePackage};
+        let mut first = FixturePackage::new("first", "1-1");
+        first.conflicts = &["second"];
+        let mut second = FixturePackage::new("second", "1-1");
+        second.conflicts = &["first"];
+        let fixture = AlpmFixture::new(&[], &[("repo", &[first, second])]);
+        assert!(check_package_conflicts(&fixture.manager, &["first".into()]).is_empty());
+        assert_eq!(
+            check_package_conflicts(&fixture.manager, &["second".into(), "first".into()]),
+            vec![("first".to_string(), "second".to_string())],
+        );
+    }
+
+    #[test]
+    fn remove_dry_run_never_executes() {
+        // `-n` / `--dry-run` only preview; forwarded to `pacman -R` they
+        // would mean `--nosave`, so they must be consumed, never forwarded.
+        let mut config = crate::config::Config::default();
+        let missing = ["definitely-not-a-real-package-xyz".to_string()];
+        assert!(remove(&mut config, &missing, &["-n".to_string()]).is_ok());
+        assert!(remove(&mut config, &missing, &["--dry-run".to_string()]).is_ok());
+        assert!(remove(&mut config, &["--config".to_string()], &["-n".to_string()]).is_err());
     }
 }

@@ -358,6 +358,12 @@ impl AlpmManager {
         &self.handle
     }
 
+    /// Mutable access for lock-free, non-committing transaction previews.
+    /// Callers must only prepare and release; never commit through this handle.
+    pub fn handle_mut(&mut self) -> &mut Alpm {
+        &mut self.handle
+    }
+
     pub fn get_dependents(&self, target_pkg: &str) -> Vec<String> {
         let mut dependents = HashSet::new();
         let mut target_names = HashSet::new();
@@ -513,6 +519,147 @@ impl AlpmManager {
 }
 
 pub use crate::orphans::OrphanPackage;
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) struct FixturePackage {
+        pub name: &'static str,
+        pub version: &'static str,
+        pub provides: &'static [&'static str],
+        pub conflicts: &'static [&'static str],
+        pub depends: &'static [&'static str],
+        pub replaces: &'static [&'static str],
+        pub isize: i64,
+        pub csize: i64,
+        pub builddate: i64,
+        pub groups: &'static [&'static str],
+    }
+
+    impl FixturePackage {
+        pub(crate) fn new(name: &'static str, version: &'static str) -> Self {
+            Self {
+                name,
+                version,
+                provides: &[],
+                conflicts: &[],
+                depends: &[],
+                replaces: &[],
+                isize: 0,
+                csize: 0,
+                builddate: 0,
+                groups: &[],
+            }
+        }
+
+        pub(crate) fn with_depends(
+            name: &'static str,
+            version: &'static str,
+            depends: &'static [&'static str],
+        ) -> Self {
+            Self { depends, ..Self::new(name, version) }
+        }
+
+        pub(crate) fn with_size(
+            name: &'static str,
+            version: &'static str,
+            isize: i64,
+            csize: i64,
+        ) -> Self {
+            Self { isize, csize, ..Self::new(name, version) }
+        }
+
+        pub(crate) fn with_replaces(
+            name: &'static str,
+            version: &'static str,
+            replaces: &'static [&'static str],
+        ) -> Self {
+            Self { replaces, ..Self::new(name, version) }
+        }
+
+        fn desc(&self) -> String {
+            format!(
+                "%NAME%\n{}\n\n%VERSION%\n{}\n\n%GROUPS%\n{}\n\n%ARCH%\nx86_64\n\n%BUILDDATE%\n{}\n\n%FILENAME%\n{}-{}-x86_64.pkg.tar.zst\n\n%REASON%\n0\n\n%SIZE%\n{}\n\n%ISIZE%\n{}\n\n%CSIZE%\n{}\n\n%DEPENDS%\n{}\n\n%REPLACES%\n{}\n\n%PROVIDES%\n{}\n\n%CONFLICTS%\n{}\n\n",
+                self.name,
+                self.version,
+                self.groups.join("\n"),
+                self.builddate,
+                self.name,
+                self.version,
+                self.isize,
+                self.isize,
+                self.csize,
+                self.depends.join("\n"),
+                self.replaces.join("\n"),
+                self.provides.join("\n"),
+                self.conflicts.join("\n")
+            )
+        }
+    }
+
+    pub(crate) struct AlpmFixture {
+        pub manager: AlpmManager,
+        path: PathBuf,
+    }
+
+    impl AlpmFixture {
+        pub(crate) fn new(local: &[FixturePackage], repos: &[(&str, &[FixturePackage])]) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "pacpin-alpm-fixture-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(path.join("local")).unwrap();
+            std::fs::create_dir_all(path.join("sync")).unwrap();
+            std::fs::write(path.join("local/ALPM_DB_VERSION"), "9\n").unwrap();
+            for pkg in local {
+                let dir = path.join("local").join(format!("{}-{}", pkg.name, pkg.version));
+                std::fs::create_dir(&dir).unwrap();
+                std::fs::write(dir.join("desc"), pkg.desc()).unwrap();
+                std::fs::write(dir.join("files"), "%FILES%\n\n").unwrap();
+            }
+            for (repo, packages) in repos {
+                let file = std::fs::File::create(path.join("sync").join(format!("{}.db", repo))).unwrap();
+                let mut archive = tar::Builder::new(file);
+                for pkg in *packages {
+                    let desc = pkg.desc();
+                    let mut header = tar::Header::new_gnu();
+                    header.set_mode(0o644);
+                    header.set_size(desc.len() as u64);
+                    header.set_cksum();
+                    archive.append_data(
+                        &mut header,
+                        format!("{}-{}/desc", pkg.name, pkg.version),
+                        desc.as_bytes(),
+                    ).unwrap();
+                }
+                archive.finish().unwrap();
+            }
+            let handle = Alpm::new(path.to_str().unwrap(), path.to_str().unwrap()).unwrap();
+            for (repo, _) in repos {
+                handle.register_syncdb(*repo, SigLevel::empty()).unwrap();
+            }
+            Self {
+                manager: AlpmManager { handle, repos: repos.iter().map(|(name, _)| name.to_string()).collect() },
+                path,
+            }
+        }
+
+        pub(crate) fn manager_mut(&mut self) -> &mut AlpmManager {
+            &mut self.manager
+        }
+    }
+
+    impl Drop for AlpmFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

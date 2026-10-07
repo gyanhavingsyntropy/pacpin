@@ -42,7 +42,9 @@ pub struct ProcessRestartInfo {
 pub struct RestartInspector;
 
 impl RestartInspector {
-    pub fn check_kernel_update(updated_pkgs: &[crate::resolver::ResolvedPackage]) -> Option<KernelUpdateInfo> {
+    pub fn check_kernel_update(
+        updated_pkgs: &[crate::resolver::ResolvedPackage],
+    ) -> Option<KernelUpdateInfo> {
         let running = Self::get_running_kernel()?;
         let modules_dir = Path::new("/usr/lib/modules");
 
@@ -74,7 +76,10 @@ impl RestartInspector {
             // If running modules are missing, or a kernel was upgraded
             if running_modules_missing || kernel_pkg_updated.is_some() {
                 // Find best matching or latest installed module
-                let latest = installed_versions.last().cloned().unwrap_or_else(|| "newer".to_string());
+                let latest = installed_versions
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "newer".to_string());
                 if latest != running {
                     return Some(KernelUpdateInfo {
                         running,
@@ -127,9 +132,10 @@ impl RestartInspector {
             let parts: Vec<&str> = cg_line.split('/').filter(|p| !p.is_empty()).collect();
             // Find the most specific (leaf-most) service in the cgroup path,
             // strictly ignoring the top-level user@<uid>.service session container.
-            let candidate_service = parts.iter().rev().find(|p| {
-                p.ends_with(".service") && !p.starts_with("user@")
-            });
+            let candidate_service = parts
+                .iter()
+                .rev()
+                .find(|p| p.ends_with(".service") && !p.starts_with("user@"));
 
             if let Some(srv) = candidate_service {
                 if Self::is_session_component(comm, srv) {
@@ -223,7 +229,13 @@ impl RestartInspector {
                 .unwrap_or_else(|_| format!("PID {}", pid));
 
             // Skip pacman, paru, yay, sudo, pacpin, pin
-            if comm == "pacman" || comm == "paru" || comm == "yay" || comm == "sudo" || comm == "pacpin" || comm == "pin" {
+            if comm == "pacman"
+                || comm == "paru"
+                || comm == "yay"
+                || comm == "sudo"
+                || comm == "pacpin"
+                || comm == "pin"
+            {
                 continue;
             }
 
@@ -237,7 +249,9 @@ impl RestartInspector {
                 ServiceType::Process { name, pid } => format!("proc:{}:{}", name, pid),
             };
 
-            let entry = map.entry(key).or_insert_with(|| (service_type, BTreeSet::new()));
+            let entry = map
+                .entry(key)
+                .or_insert_with(|| (service_type, BTreeSet::new()));
             entry.1.extend(deleted_libs);
         }
 
@@ -249,7 +263,10 @@ impl RestartInspector {
             .collect()
     }
 
-    pub fn print_restart_advisory(updated_pkgs: &[crate::resolver::ResolvedPackage]) {
+    pub fn print_restart_advisory(
+        updated_pkgs: &[crate::resolver::ResolvedPackage],
+        privilege_tool: &str,
+    ) {
         let kernel_update = Self::check_kernel_update(updated_pkgs);
         let services = Self::check_deleted_libraries();
 
@@ -258,99 +275,215 @@ impl RestartInspector {
             return;
         }
 
-        println!();
-        println!(
-            "{}",
-            ":: Post-Upgrade Restart Advisory:".yellow().bold()
-        );
-
-        if let Some(k) = kernel_update {
-            println!(
-                "  {} {} (running: {}, installed: {}) ➔ {}",
-                "•".yellow(),
-                "Kernel updated:".bold(),
-                k.running.cyan(),
-                k.installed.green(),
-                "System reboot required to boot into new kernel".yellow().bold()
-            );
+        for line in render_advisory(
+            kernel_update.as_ref(),
+            &services,
+            crate::ui::get_terminal_width(),
+            privilege_tool,
+        ) {
+            println!("{line}");
         }
-
-        if !services.is_empty() {
-            println!(
-                "  {} {}",
-                "•".yellow(),
-                "Services running outdated shared libraries in RAM:".bold()
-            );
-
-            for info in &services {
-                let sample_lib = info
-                    .deleted_files
-                    .iter()
-                    .next()
-                    .map(|s| {
-                        Path::new(s)
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| s.clone())
-                    })
-                    .unwrap_or_default();
-
-                let lib_count = info.deleted_files.len();
-                let lib_summary = if lib_count > 1 {
-                    format!("{} (+{} others)", sample_lib, lib_count - 1)
-                } else {
-                    sample_lib
-                };
-
-                match &info.service {
-                    ServiceType::SystemdSystem(s) => {
-                        let restart_cmd = format!("sudo systemctl restart {}", s);
-                        println!(
-                            "    - {:<34} [{}] ➔ {}",
-                            s.cyan().bold(),
-                            lib_summary.dimmed(),
-                            restart_cmd.green()
-                        );
-                    }
-                    ServiceType::SystemdUser(s) => {
-                        let restart_cmd = if s == "systemd --user" {
-                            "systemctl --user daemon-reexec".to_string()
-                        } else {
-                            format!("systemctl --user restart {}", s)
-                        };
-                        println!(
-                            "    - {:<34} [{}] ➔ {}",
-                            s.cyan().bold(),
-                            lib_summary.dimmed(),
-                            restart_cmd.green()
-                        );
-                    }
-                    ServiceType::SessionComponent(s) => {
-                        println!(
-                            "    - {:<34} [{}] ➔ {}",
-                            s.cyan().bold(),
-                            lib_summary.dimmed(),
-                            "re-login or reboot to apply (desktop session)".yellow()
-                        );
-                    }
-                    ServiceType::Process { name, pid } => {
-                        println!(
-                            "    - {:<34} [{}] ➔ {}",
-                            format!("{} (PID {})", name, pid).cyan(),
-                            lib_summary.dimmed(),
-                            "restart application".dimmed()
-                        );
-                    }
-                }
-            }
-        }
-        println!();
     }
+}
+
+fn wrap_field(text: &str, prefix: &str, continuation: &str, width: usize) -> Vec<String> {
+    crate::ui::wrap_field(text, prefix, continuation, width)
+}
+
+fn command_lines(tokens: &[String], width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = "      ".to_string();
+    for token in tokens {
+        if !line.trim().is_empty() && crate::ui::str_width(&line) + token.len() + 3 > width {
+            line.push_str(" \\");
+            lines.push(line);
+            line = "      ".into();
+        }
+        if !line.ends_with(' ') {
+            line.push(' ');
+        }
+        line.push_str(token);
+    }
+    lines.push(line);
+    // Keep shell arguments intact. An argument wider than the terminal soft
+    // wraps naturally; inserting a newline inside its quotes changes the unit.
+    lines
+}
+
+pub(crate) fn render_advisory(
+    kernel: Option<&KernelUpdateInfo>,
+    services: &[ProcessRestartInfo],
+    width: usize,
+    privilege_tool: &str,
+) -> Vec<String> {
+    if kernel.is_none() && services.is_empty() {
+        return Vec::new();
+    }
+    let width = width.max(8);
+    let mut lines = vec![String::new()];
+    lines.extend(
+        wrap_field(":: Post-Upgrade Restart Advisory:", "", "", width)
+            .into_iter()
+            .map(|line| line.yellow().bold().to_string()),
+    );
+    if let Some(kernel) = kernel {
+        lines.extend(wrap_field(
+            "Kernel updated; reboot required.",
+            "  ",
+            "  ",
+            width,
+        ));
+        lines.extend(wrap_field(
+            &format!("Running: {}", kernel.running),
+            "    ",
+            "    ",
+            width,
+        ));
+        lines.extend(wrap_field(
+            &format!("Installed: {}", kernel.installed),
+            "    ",
+            "    ",
+            width,
+        ));
+    }
+    if !services.is_empty() {
+        lines.extend(wrap_field(
+            "Services using outdated libraries:",
+            "  ",
+            "  ",
+            width,
+        ));
+    }
+    for info in services {
+        let name = match &info.service {
+            ServiceType::SystemdSystem(name)
+            | ServiceType::SystemdUser(name)
+            | ServiceType::SessionComponent(name) => name.clone(),
+            ServiceType::Process { name, pid } => format!("{name} (PID {pid})"),
+        };
+        lines.extend(
+            wrap_field(&name, "    - ", "      ", width)
+                .into_iter()
+                .map(|line| line.cyan().bold().to_string()),
+        );
+        let sample = info
+            .deleted_files
+            .iter()
+            .next()
+            .map(|name| {
+                Path::new(name)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| name.clone())
+            })
+            .unwrap_or_default();
+        let libraries = if info.deleted_files.len() > 1 {
+            format!("{sample} (+{} others)", info.deleted_files.len() - 1)
+        } else {
+            sample
+        };
+        lines.extend(
+            wrap_field(&format!("Library: {libraries}"), "      ", "      ", width)
+                .into_iter()
+                .map(|line| line.dimmed().to_string()),
+        );
+        let tokens = match &info.service {
+            ServiceType::SystemdSystem(name) => Some(vec![
+                privilege_tool.into(),
+                "systemctl".into(),
+                "restart".into(),
+                crate::utils::shell_quote(name),
+            ]),
+            ServiceType::SystemdUser(name) if name == "systemd --user" => Some(vec![
+                "systemctl".into(),
+                "--user".into(),
+                "daemon-reexec".into(),
+            ]),
+            ServiceType::SystemdUser(name) => Some(vec![
+                "systemctl".into(),
+                "--user".into(),
+                "restart".into(),
+                crate::utils::shell_quote(name),
+            ]),
+            ServiceType::SessionComponent(_) => {
+                lines.extend(
+                    wrap_field(
+                        "Log out and back in, or reboot (desktop session).",
+                        "      ",
+                        "      ",
+                        width,
+                    )
+                    .into_iter()
+                    .map(|line| line.yellow().to_string()),
+                );
+                None
+            }
+            ServiceType::Process { .. } => {
+                lines.extend(wrap_field(
+                    "Restart the application.",
+                    "      ",
+                    "      ",
+                    width,
+                ));
+                None
+            }
+        };
+        if let Some(tokens) = tokens {
+            lines.extend(
+                command_lines(&tokens, width)
+                    .into_iter()
+                    .map(|line| line.green().to_string()),
+            );
+        }
+        lines.push(String::new());
+    }
+    lines
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advisory_wraps_long_session_names_and_library_fields() {
+        let service = ProcessRestartInfo {
+            service: ServiceType::SessionComponent(
+                "dbus-:1.1-org.gnome.Shell.Notifications@0.service".into(),
+            ),
+            deleted_files: ["/usr/lib/libupower-glib.so.3.1.2".into()]
+                .into_iter()
+                .collect(),
+        };
+        for width in [24, 32, 40, 60, 80, 120] {
+            let lines = render_advisory(None, std::slice::from_ref(&service), width, "pkexec");
+            assert!(
+                lines.iter().all(|line| crate::ui::str_width(line) <= width),
+                "overflow at {width}: {lines:?}"
+            );
+            assert!(!lines.iter().any(|line| line.contains("systemctl")));
+        }
+        assert!(render_advisory(None, &[], 40, "pkexec").is_empty());
+    }
+
+    #[test]
+    fn advisory_commands_preserve_units_and_runtime_privilege_tool() {
+        let services = [
+            ProcessRestartInfo {
+                service: ServiceType::SystemdSystem("a-long-system-service-name.service".into()),
+                deleted_files: BTreeSet::new(),
+            },
+            ProcessRestartInfo {
+                service: ServiceType::SystemdUser("org.gnome.SettingsDaemon.Power.service".into()),
+                deleted_files: BTreeSet::new(),
+            },
+        ];
+        let text = render_advisory(None, &services, 40, "pkexec").join("\n");
+        assert!(text.contains("pkexec systemctl restart"));
+        assert!(!text.contains("sudo"));
+        assert!(text.contains("'org.gnome.SettingsDaemon.Power.service'"));
+        assert!(text.contains("systemctl --user restart"));
+        assert!(text.contains(" \\\n"));
+    }
 
     #[test]
     fn test_get_running_kernel() {
@@ -379,35 +512,54 @@ mod tests {
         ];
         versions.sort_by(|a, b| alpm::vercmp(a.as_str(), b.as_str()));
 
-        assert_eq!(versions, vec![
-            "6.9.2-arch1-1",
-            "6.9.9-arch1-1",
-            "6.9.10-arch1-1",
-            "6.10.0-arch1-1",
-        ]);
+        assert_eq!(
+            versions,
+            vec![
+                "6.9.2-arch1-1",
+                "6.9.9-arch1-1",
+                "6.9.10-arch1-1",
+                "6.10.0-arch1-1",
+            ]
+        );
     }
 
     #[test]
     fn test_parse_cgroup_service() {
         // 1. User service under user@1000.service
-        let cg_user = "0::/user.slice/user-1000.slice/user@1000.service/session.slice/wireplumber.service";
+        let cg_user =
+            "0::/user.slice/user-1000.slice/user@1000.service/session.slice/wireplumber.service";
         let res = RestartInspector::parse_cgroup_service(cg_user, "wireplumber", 2388);
-        assert_eq!(res, ServiceType::SystemdUser("wireplumber.service".to_string()));
+        assert_eq!(
+            res,
+            ServiceType::SystemdUser("wireplumber.service".to_string())
+        );
 
         // 2. System service under system.slice
         let cg_sys = "0::/system.slice/bluetooth.service";
         let res = RestartInspector::parse_cgroup_service(cg_sys, "bluetoothd", 1234);
-        assert_eq!(res, ServiceType::SystemdSystem("bluetooth.service".to_string()));
+        assert_eq!(
+            res,
+            ServiceType::SystemdSystem("bluetooth.service".to_string())
+        );
 
         // 3. Application in user scope
         let cg_scope = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-org.kde.kdeconnect.daemon-2774.scope";
         let res = RestartInspector::parse_cgroup_service(cg_scope, "kdeconnectd", 2774);
-        assert_eq!(res, ServiceType::Process { name: "kdeconnectd".to_string(), pid: 2774 });
+        assert_eq!(
+            res,
+            ServiceType::Process {
+                name: "kdeconnectd".to_string(),
+                pid: 2774
+            }
+        );
 
         // 4. Desktop session compositor
         let cg_shell = "0::/user.slice/user-1000.slice/user@1000.service/session.slice/org.gnome.Shell@user.service";
         let res = RestartInspector::parse_cgroup_service(cg_shell, "gnome-shell", 2586);
-        assert_eq!(res, ServiceType::SessionComponent("org.gnome.Shell@user.service".to_string()));
+        assert_eq!(
+            res,
+            ServiceType::SessionComponent("org.gnome.Shell@user.service".to_string())
+        );
 
         // 5. systemd --user manager itself
         let cg_init = "0::/user.slice/user-1000.slice/user@1000.service/init.scope";

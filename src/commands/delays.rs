@@ -18,11 +18,11 @@ use std::process::exit;
 
 use colored::Colorize;
 
-use crate::config::{save_config, Config};
+use crate::config::mutate_config;
 use crate::db::AlpmManager;
 use crate::ui::print_banner;
 
-pub fn cmd_delay(mut config: Config, pkg: &str, days: u32) {
+pub fn cmd_delay(pkg: &str, days: u32) {
     print_banner();
 
     if !crate::utils::is_safe_pattern(pkg) {
@@ -43,8 +43,10 @@ pub fn cmd_delay(mut config: Config, pkg: &str, days: u32) {
         }
     };
 
-    config.delay.insert(pkg.to_string(), days);
-    if let Err(e) = save_config(&config) {
+    if let Err(e) = mutate_config(|current| {
+        current.delay.insert(pkg.to_string(), days);
+        Ok(())
+    }) {
         eprintln!("{}", format!("Failed to save config: {}", e).red());
         exit(1);
     }
@@ -67,13 +69,16 @@ pub fn cmd_delay(mut config: Config, pkg: &str, days: u32) {
     }
 }
 
-pub fn cmd_undelay(mut config: Config, pkg: &str) {
+pub fn cmd_undelay(pkg: &str) {
     print_banner();
-    if config.delay.remove(pkg).is_some() {
-        if let Err(e) = save_config(&config) {
+    let removed = match mutate_config(|current| Ok(current.delay.remove(pkg).is_some())) {
+        Ok(removed) => removed,
+        Err(e) => {
             eprintln!("{}", format!("Failed to save config: {}", e).red());
             exit(1);
         }
+    };
+    if removed {
         println!(
             "{}",
             format!("✔ Removed stability delay on '{}'.", pkg).green()

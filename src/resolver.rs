@@ -265,12 +265,15 @@ impl<'a> ResolverEngine<'a> {
         } else {
             BTreeMap::new()
         };
+        let glob_pins = Self::compile_glob_pins(&pins);
         let alpm = self.manager.handle();
         let syncdbs: Vec<&alpm::Db> = alpm.syncdbs().into_iter().collect();
         let mut foreign_pkgs_set = HashSet::new();
         let mut foreign_pkgs = Vec::new();
         if !skip_aur {
             for pkg in alpm.localdb().pkgs() {
+                if crate::sources::owner(config, pkg.name()).is_some() { continue; }
+                if Self::match_pinned_package(pkg.name(), &pins, &glob_pins).is_some_and(|repo| repo != "aur") { continue; }
                 if !syncdbs.iter().any(|db| db.pkg(pkg.name()).is_ok()) {
                     let name = pkg.name().to_string();
                     if foreign_pkgs_set.insert(name.clone()) {
@@ -284,6 +287,8 @@ impl<'a> ResolverEngine<'a> {
                 }
                 if let Ok(glob) = Pattern::new(pattern) {
                     for pkg in alpm.localdb().pkgs() {
+                        if crate::sources::owner(config, pkg.name()).is_some() { continue; }
+                        if Self::match_pinned_package(pkg.name(), &pins, &glob_pins).is_some_and(|repo| repo != "aur") { continue; }
                         if glob.matches(pkg.name()) {
                             let name = pkg.name().to_string();
                             if foreign_pkgs_set.insert(name.clone()) {
@@ -329,12 +334,6 @@ impl<'a> ResolverEngine<'a> {
         let syncdb_map: HashMap<&str, &alpm::Db> =
             syncdbs_list.iter().map(|d| (d.name(), *d)).collect();
 
-        let glob_pins = if config.features.pinning {
-            Self::compile_glob_pins(&config.pins)
-        } else {
-            Vec::new()
-        };
-
         struct PendingAurPackage {
             pkg_name: String,
             inst_ver: String,
@@ -353,6 +352,7 @@ impl<'a> ResolverEngine<'a> {
 
         for inst_pkg in local_pkgs {
             let pkg_name = inst_pkg.name();
+            if crate::sources::owner(config, pkg_name).is_some() { continue; }
             let inst_ver = inst_pkg.version();
             let inst_size = inst_pkg.isize();
 
@@ -1026,5 +1026,45 @@ mod tests {
         assert_eq!(vercmp("2.0.0", "2.0.0rc1"), Ordering::Greater);
         assert_eq!(vercmp("2.0.0beta2", "2.0.0beta1"), Ordering::Greater);
         assert_eq!(vercmp("2.0.0alpha", "2.0.0beta"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_stability_delay_holds_young_updates() {
+        use crate::db::test_support::{AlpmFixture, FixturePackage};
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut fresh = FixturePackage::new("freshpkg", "2.0-1");
+        fresh.builddate = now - 86400;
+        let mut stale = FixturePackage::new("stalepkg", "2.0-1");
+        stale.builddate = now - 86400 * 30;
+        let local = [
+            FixturePackage::new("freshpkg", "1.0-1"),
+            FixturePackage::new("stalepkg", "1.0-1"),
+        ];
+        let sync = [fresh, stale];
+        let fixture = AlpmFixture::new(&local, &[("extra", &sync)]);
+
+        let mut config = crate::config::Config::default();
+        config.features.stability_delays = true;
+        config.delay.insert("freshpkg".to_string(), 7);
+        config.delay.insert("stalepkg".to_string(), 7);
+
+        let engine = ResolverEngine::new(&fixture.manager);
+        let res = engine.resolve_with_options(&config, true);
+        assert!(
+            res.held_packages.iter().any(|p| p.name == "freshpkg"),
+            "young update must be held"
+        );
+        assert!(
+            !res.updates.iter().any(|p| p.name == "freshpkg"),
+            "held update must leave the update list"
+        );
+        assert!(
+            res.updates.iter().any(|p| p.name == "stalepkg"),
+            "old update must still be offered"
+        );
     }
 }

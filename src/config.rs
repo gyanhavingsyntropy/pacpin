@@ -51,25 +51,44 @@ pub fn validate_helper(helper: &str) -> Result<String, String> {
     ))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Options {
     #[serde(default = "default_helper")]
     pub helper: String,
+    #[serde(default = "default_privilege_tool")]
+    pub privilege_tool: String,
+    #[serde(default = "default_false")]
+    pub no_cache: bool,
 }
 
 fn default_helper() -> String {
     "paru".to_string()
 }
 
+fn default_privilege_tool() -> String {
+    "sudo".to_string()
+}
+
+pub fn validate_privilege_tool(tool: &str) -> Result<&str, String> {
+    match tool {
+        "sudo" | "doas" | "pkexec" => Ok(tool),
+        _ => Err(format!(
+            "Unsupported privilege tool '{tool}'; expected sudo, doas, or pkexec"
+        )),
+    }
+}
+
 impl Default for Options {
     fn default() -> Self {
         Self {
             helper: default_helper(),
+            privilege_tool: default_privilege_tool(),
+            no_cache: false,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Features {
     #[serde(default = "default_true")]
     pub pinning: bool,
@@ -106,7 +125,7 @@ impl Default for Features {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct IntegrationsConfig {
     #[serde(default = "default_false")]
     pub flatpak: bool,
@@ -116,8 +135,37 @@ pub struct IntegrationsConfig {
     pub pipx: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Packages the user wants present on every machine using this config.
+/// Dependency packages are intentionally omitted: the native managers resolve them.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PackageManifest {
+    #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(default)]
+    pub pacman: Vec<String>,
+    #[serde(default)]
+    pub aur: Vec<String>,
+    #[serde(default)]
+    pub flatpak_user: Vec<String>,
+    #[serde(default)]
+    pub flatpak_system: Vec<String>,
+}
+
+impl PackageManifest {
+    pub fn is_empty(&self) -> bool {
+        self.pacman.is_empty()
+            && self.sources.is_empty()
+            && self.aur.is_empty()
+            && self.flatpak_user.is_empty()
+            && self.flatpak_system.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Config {
+    #[serde(default)]
+    pub sources: BTreeMap<String, crate::sources::Source>,
     #[serde(default)]
     pub features: Features,
     #[serde(default)]
@@ -132,6 +180,8 @@ pub struct Config {
     pub delay: BTreeMap<String, u32>,
     #[serde(default)]
     pub integrations: IntegrationsConfig,
+    #[serde(default)]
+    pub packages: PackageManifest,
 }
 
 fn deserialize_exclude<'de, D>(deserializer: D) -> Result<BTreeMap<String, Vec<String>>, D::Error>
@@ -225,9 +275,18 @@ pub fn load_config() -> Config {
         }
     };
 
+    if let Err(e) = crate::sources::validate_config(&config) {
+        eprintln!("Error: Invalid package source configuration: {e}");
+        std::process::exit(1);
+    }
     if let Err(e) = validate_helper(&config.options.helper) {
         eprintln!("{} Warning: {} Falling back to 'paru'.", "::".yellow(), e);
         config.options.helper = default_helper();
+    }
+
+    if let Err(e) = validate_privilege_tool(&config.options.privilege_tool) {
+        eprintln!("{} Warning: {} Falling back to 'sudo'.", "::".yellow(), e);
+        config.options.privilege_tool = default_privilege_tool();
     }
 
     config
@@ -238,66 +297,85 @@ pub fn save_config(config: &Config) -> Result<(), std::io::Error> {
     save_config_to_path(config, &path)
 }
 
-#[allow(dead_code)]
 pub fn mutate_config<F, R>(f: F) -> Result<R, String>
 where
     F: FnOnce(&mut Config) -> Result<R, String>,
 {
-    let path = get_config_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let lock_path = path.with_extension("lock");
-    let lock_file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|e| format!("Failed to open config lock file: {}", e))?;
+    mutate_config_at(&get_config_path(), f)
+}
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX);
-        }
-    }
-
-    let mut cfg = load_config();
+fn mutate_config_at<F, R>(path: &Path, f: F) -> Result<R, String>
+where
+    F: FnOnce(&mut Config) -> Result<R, String>,
+{
+    let _lock = lock_config(path).map_err(|e| format!("Failed to lock configuration: {}", e))?;
+    let mut cfg = match fs::read_to_string(path) {
+        Ok(contents) => toml::from_str(&contents)
+            .map_err(|e| format!("Failed to parse configuration: {}", e))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        Err(e) => return Err(format!("Failed to read configuration: {}", e)),
+    };
     let res = f(&mut cfg)?;
-    save_config(&cfg).map_err(|e| format!("Failed to save configuration: {}", e))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-
+    write_config_unlocked(&cfg, path)
+        .map_err(|e| format!("Failed to save configuration: {}", e))?;
     Ok(res)
 }
 
-pub fn save_config_to_path(config: &Config, path: &Path) -> Result<(), std::io::Error> {
+/// Interactive setup must not overwrite edits made while its prompts were open.
+pub fn save_config_if_unchanged(previous: &Config, updated: &Config) -> Result<(), String> {
+    save_config_if_unchanged_at(&get_config_path(), previous, updated)
+}
+
+fn save_config_if_unchanged_at(path: &Path, previous: &Config, updated: &Config) -> Result<(), String> {
+    mutate_config_at(path, |current| {
+        if current != previous {
+            return Err("Configuration changed during setup. Run setup again to include those changes.".into());
+        }
+        *current = updated.clone();
+        Ok(())
+    })
+}
+
+// The returned file owns the flock; closing it releases the lock on every path.
+fn lock_config(path: &Path) -> std::io::Result<fs::File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-
     let lock_path = path.with_extension("lock");
-    let lock_file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)?;
-
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let lock_file = options.open(lock_path)?;
+    if !lock_file.metadata()?.is_file() {
+        return Err(std::io::Error::other("Configuration lock is not a regular file"));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX);
+        loop {
+            if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
         }
     }
+    Ok(lock_file)
+}
+
+pub fn save_config_to_path(config: &Config, path: &Path) -> Result<(), std::io::Error> {
+    let _lock = lock_config(path)?;
+    write_config_unlocked(config, path)
+}
+
+fn write_config_unlocked(config: &Config, path: &Path) -> Result<(), std::io::Error> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
 
     let toml_str = toml::to_string_pretty(config)
         .map_err(std::io::Error::other)?;
@@ -347,11 +425,12 @@ pub fn save_config_to_path(config: &Config, path: &Path) -> Result<(), std::io::
         )
     })?;
 
-    file.write_all(toml_str.as_bytes())?;
-    file.sync_all()?;
+    let result = file.write_all(toml_str.as_bytes()).and_then(|()| file.sync_all());
     drop(file);
-
-    fs::rename(&temp_path, path)?;
+    if let Err(error) = result.and_then(|()| fs::rename(&temp_path, path)) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
 
     // Durably sync directory entry on Unix
     if let Ok(parent_dir) = fs::File::open(parent) {
@@ -366,6 +445,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn concurrent_config_mutations_preserve_every_update() {
+        let dir = std::env::temp_dir().join(format!("pacpin_config_race_{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let mut initial = Config::default();
+        initial.packages.pacman.push("git".into());
+        save_config_to_path(&initial, &path).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8).map(|i| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..5 {
+                    mutate_config_at(&path, |cfg| {
+                        cfg.pins.insert(format!("pkg-{i}"), "extra".into());
+                        *cfg.delay.entry("counter".into()).or_default() += 1;
+                        Ok(())
+                    }).unwrap();
+                }
+            })
+        }).collect();
+        for worker in workers { worker.join().unwrap(); }
+        let result: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(result.pins.len(), 8);
+        assert_eq!(result.delay["counter"], 40);
+        assert_eq!(result.packages, initial.packages);
+        // An interactive editor with an old snapshot must not lose these changes.
+        assert!(save_config_if_unchanged_at(&path, &initial, &Config::default()).is_err());
+        let unchanged: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(unchanged, result);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn config_mutation_failure_releases_lock_and_preserves_data() {
+        let dir = std::env::temp_dir().join(format!("pacpin_config_error_{}", std::process::id()));
+        let path = dir.join("config.toml");
+        save_config_to_path(&Config::default(), &path).unwrap();
+        let before = fs::read(&path).unwrap();
+        let result: Result<(), String> = mutate_config_at(&path, |cfg| {
+            cfg.pins.insert("git".into(), "extra".into());
+            Err("cancelled".into())
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        mutate_config_at(&path, |cfg| { cfg.pins.insert("vim".into(), "extra".into()); Ok(()) }).unwrap();
+        fs::write(&path, "malformed = [").unwrap();
+        assert!(mutate_config_at(&path, |_| Ok(())).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "malformed = [");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn config_lock_rejects_symlinks() {
+        let dir = std::env::temp_dir().join(format!("pacpin_config_link_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("victim");
+        fs::write(&target, "keep").unwrap();
+        let path = dir.join("config.toml");
+        std::os::unix::fs::symlink(&target, path.with_extension("lock")).unwrap();
+        assert!(save_config_to_path(&Config::default(), &path).is_err());
+        assert_eq!(fs::read_to_string(target).unwrap(), "keep");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn test_features_default() {
         let toml_str = r#"
         [options]
@@ -375,6 +521,7 @@ mod tests {
         assert!(config.features.pinning);
         assert!(!config.features.stability_delays);
         assert!(config.features.smart_orphans);
+        assert_eq!(config.options.privilege_tool, "sudo");
     }
 
     #[test]
@@ -414,6 +561,24 @@ mod tests {
         assert!(config.features.integrations);
         assert!(config.integrations.flatpak);
         assert!(config.integrations.nix);
+    }
+
+    #[test]
+    fn test_package_manifest_round_trip_and_legacy_default() {
+        let legacy: Config = toml::from_str("[options]\nhelper = 'paru'\n").unwrap();
+        assert!(legacy.packages.is_empty());
+
+        let manifest: Config = toml::from_str(
+            "[packages]\npacman = ['git', 'core/linux']\naur = ['paru-bin']\nflatpak_user = ['flathub/org.gnome.Calculator']\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.packages.pacman, ["git", "core/linux"]);
+        assert_eq!(manifest.packages.aur, ["paru-bin"]);
+        assert_eq!(manifest.packages.flatpak_user.len(), 1);
+        let encoded = toml::to_string(&manifest).unwrap();
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.packages, manifest.packages);
+        assert!(toml::from_str::<Config>("[packages]\nnix = ['ripgrep']\n").is_err());
     }
 
     #[test]

@@ -27,6 +27,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static CLEANUP_TARGETS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 static ACTIVE_CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static TERMINATING: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static CHILD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn register_child(pid: u32) {
+    if let Ok(mut children) = ACTIVE_CHILDREN.lock() { children.push(pid); }
+}
+
+pub fn unregister_child(pid: u32) {
+    if let Ok(mut children) = ACTIVE_CHILDREN.lock() { children.retain(|&active| active != pid); }
+}
 
 pub fn is_terminating() -> bool {
     TERMINATING.load(Ordering::SeqCst)
@@ -56,14 +66,35 @@ pub fn run_tracked_command(command: &mut Command) -> io::Result<std::process::Ex
 }
 
 fn kill_active_children() {
-    if let Ok(mut lock) = ACTIVE_CHILDREN.lock() {
-        for pid in lock.drain(..) {
-            #[cfg(unix)]
-            unsafe { libc::kill(pid as i32, libc::SIGKILL); }
-        }
+    let mut children = ACTIVE_CHILDREN.lock().map(|mut lock| std::mem::take(&mut *lock)).unwrap_or_default();
+    // Let sudo relay interruption and let pacman release its database lock.
+    // An immediate SIGKILL can leave an interrupted download's lock behind.
+    for &pid in &children {
+        unsafe { libc::kill(pid as i32, libc::SIGINT); }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !children.is_empty() && std::time::Instant::now() < deadline {
+        children.retain(|&pid| {
+            if unsafe { libc::kill(pid as i32, 0) } != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) { return false; }
+            !fs::read_to_string(format!("/proc/{pid}/stat")).ok()
+                .and_then(|stat| stat.rsplit_once(") ").map(|(_, rest)| rest.starts_with('Z')))
+                .unwrap_or(false)
+        });
+        if !children.is_empty() { std::thread::sleep(std::time::Duration::from_millis(20)); }
+    }
+    for pid in children {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL); }
     }
 }
 
+#[cfg(test)]
+fn wait_for_test_file(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !path.exists() {
+        assert!(std::time::Instant::now() < deadline, "child fixture did not become ready");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
 pub fn register_cleanup_target(path: PathBuf) {
     if is_terminating() {
         remove_cleanup_path(&path);
@@ -133,6 +164,15 @@ pub fn clean_stale_sandboxes() {
 }
 
 fn should_clean_stale_sandbox(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else { return false; };
+    if !metadata.is_dir() { return false; }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return false;
+        }
+    }
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
@@ -164,6 +204,7 @@ pub fn init_signal_handlers() {
             TERMINATING.store(true, Ordering::SeqCst);
             kill_active_children();
             cleanup_active_targets();
+            crate::progress::restore_terminal();
             std::process::exit(130);
         });
     });
@@ -303,11 +344,14 @@ fn try_flatpak(app_id: &str, args: &[String]) -> Result<i32, String> {
         fn drop(&mut self) {
             if self.needs_cleanup {
                 println!("\n{} Purging ephemeral Flatpak '{}'...", "::".cyan(), self.app_id);
-                let _ = Command::new("flatpak")
+                let status = Command::new("flatpak")
                     .args(["uninstall", "--user", "-y", self.app_id])
                     .status();
                 // Flatpak app data may predate this invocation. Never delete it here.
-                println!("✔ Ephemeral Flatpak '{}' uninstalled.", self.app_id.green());
+                match status {
+                    Ok(status) if status.success() => println!("✔ Ephemeral Flatpak '{}' uninstalled.", self.app_id.green()),
+                    _ => eprintln!(":: Warning: Ephemeral Flatpak '{}' cleanup failed; the app may remain installed.", self.app_id),
+                }
             }
         }
     }
@@ -360,7 +404,7 @@ fn try_flatpak(app_id: &str, args: &[String]) -> Result<i32, String> {
         .map_err(|e| format!("Failed to execute flatpak run: {}", e))?;
 
     drop(guard);
-    Ok(child_status.code().unwrap_or(0))
+    Ok(child_status.code().unwrap_or(1))
 }
 
 fn try_nix(pkg: &str, args: &[String]) -> Result<i32, String> {
@@ -408,7 +452,7 @@ fn try_nix(pkg: &str, args: &[String]) -> Result<i32, String> {
         .status()
         .map_err(|e| format!("Failed to run nix-shell: {}", e))?;
 
-    Ok(shell_status.code().unwrap_or(0))
+    Ok(shell_status.code().unwrap_or(1))
 }
 
 fn try_pipx(pkg: &str, args: &[String]) -> Result<i32, String> {
@@ -434,7 +478,7 @@ fn try_pipx(pkg: &str, args: &[String]) -> Result<i32, String> {
         .status()
         .map_err(|e| format!("Failed to execute pipx: {}", e))?;
 
-    Ok(status.code().unwrap_or(0))
+    Ok(status.code().unwrap_or(1))
 }
 
 fn create_secure_temp_dir(prefix: &str) -> Result<PathBuf, String> {
@@ -557,7 +601,7 @@ fn should_bind_cwd(cwd: &Path, home: &Path) -> bool {
 #[allow(unused_imports)]
 pub use crate::download::{
     compute_sha256, create_secure_temp_file, extract_archive, is_safe_link_destination,
-    is_safe_tar_entry, is_safe_tar_listing_line, MAX_ARCHIVE_ENTRIES, MAX_UNPACKED_BYTES,
+    is_safe_tar_entry, MAX_ARCHIVE_ENTRIES, MAX_UNPACKED_BYTES,
 };
 
 fn add_host_runtime_mounts(command: &mut Command) {
@@ -683,6 +727,8 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
                                 sysupgrade: false,
                                 dry_run: false,
                                 forwarded_flags: Vec::new(),
+                                channel: None,
+                                no_cache: false,
                             };
                             match crate::pm::install(
                                 &mut config,
@@ -723,7 +769,7 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
                         "Bubblewrap ('bwrap') is not installed on this system.\n  \
                         'pacpin try' defaults to fail-closed container isolation for security.\n  \
                         To run securely in a sandbox container, install bubblewrap:\n    \
-                        sudo pacman -S bubblewrap\n  \
+                        pin install bubblewrap\n  \
                         To bypass sandboxing and run directly on your host (UNSAFE), pass --no-sandbox."
                             .to_string(),
                     );
@@ -1182,44 +1228,6 @@ mod tests {
         assert!(!is_safe_tar_entry("..\\..\\windows\\system32"));
     }
 
-    #[test]
-    fn test_is_safe_tar_listing_line() {
-        // Safe regular file
-        let regular = "-rwxr-xr-x 0/0 12345 2026-09-01 12:00 usr/bin/jq";
-        let res = is_safe_tar_listing_line(regular).unwrap();
-        assert_eq!(res.0, "usr/bin/jq");
-        assert_eq!(res.1, 12345);
-
-        // Safe relative symlink
-        let symlink = "lrwxrwxrwx 0/0 0 2026-09-01 12:00 usr/bin/jq-sym -> jq";
-        let res = is_safe_tar_listing_line(symlink).unwrap();
-        assert_eq!(res.0, "usr/bin/jq-sym");
-
-        // Safe relative hardlink
-        let hardlink = "hrwxr-xr-x 0/0 0 2026-09-01 12:00 usr/bin/jq-link link to usr/bin/jq";
-        let res = is_safe_tar_listing_line(hardlink).unwrap();
-        assert_eq!(res.0, "usr/bin/jq-link");
-
-        // Unsafe absolute symlink
-        let bad_symlink = "lrwxrwxrwx 0/0 0 2026-09-01 12:00 usr/bin/bad -> /etc/shadow";
-        assert!(is_safe_tar_listing_line(bad_symlink).is_err());
-
-        // Unsafe path traversal symlink (exceeds root)
-        let escaping_symlink = "lrwxrwxrwx 0/0 0 2026-09-01 12:00 usr/bin/bad -> ../../../etc/passwd";
-        assert!(is_safe_tar_listing_line(escaping_symlink).is_err());
-
-        // Safe deep internal relative symlink (e.g. from official rust package)
-        let deep_internal_symlink = "lrwxrwxrwx 0/0 0 2026-09-01 12:00 usr/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld/ld.lld -> ../../../../../bin/ld.lld";
-        assert!(is_safe_tar_listing_line(deep_internal_symlink).is_ok());
-
-        // Unsafe escaping symlink from deep directory
-        let deep_escaping_symlink = "lrwxrwxrwx 0/0 0 2026-09-01 12:00 usr/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld/ld.lld -> ../../../../../../../etc/shadow";
-        assert!(is_safe_tar_listing_line(deep_escaping_symlink).is_err());
-
-        // Unsafe hardlink
-        let bad_hardlink = "hrwxr-xr-x 0/0 0 2026-09-01 12:00 usr/bin/bad link to /etc/shadow";
-        assert!(is_safe_tar_listing_line(bad_hardlink).is_err());
-    }
 
     #[test]
     fn test_try_options_default() {
@@ -1280,7 +1288,22 @@ mod tests {
 
         let dead = env::temp_dir().join(format!("pacpin-run-dead-test-pid{}-123", i32::MAX));
         fs::create_dir(&dead).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dead, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         assert!(should_clean_stale_sandbox(&dead));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let link = dead.with_extension("link");
+            symlink(&dead, &link).unwrap();
+            assert!(!should_clean_stale_sandbox(&link));
+            fs::remove_file(link).unwrap();
+            fs::set_permissions(&dead, fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(!should_clean_stale_sandbox(&dead));
+        }
         fs::remove_dir_all(dead).unwrap();
     }
 
@@ -1352,7 +1375,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn interruption_allows_child_cleanup_before_forceful_termination() {
+        let _serial = CHILD_TEST_LOCK.lock().unwrap();
+        let fixture = create_secure_temp_dir("pacpin-run-interrupt-test").unwrap();
+        let ready = fixture.join("ready");
+        let cleaned = fixture.join("cleaned");
+        let handler = format!("touch {}; exit 0", crate::utils::shell_quote(&cleaned.to_string_lossy()));
+        let script = format!("trap {} INT; touch {}; while :; do sleep .02; done", crate::utils::shell_quote(&handler), crate::utils::shell_quote(&ready.to_string_lossy()));
+        let worker = std::thread::spawn(move || run_tracked_command(Command::new("bash").args(["-c", &script])).unwrap());
+        wait_for_test_file(&ready);
+        kill_active_children();
+        assert!(worker.join().unwrap().success());
+        assert!(cleaned.exists(), "child did not get a chance to clean up");
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_active_download_children_are_killed_before_cleanup() {
+        let _serial = CHILD_TEST_LOCK.lock().unwrap();
         let worker = std::thread::spawn(|| {
             run_tracked_command(Command::new("sleep").arg("30")).unwrap()
         });

@@ -15,12 +15,15 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 pub mod check;
+pub mod cli;
 pub mod delays;
+pub mod ephemeral;
 pub mod history;
 pub mod maintenance;
 pub mod orphans;
 pub mod pins;
 pub mod query;
+pub mod rebuild;
 pub mod upgrade;
 
 use std::env;
@@ -31,12 +34,15 @@ use colored::Colorize;
 use crate::pm;
 
 pub use check::cmd_check;
+pub use cli::{is_refresh_only_invocation, is_upgrade_invocation, pacman_files_needs_sudo, parse_pacman_cli_args};
 pub use delays::{cmd_delay, cmd_undelay};
+pub use ephemeral::{cmd_run, cmd_try};
 pub use history::cmd_history;
-pub use maintenance::{cmd_clean, cmd_remove, cmd_reset};
+pub use maintenance::{cmd_clean, cmd_keep, cmd_remove, cmd_reset};
 pub use orphans::cmd_orphans;
-pub use pins::{cmd_list, cmd_pin, cmd_repos, cmd_unpin};
+pub use pins::{cmd_list, cmd_pin, cmd_repos, cmd_unpin, parse_pin_args};
 pub use query::{cmd_info, cmd_print_uris, cmd_search, cmd_sync_groups, cmd_sync_list};
+pub use rebuild::{cmd_capture, cmd_rebuild};
 pub use upgrade::{cmd_install, cmd_upgrade, parse_install_flags};
 
 pub fn check_pacman_lock() {

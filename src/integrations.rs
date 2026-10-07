@@ -59,13 +59,16 @@ pub trait IntegrationProvider: Send + Sync {
     fn clean_command_str(&self) -> String;
     fn execute_clean(&self) -> Result<bool, std::io::Error>;
     fn supports_clean(&self) -> bool {
-        true
+        false
     }
+    fn prefetch(&self, _updates: &[ExternalUpdate]) {}
+    fn supports_prefetch(&self) -> bool { false }
 }
 
 pub struct FlatpakProvider;
 
 impl IntegrationProvider for FlatpakProvider {
+    fn supports_clean(&self) -> bool { true }
     fn name(&self) -> &'static str {
         "Flatpak"
     }
@@ -162,7 +165,7 @@ impl IntegrationProvider for FlatpakProvider {
         for u in updates {
             cmd.arg(&u.id);
         }
-        let status = cmd.status()?;
+        let status = crate::progress::run(&mut cmd, crate::progress::Manager::Flatpak, "Updating Flatpak applications", || {})?;
         Ok(status.success())
     }
 
@@ -171,9 +174,7 @@ impl IntegrationProvider for FlatpakProvider {
     }
 
     fn execute_clean(&self) -> Result<bool, std::io::Error> {
-        let status = Command::new("flatpak")
-            .args(["uninstall", "--unused", "-y"])
-            .status()?;
+        let status = crate::progress::run(Command::new("flatpak").args(["uninstall", "--unused", "-y"]), crate::progress::Manager::Flatpak, "Removing unused Flatpak runtimes", || {})?;
         Ok(status.success())
     }
 }
@@ -181,6 +182,7 @@ impl IntegrationProvider for FlatpakProvider {
 pub struct NixProvider;
 
 impl IntegrationProvider for NixProvider {
+    fn supports_clean(&self) -> bool { true }
     fn name(&self) -> &'static str {
         "Nix"
     }
@@ -234,15 +236,13 @@ impl IntegrationProvider for NixProvider {
     }
 
     fn execute_upgrade(&self, _updates: &[ExternalUpdate]) -> Result<bool, std::io::Error> {
-        let status = Command::new("nix")
-            .args(["profile", "upgrade", ".*"])
-            .status();
+        let status = crate::progress::run(Command::new("nix").args(["profile", "upgrade", ".*"]), crate::progress::Manager::Nix, "Updating Nix profile", || {});
 
         match status {
             Ok(s) if s.success() => Ok(true),
             _ => {
                 // Fallback to nix-env if profile is not used
-                let env_status = Command::new("nix-env").arg("-u").status()?;
+                let env_status = crate::progress::run(Command::new("nix-env").arg("-u"), crate::progress::Manager::Nix, "Updating Nix environment", || {})?;
                 Ok(env_status.success())
             }
         }
@@ -253,7 +253,7 @@ impl IntegrationProvider for NixProvider {
     }
 
     fn execute_clean(&self) -> Result<bool, std::io::Error> {
-        let status = Command::new("nix-collect-garbage").arg("-d").status()?;
+        let status = crate::progress::run(Command::new("nix-collect-garbage").arg("-d"), crate::progress::Manager::Nix, "Cleaning Nix generations", || {})?;
         Ok(status.success())
     }
 }
@@ -369,7 +369,7 @@ impl IntegrationProvider for PipxProvider {
     }
 
     fn execute_upgrade(&self, _updates: &[ExternalUpdate]) -> Result<bool, std::io::Error> {
-        let status = Command::new("pipx").arg("upgrade-all").status()?;
+        let status = crate::progress::run(Command::new("pipx").arg("upgrade-all"), crate::progress::Manager::Pipx, "Updating Pipx applications", || {})?;
         Ok(status.success())
     }
 
@@ -390,11 +390,13 @@ pub struct IntegrationsManager;
 
 impl IntegrationsManager {
     pub fn get_active_providers(config: &Config) -> Vec<Arc<dyn IntegrationProvider>> {
-        if !config.features.integrations {
-            return Vec::new();
-        }
-
         let mut providers: Vec<Arc<dyn IntegrationProvider>> = Vec::new();
+        if !config.sources.is_empty() {
+            providers.push(Arc::new(crate::sources::SourceProvider::new(config)));
+        }
+        if !config.features.integrations {
+            return Self::filter_available_parallel(providers);
+        }
 
         if config.integrations.flatpak {
             providers.push(Arc::new(FlatpakProvider));
@@ -471,6 +473,34 @@ impl IntegrationsManager {
         all_updates
     }
 
+    pub fn spawn_prefetch(
+        providers: &[Arc<dyn IntegrationProvider>],
+        external_updates: &[ExternalUpdate],
+    ) -> Option<thread::JoinHandle<()>> {
+        let providers: Vec<_> = providers.iter().filter(|p| p.supports_prefetch()
+            && external_updates.iter().any(|u| u.runner == p.name())).cloned().collect();
+        let updates: Vec<_> = external_updates.to_vec();
+        if providers.is_empty() {
+            return None;
+        }
+        Some(thread::spawn(move || {
+            for p in &providers {
+                let p_updates: Vec<ExternalUpdate> = updates
+                    .iter()
+                    .filter(|u| u.runner == p.name())
+                    .cloned()
+                    .collect();
+                if !p_updates.is_empty() {
+                    p.prefetch(&p_updates);
+                }
+            }
+        }))
+    }
+
+    pub fn has_prefetch(providers: &[Arc<dyn IntegrationProvider>], updates: &[ExternalUpdate]) -> bool {
+        providers.iter().any(|p| p.supports_prefetch() && updates.iter().any(|u| u.runner == p.name()))
+    }
+
     pub fn execute_upgrades(
         providers: &[Arc<dyn IntegrationProvider>],
         external_updates: &[ExternalUpdate],
@@ -497,6 +527,14 @@ impl IntegrationsManager {
             );
             match p.execute_upgrade(&p_updates) {
                 Ok(true) => {
+                    let manager = match p.name() {
+                        "Sources" => Some(crate::progress::Manager::Sources),
+                        "Flatpak" => Some(crate::progress::Manager::Flatpak),
+                        "Nix" => Some(crate::progress::Manager::Nix),
+                        "Pipx" => Some(crate::progress::Manager::Pipx),
+                        _ => None,
+                    };
+                    if let Some(manager) = manager { crate::progress::completed(manager); }
                     println!("✔ {} upgrade completed successfully.", p.name().green());
                     outcomes.push((p.name().to_string(), cmd_str, true));
                 }
@@ -519,54 +557,40 @@ impl IntegrationsManager {
         outcomes
     }
 
-    pub fn execute_cleanups(providers: &[Arc<dyn IntegrationProvider>]) {
-        let active_cleaners: Vec<_> = providers
-            .iter()
-            .filter(|p| p.supports_clean())
-            .cloned()
-            .collect();
-        if active_cleaners.is_empty() {
-            return;
-        }
-
-        let mut handles = Vec::new();
-        for p in active_cleaners {
-            let provider = Arc::clone(&p);
-            handles.push(thread::spawn(move || {
+    pub fn execute_cleanups(providers: &[Arc<dyn IntegrationProvider>]) -> bool {
+        // One foreground owner at a time: print the heading before execution,
+        // keep manager output intact, and propagate failures to the CLI.
+        let mut success = true;
+        for provider in providers.iter().filter(|p| p.supports_clean()) {
                 let name = provider.name();
                 let cmd_str = provider.clean_command_str();
-                let res = provider.execute_clean();
-                (name, cmd_str, res)
-            }));
-        }
-
-        for h in handles {
-            if let Ok((name, cmd_str, res)) = h.join() {
                 println!(
                     "\n{} Cleaning {} unused packages ({})...",
                     "::".cyan(),
                     name.bold(),
                     cmd_str.dimmed()
                 );
-                match res {
+                match provider.execute_clean() {
                     Ok(true) => {
                         println!("✔ {} cleanup completed successfully.", name.green());
                     }
                     Ok(false) => {
+                        success = false;
                         eprintln!(
                             "{}",
                             format!("Warning: {} cleanup exited with errors.", name).yellow()
                         );
                     }
                     Err(e) => {
+                        success = false;
                         eprintln!(
                             "{}",
                             format!("Failed to run {} cleanup: {}", name, e).red()
                         );
                     }
                 }
-            }
         }
+        success
     }
 }
 
@@ -667,5 +691,26 @@ mod tests {
         let selected = IntegrationsManager::filter_available_parallel(providers);
         assert_eq!(selected.iter().map(|p| p.name()).collect::<Vec<_>>(), vec!["one", "three"]);
         assert!(peak.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn cleanup_requires_an_explicit_provider_capability() {
+        let provider = MockProvider { label: "future", available: true,
+            active: Arc::new(AtomicUsize::new(0)), peak: Arc::new(AtomicUsize::new(0)) };
+        assert!(!provider.supports_clean());
+        assert!(FlatpakProvider.supports_clean());
+        assert!(NixProvider.supports_clean());
+        assert!(!PipxProvider.supports_clean());
+    }
+
+    #[test]
+    fn prefetch_is_opt_in_and_matches_the_selected_manager() {
+        let providers: Vec<Arc<dyn IntegrationProvider>> = vec![Arc::new(FlatpakProvider), Arc::new(crate::sources::SourceProvider::new(&Config::default()))];
+        let mut updates = vec![ExternalUpdate { runner: "Flatpak".into(), id: "app".into(), name: "App".into(), repo: "test".into(), version: "1".into() }];
+        assert!(!IntegrationsManager::has_prefetch(&providers, &updates));
+        assert!(IntegrationsManager::spawn_prefetch(&providers, &updates).is_none());
+        updates[0].runner = "Sources".into();
+        assert!(IntegrationsManager::has_prefetch(&providers, &updates));
+        assert!(!IntegrationsManager::has_prefetch(&providers, &[]));
     }
 }

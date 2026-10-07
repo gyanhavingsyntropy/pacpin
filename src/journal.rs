@@ -118,27 +118,34 @@ impl TransactionJournal {
         None
     }
 
-    pub fn get_last_transaction_id(path: &Path) -> Option<usize> {
+    fn get_last_transaction_id(file: &mut fs::File) -> std::io::Result<Option<usize>> {
         use std::io::{Read, Seek, SeekFrom};
-        let mut file = fs::File::open(path).ok()?;
-        let len = file.metadata().ok()?.len();
+        let len = file.metadata()?.len();
         if len == 0 {
-            return None;
+            return Ok(None);
         }
-        let read_size = std::cmp::min(len, 8192);
-        file.seek(SeekFrom::End(-(read_size as i64))).ok()?;
-        let mut buf = vec![0u8; read_size as usize];
-        file.read_exact(&mut buf).ok()?;
-        let s = String::from_utf8_lossy(&buf);
-        for line in s.lines().rev() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                if let Ok(record) = serde_json::from_str::<TransactionRecord>(trimmed) {
-                    return Some(record.id);
+        let mut read_size = len.min(8192);
+        loop {
+            let start = len - read_size;
+            file.seek(SeekFrom::Start(start))?;
+            let size = usize::try_from(read_size).map_err(|_| std::io::Error::other("History is too large"))?;
+            let mut buf = vec![0u8; size];
+            file.read_exact(&mut buf)?;
+            // A window may begin halfway through a record. Only parse complete
+            // lines, expanding backwards for large transactions or a damaged tail.
+            let complete = if start == 0 {
+                buf.as_slice()
+            } else {
+                buf.iter().position(|&byte| byte == b'\n').map_or(&[][..], |i| &buf[i + 1..])
+            };
+            for line in complete.split(|&byte| byte == b'\n').rev() {
+                if let Ok(record) = serde_json::from_slice::<TransactionRecord>(line) {
+                    return Ok(Some(record.id));
                 }
             }
+            if read_size == len { return Ok(None); }
+            read_size = read_size.saturating_mul(2).min(len);
         }
-        None
     }
 
     pub fn record_transaction(
@@ -146,34 +153,50 @@ impl TransactionJournal {
         packages: Vec<serde_json::Value>,
         command: &str,
     ) -> Result<usize, std::io::Error> {
+        let result = Self::write_transaction(action, packages, command);
+        if let Err(error) = &result {
+            eprintln!(":: Warning: Could not save transaction history: {error}. Package changes may already be applied.");
+        }
+        result
+    }
+
+    fn write_transaction(action: &str, packages: Vec<serde_json::Value>, command: &str) -> Result<usize, std::io::Error> {
         let state_dir =
             Self::state_dir().map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
         fs::create_dir_all(&state_dir)?;
         let history_file = Self::history_file()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
+        Self::record_transaction_at(&history_file, action, packages, command)
+    }
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&history_file)?;
+    fn record_transaction_at(
+        path: &Path, action: &str, packages: Vec<serde_json::Value>, command: &str,
+    ) -> std::io::Result<usize> {
+        let mut options = OpenOptions::new();
+        options.create(true).append(true).read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        }
+        let mut file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other("Transaction history is not a regular file"));
+        }
 
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
             let fd = file.as_raw_fd();
-            unsafe {
-                libc::flock(fd, libc::LOCK_EX);
+            loop {
+                if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 { break; }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted { return Err(error); }
             }
         }
 
-        let next_id = if history_file.exists() {
-            Self::get_last_transaction_id(&history_file)
-                .map(|id| id + 1)
-                .unwrap_or(1)
-        } else {
-            1
-        };
+        let next_id = Self::get_last_transaction_id(&mut file)?.unwrap_or(0)
+            .checked_add(1).ok_or_else(|| std::io::Error::other("Transaction ID overflow"))?;
 
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let record = TransactionRecord {
@@ -187,17 +210,15 @@ impl TransactionJournal {
 
         let line = serde_json::to_string(&record)
             .map_err(std::io::Error::other)?;
-        writeln!(file, "{}", line)?;
-        let _ = file.sync_data();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = file.as_raw_fd();
-            unsafe {
-                libc::flock(fd, libc::LOCK_UN);
-            }
+        if file.metadata()?.len() > 0 {
+            use std::io::{Read, Seek, SeekFrom};
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' { writeln!(file)?; }
         }
+        writeln!(file, "{}", line)?;
+        file.sync_data()?;
 
         Ok(next_id)
     }
@@ -249,7 +270,7 @@ impl TransactionJournal {
         None
     }
 
-    pub fn rollback(tx_id: Option<usize>, dry_run: bool, allow_partial: bool, noconfirm: bool) {
+    pub fn rollback(tx_id: Option<usize>, dry_run: bool, allow_partial: bool, noconfirm: bool, privilege_tool: &str) {
         let txs = Self::list_transactions(100);
         if txs.is_empty() {
             println!(
@@ -355,7 +376,7 @@ impl TransactionJournal {
             cmd_args.push(path.display().to_string());
         }
 
-        let full_cmd = format!("sudo {}", cmd_args.join(" "));
+        let full_cmd = format!("{privilege_tool} {}", cmd_args.join(" "));
 
         if dry_run {
             println!("\n{}", "Dry-Run: Synthesized Rollback Command:".bold());
@@ -390,7 +411,7 @@ impl TransactionJournal {
         println!(
             "\n{} {}",
             ":: Executing rollback:".cyan(),
-            "sudo pacman -U ...".bold()
+            format!("{privilege_tool} pacman -U ...").bold()
         );
         let mut child_args = vec!["pacman", "-U"];
         if noconfirm {
@@ -404,7 +425,7 @@ impl TransactionJournal {
             child_args.push(p);
         }
 
-        let status = Command::new("sudo").args(&child_args).status();
+        let status = crate::privilege::command(privilege_tool).args(&child_args).status();
 
         match status {
             Ok(s) if s.success() => {
@@ -432,7 +453,7 @@ impl TransactionJournal {
                 std::process::exit(s.code().unwrap_or(1));
             }
             Err(e) => {
-                eprintln!("{}", format!("Failed to execute sudo pacman: {}", e).red());
+                eprintln!("{}", format!("Failed to execute {privilege_tool} pacman: {}", e).red());
                 std::process::exit(1);
             }
         }
@@ -442,6 +463,44 @@ impl TransactionJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_history_records_and_incomplete_tail_do_not_reuse_ids() {
+        let dir = std::env::temp_dir().join(format!("pacpin_journal_large_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        let large = "x".repeat(32 * 1024);
+        assert_eq!(TransactionJournal::record_transaction_at(&path, "upgrade", vec![], &large).unwrap(), 1);
+        assert_eq!(TransactionJournal::record_transaction_at(&path, "upgrade", vec![], &large).unwrap(), 2);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{{\"id\":3,\"interrupted\":").unwrap();
+        drop(file);
+        assert_eq!(TransactionJournal::record_transaction_at(&path, "install", vec![], "next").unwrap(), 3);
+        let contents = fs::read_to_string(&path).unwrap();
+        let ids: Vec<_> = contents.lines().filter_map(|line| serde_json::from_str::<TransactionRecord>(line).ok()).map(|r| r.id).collect();
+        assert_eq!(ids, [1, 2, 3]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_history_appends_allocate_unique_ids() {
+        let dir = std::env::temp_dir().join(format!("pacpin_journal_race_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8).map(|_| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                TransactionJournal::record_transaction_at(&path, "install", vec![], "test").unwrap()
+            })
+        }).collect();
+        let mut ids: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=8).collect::<Vec<_>>());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn test_is_safe_pkg_name() {
@@ -479,7 +538,7 @@ mod tests {
         let sample = "{\"id\":1,\"timestamp\":\"2026-09-20 12:00:00\",\"action\":\"install\",\"command\":\"pacpin -S foo\",\"total_packages\":1,\"packages\":[]}\n{\"id\":42,\"timestamp\":\"2026-09-20 12:10:00\",\"action\":\"upgrade\",\"command\":\"pacpin upgrade\",\"total_packages\":1,\"packages\":[]}\n";
         std::fs::write(&tmp, sample).unwrap();
 
-        assert_eq!(TransactionJournal::get_last_transaction_id(&tmp), Some(42));
+        assert_eq!(TransactionJournal::get_last_transaction_id(&mut fs::File::open(&tmp).unwrap()).unwrap(), Some(42));
         let _ = std::fs::remove_file(&tmp);
     }
 

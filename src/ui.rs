@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use crate::preview::{RequestedItem, RequestedStatus, TransactionPreview, partition_new_dependencies};
 use crate::resolver::{ResolveResult, ResolvedPackage};
 use colored::Colorize;
 use std::collections::HashSet;
@@ -21,19 +22,18 @@ use std::io::{self, IsTerminal, Write};
 use terminal_size::{terminal_size, Width};
 
 pub fn get_terminal_width() -> usize {
-    if let Ok(cols) = std::env::var("COLUMNS") {
-        if let Ok(w) = cols.parse::<usize>() {
-            if w >= 40 {
-                return w;
-            }
-        }
-    }
-    if let Some((Width(w), _)) = terminal_size() {
-        if w >= 40 {
-            return w as usize;
-        }
-    }
-    80
+    // COLUMNS can be inherited from the shell and remain stale after resize.
+    // Measure the live output terminal; use COLUMNS for redirected output.
+    let measured = if io::stdout().is_terminal() {
+        terminal_size().map(|(Width(width), _)| width as usize)
+    } else { None };
+    choose_terminal_width(measured, std::env::var("COLUMNS").ok().as_deref())
+}
+
+fn choose_terminal_width(measured: Option<usize>, columns: Option<&str>) -> usize {
+    measured.filter(|width| *width > 0)
+        .or_else(|| columns.and_then(|value| value.parse().ok()).filter(|width| *width > 0))
+        .unwrap_or(80)
 }
 
 pub fn truncate_str(s: &str, max_w: usize) -> String {
@@ -535,6 +535,21 @@ pub fn render_transaction_view(
     helper: &str,
     external_updates: &[crate::integrations::ExternalUpdate],
 ) -> Vec<ResolvedPackage> {
+    render_transaction_plan(data, helper, external_updates, None)
+}
+
+pub struct PlanDetails<'a> {
+    pub preview: &'a TransactionPreview,
+    pub explicit_names: &'a HashSet<String>,
+    pub requested: &'a [RequestedItem],
+}
+
+pub fn render_transaction_plan(
+    data: &ResolveResult,
+    helper: &str,
+    external_updates: &[crate::integrations::ExternalUpdate],
+    details: Option<PlanDetails<'_>>,
+) -> Vec<ResolvedPackage> {
     let updates = &data.updates;
     let held = &data.held_packages;
 
@@ -588,7 +603,7 @@ pub fn render_transaction_view(
         }
     }
 
-    if updates.is_empty() && external_updates.is_empty() {
+    if updates.is_empty() && external_updates.is_empty() && details.as_ref().is_none_or(|d| d.preview.adds.is_empty() && d.requested.iter().all(|p| p.status == RequestedStatus::AlreadyCurrent)) {
         if held.is_empty() {
             println!("\n{}", "✔ System is fully up to date!".green());
             println!(
@@ -602,14 +617,12 @@ pub fn render_transaction_view(
 
     let term_w = get_terminal_width();
     let avail = term_w.saturating_sub(2);
+    let narrow = term_w < 80;
 
     let mut tot_csize: i64 = 0;
     let mut tot_isize: i64 = 0;
     let mut tot_delta: i64 = 0;
     let mut has_known_delta = false;
-    let mut custom_count = 0;
-    let mut sticky_count = 0;
-    let mut default_count = 0;
     let mut pacman_count = 0;
     let mut aur_count = 0;
 
@@ -656,7 +669,7 @@ pub fn render_transaction_view(
             (pw, vw)
         };
 
-        if is_full {
+        if !narrow && is_full {
             println!(
                 "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10} {:>10} {:>11}",
                 "STATE",
@@ -683,7 +696,7 @@ pub fn render_transaction_view(
                 rw = repo_w,
                 vw = ver_w
             );
-        } else if is_medium {
+        } else if !narrow && is_medium {
             println!(
                 "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10} {:>10}",
                 "STATE",
@@ -708,7 +721,7 @@ pub fn render_transaction_view(
                 rw = repo_w,
                 vw = ver_w
             );
-        } else {
+        } else if !narrow {
             println!(
                 "  {:<9} {:<pw$} {:<rw$} {:<vw$} {:>10}",
                 "STATE",
@@ -746,7 +759,6 @@ pub fn render_transaction_view(
             }
 
             let state_str = if p.state == "custom" {
-                custom_count += 1;
                 if p.is_downgrade {
                     format!("{:<9}", "[down]").red()
                 } else if p.update_type == "pin_sync" {
@@ -755,10 +767,8 @@ pub fn render_transaction_view(
                     format!("{:<9}", "[custom]").cyan()
                 }
             } else if p.state == "sticky" {
-                sticky_count += 1;
                 format!("{:<9}", "[sticky]").blue()
             } else {
-                default_count += 1;
                 format!("{:<9}", "[default]").green()
             };
 
@@ -816,7 +826,18 @@ pub fn render_transaction_view(
                 has_known_delta = true;
             }
 
-            if is_full {
+            if narrow {
+                for (text, prefix) in [
+                    (p.name.clone(), "  - "),
+                    (format!("{} [{}]", p.state, cand.repo), "    "),
+                    (format!("{} → {}", p.installed_ver, cand.version), "    "),
+                    (format!("Net delta: {delta_raw}"), "    "),
+                ] {
+                    for line in wrap_field(&text, prefix, "    ", term_w) {
+                        println!("{line}");
+                    }
+                }
+            } else if is_full {
                 println!(
                     "  {} {} {} {} {} {} {}",
                     state_str, pkg_str, repo_str, ver_str, csize_padded, isize_padded, delta_11
@@ -849,7 +870,7 @@ pub fn render_transaction_view(
         let ext_pkg_w = (rem_ext * 55 / 100).max(18);
         let ext_ver_w = rem_ext.saturating_sub(ext_pkg_w).max(16);
 
-        println!(
+        if !narrow { println!(
             "  {:<10} {:<pw$} {:<14} {:<vw$}",
             "RUNNER",
             "PACKAGE / APP ID",
@@ -857,8 +878,8 @@ pub fn render_transaction_view(
             "TARGET VERSION",
             pw = ext_pkg_w,
             vw = ext_ver_w
-        );
-        println!(
+        ); }
+        if !narrow { println!(
             "  {:<10} {:<pw$} {:<14} {:<vw$}",
             "──────────",
             "─".repeat(ext_pkg_w),
@@ -866,9 +887,21 @@ pub fn render_transaction_view(
             "─".repeat(ext_ver_w),
             pw = ext_pkg_w,
             vw = ext_ver_w
-        );
+        ); }
 
         for ext in external_updates {
+            if narrow {
+                for (text, prefix) in [
+                    (ext.name.clone(), "  - "),
+                    (format!("{} [{}]", ext.runner, ext.repo), "    "),
+                    (format!("Target: {}", ext.version), "    "),
+                ] {
+                    for line in wrap_field(&text, prefix, "    ", term_w) {
+                        println!("{line}");
+                    }
+                }
+                continue;
+            }
             let repo_display = format!("[{}]", ext.repo);
             let runner_str = format!("{:<10}", ext.runner).cyan();
             let name_str = format!(
@@ -891,6 +924,7 @@ pub fn render_transaction_view(
     let mut flatpak_count = 0;
     let mut nix_count = 0;
     let mut pipx_count = 0;
+    let mut sources_count = 0;
     for ext in external_updates {
         if ext.runner == "Flatpak" {
             flatpak_count += 1;
@@ -898,12 +932,31 @@ pub fn render_transaction_view(
             nix_count += 1;
         } else if ext.runner == "Pipx" {
             pipx_count += 1;
+        } else if ext.runner == "Sources" {
+            sources_count += 1;
         }
     }
 
-    let card_inner_w = (avail.saturating_sub(4)).clamp(30, 60);
+    let mut native_new = 0;
+    let mut dependency_count = 0;
+    if let Some(details) = &details {
+        render_preview_boxes(details.preview, details.explicit_names);
+        pacman_count = details.preview.adds.len();
+        native_new = details.preview.adds.iter().filter(|p| p.is_new_install()).count();
+        dependency_count = partition_new_dependencies(details.preview, details.explicit_names).len();
+        aur_count += details.requested.iter().filter(|p| p.manager == "aur" && p.status != RequestedStatus::AlreadyCurrent).count();
+        tot_csize = details.preview.adds.iter().map(|p| p.download_size).sum();
+        tot_isize = details.preview.adds.iter().map(|p| p.new_isize).sum();
+        tot_delta = details.preview.adds.iter().map(|p| p.net_delta()).sum::<i64>() - details.preview.removed_isize;
+        // AUR sizes remain unknown and must not masquerade as complete totals.
+        has_known_delta = !details.preview.adds.is_empty() || !details.preview.removes.is_empty();
+    }
+    let card_inner_w = (avail.saturating_sub(4)).clamp(8, 60);
+    let unknown_sizes = aur_count > 0 || !external_updates.is_empty();
     let (tot_delta_str, tot_delta_color) = if has_known_delta {
-        format_delta_text(tot_delta)
+        let (mut text, color) = format_delta_text(tot_delta);
+        if unknown_sizes { text.push_str(" + unknown"); }
+        (text, color)
     } else {
         ("-".to_string(), colored::Color::BrightBlack)
     };
@@ -912,6 +965,13 @@ pub fn render_transaction_view(
         let label_w = str_width(label);
         let val_w = str_width(val_str);
         let used = label_w + val_w;
+        if used + 2 > card_inner_w {
+            for line in wrap_field(&format!("{label}{val_str}"), "", "", card_inner_w - 2) {
+                let pad = card_inner_w.saturating_sub(str_width(&line) + 2);
+                println!("  │ {line}{} │", " ".repeat(pad));
+            }
+            return;
+        }
         let pad = if card_inner_w >= used + 2 {
             card_inner_w - used - 2
         } else {
@@ -921,35 +981,23 @@ pub fn render_transaction_view(
     };
 
     println!("\n  ┌{}┐", "─".repeat(card_inner_w));
-    let total_all = updates.len() + external_updates.len();
-    let mut breakdown = Vec::new();
-    if custom_count > 0 {
-        breakdown.push(format!("{} custom", custom_count));
-    }
-    if sticky_count > 0 {
-        breakdown.push(format!("{} sticky", sticky_count));
-    }
-    if default_count > 0 || (breakdown.is_empty() && external_updates.is_empty()) {
-        breakdown.push(format!("{} default", default_count));
-    }
-    if flatpak_count > 0 {
-        breakdown.push(format!("{} flatpak", flatpak_count));
-    }
-    if nix_count > 0 {
-        breakdown.push(format!("{} nix", nix_count));
-    }
-    if pipx_count > 0 {
-        breakdown.push(format!("{} pipx", pipx_count));
-    }
-    let pkg_summary = format!("{} ({})", total_all, breakdown.join(", "));
+    let total_all = pacman_count + aur_count + external_updates.len();
+    let pkg_summary = if dependency_count == 0 {
+        total_all.to_string()
+    } else {
+        format!("{total_all} (includes {dependency_count} new deps)")
+    };
     print_card_line(
-        "📦 Packages to Upgrade : ",
+        "📦 Packages to Change  : ",
         &pkg_summary,
         pkg_summary.bold().to_string(),
     );
 
     if pacman_count > 0 {
-        let s = format!("{} updates", pacman_count);
+        let mut s = package_count_text(pacman_count - native_new, native_new);
+        if dependency_count > 0 && dependency_count == native_new {
+            s = s.replace("new installs", "new dependencies");
+        }
         print_card_line("  • Pacman             : ", &s, s.cyan().to_string());
     }
 
@@ -979,6 +1027,11 @@ pub fn render_transaction_view(
         print_card_line("  • Pipx               : ", &s, s.green().to_string());
     }
 
+    if sources_count > 0 {
+        let s = format!("{} updates", sources_count);
+        print_card_line("  • Sources            : ", &s, s.cyan().to_string());
+    }
+
     if !held.is_empty() {
         let held_summary = format!("{} packages", held.len());
         print_card_line(
@@ -987,14 +1040,14 @@ pub fn render_transaction_view(
             held_summary.yellow().to_string(),
         );
     }
+    if let Some(details) = &details {
+        if !details.preview.removes.is_empty() {
+            let count = details.preview.removes.len().to_string();
+            print_card_line("🗑 Packages to Remove  : ", &count, count.red().to_string());
+        }
+    }
 
-    let dl_summary = if tot_csize > 0 {
-        format_size(tot_csize)
-    } else if aur_count > 0 && updates.len() == aur_count {
-        "-".to_string()
-    } else {
-        format_size(tot_csize)
-    };
+    let dl_summary = summary_size(tot_csize, unknown_sizes);
     print_card_line(
         "📥 Total Download Size : ",
         &dl_summary,
@@ -1005,13 +1058,7 @@ pub fn render_transaction_view(
         },
     );
 
-    let inst_summary = if tot_isize > 0 {
-        format_size(tot_isize)
-    } else if aur_count > 0 && updates.len() == aur_count {
-        "-".to_string()
-    } else {
-        format_size(tot_isize)
-    };
+    let inst_summary = summary_size(tot_isize, unknown_sizes);
     print_card_line(
         "💾 Total Install Size  : ",
         &inst_summary,
@@ -1036,9 +1083,196 @@ pub fn render_transaction_view(
     updates.clone()
 }
 
+fn package_count_text(changes: usize, new: usize) -> String {
+    if new == 0 {
+        format!("{changes} upgrades")
+    } else if changes == 0 {
+        format!("{new} new installs")
+    } else {
+        format!("{changes} upgrades + {new} new installs")
+    }
+}
+
+fn summary_size(known: i64, has_unknown: bool) -> String {
+    if has_unknown && known == 0 {
+        "Unknown".into()
+    } else if has_unknown {
+        format!("{} + unknown", format_size(known))
+    } else {
+        format_size(known)
+    }
+}
+
+pub(crate) fn wrap_field(text: &str, prefix: &str, continuation: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = prefix.to_string();
+    for word in crate::utils::sanitize_display_text(text).split_whitespace() {
+        let mut remaining = word.to_string();
+        if line.len() > prefix.len()
+            && str_width(&line) + 1 + str_width(word) > width
+        {
+            lines.push(line);
+            line = continuation.into();
+        }
+        if !line.ends_with(' ') && !line.is_empty() {
+            line.push(' ');
+        }
+        while !remaining.is_empty() {
+            let room = width.saturating_sub(str_width(&line)).max(1);
+            let mut used = 0;
+            let mut end = 0;
+            for (index, ch) in remaining.char_indices() {
+                let next = used + char_width(ch);
+                if next > room && end != 0 {
+                    break;
+                }
+                used = next;
+                end = index + ch.len_utf8();
+            }
+            line.push_str(&remaining[..end]);
+            remaining = remaining[end..].into();
+            if !remaining.is_empty() {
+                lines.push(line);
+                line = continuation.into();
+            }
+        }
+    }
+    if !line.trim().is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Explicitly requested packages (`pin -Syu <pkg...>`) in their own box so
+/// they are never confused with routine updates.
+pub fn render_requested_box(items: &[RequestedItem]) {
+    if items.is_empty() {
+        return;
+    }
+    println!(
+        "\n{}",
+        format!("🎯 Requested Packages ({}):", items.len()).bold()
+    );
+    for item in items {
+        let manager_str = if item.manager == "aur" {
+            "[aur]".yellow()
+        } else {
+            format!("[{}]", item.repo.as_deref().unwrap_or("repo")).cyan()
+        };
+        let version_part = match &item.installed_version {
+            Some(installed) => format!("{} ➔ {}", installed, item.candidate_version.green()),
+            None => format!("➔ {}", item.candidate_version.green()),
+        };
+        let status_str = match item.status {
+            RequestedStatus::NewInstall => "(new install)".green(),
+            RequestedStatus::Upgrade => "(upgrade)".green(),
+            RequestedStatus::Downgrade => "(downgrade)".red(),
+            RequestedStatus::AlreadyCurrent => "(already current; no change)".dimmed(),
+        };
+        println!(
+            "  • {} {} {}  {}",
+            item.name.bold(),
+            manager_str,
+            version_part,
+            status_str
+        );
+    }
+}
+
+/// Dependency-expanded additions and removals from the prepared native
+/// transaction. Anything here was NOT explicitly requested: it is pulled in
+/// automatically by the solver, and approving the plan approves these too.
+pub fn render_preview_boxes(
+    preview: &TransactionPreview,
+    explicit_names: &HashSet<String>,
+) {
+    let new_deps = partition_new_dependencies(preview, explicit_names);
+    if !new_deps.is_empty() {
+        let total: i64 = new_deps.iter().map(|p| p.net_delta()).sum();
+        let (total_str, total_color) = format_delta_text(total);
+        println!(
+            "\n{}",
+            format!(
+                "📦 New Dependencies ({} — installed automatically with this plan):",
+                new_deps.len()
+            )
+            .bold()
+        );
+        for dep in &new_deps {
+            let (delta_str, delta_color) = format_delta_text(dep.net_delta());
+            println!(
+                "  • {} {} {}  ({})",
+                dep.name.bold(),
+                format!("[{}]", dep.repo).dimmed(),
+                dep.version.green(),
+                format!("{:>9}", delta_str).color(delta_color)
+            );
+        }
+        println!(
+            "    {} {}",
+            "Net growth from new dependencies:".dimmed(),
+            total_str.color(total_color)
+        );
+    }
+
+    let implicit_changes: Vec<_> = preview.adds.iter().filter(|p| !p.is_new_install() && !explicit_names.contains(&p.name)).collect();
+    if !implicit_changes.is_empty() {
+        println!("\n{}", format!("Additional Dependency Changes ({}):", implicit_changes.len()).bold());
+        for dep in implicit_changes {
+            for line in wrap_field(&format!("{} [{}] {} → {}", dep.name, dep.repo, dep.old_version.as_deref().unwrap_or("unknown"), dep.version), "  • ", "    ", get_terminal_width()) {
+                println!("{line}");
+            }
+        }
+    }
+
+    if !preview.removes.is_empty() {
+        println!(
+            "\n{}",
+            format!("🗑 Removals / Replacements ({}):", preview.removes.len()).bold()
+        );
+        for (name, version) in &preview.removes {
+            println!("  • {} {}  {}", name.bold(), version.dimmed(), "(removed)".red());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_terminal_width_wins_over_stale_columns() {
+        assert_eq!(choose_terminal_width(Some(40), Some("80")), 40);
+        assert_eq!(choose_terminal_width(None, Some("32")), 32);
+        assert_eq!(choose_terminal_width(Some(0), Some("32")), 32);
+        assert_eq!(choose_terminal_width(None, Some("0")), 80);
+        assert_eq!(choose_terminal_width(None, Some("invalid")), 80);
+    }
+
+    #[test]
+    fn count_labels_include_new_installs_only_when_present() {
+        assert_eq!(package_count_text(41, 7), "41 upgrades + 7 new installs");
+        assert_eq!(package_count_text(41, 0), "41 upgrades");
+        assert_eq!(package_count_text(0, 7), "7 new installs");
+    }
+
+    #[test]
+    fn unknown_source_and_aur_sizes_are_not_zero_or_complete_totals() {
+        assert_eq!(summary_size(0, true), "Unknown");
+        assert_eq!(summary_size(1024, true), "1.0 KiB + unknown");
+        assert_eq!(summary_size(0, false), "0 B");
+        assert_eq!(summary_size(1024, false), "1.0 KiB");
+    }
+
+    #[test]
+    fn narrow_summary_fields_wrap_without_losing_names_or_values() {
+        for width in [24, 32, 40, 60, 80] {
+            let lines = wrap_field("github-openai-codex-4309d93a1a84-alpha/openai-codex", "  - ", "    ", width);
+            assert!(lines.iter().all(|line| str_width(line) <= width));
+            let name = lines.iter().map(|line| line.trim_start().trim_start_matches("- ")).collect::<String>();
+            assert_eq!(name, "github-openai-codex-4309d93a1a84-alpha/openai-codex");
+        }
+    }
 
     #[test]
     fn test_card_line_alignment() {

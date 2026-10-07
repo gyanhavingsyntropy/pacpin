@@ -15,6 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 mod alias;
+mod archive;
 mod aur;
 pub mod commands;
 mod config;
@@ -24,10 +25,14 @@ pub mod pm;
 mod integrations;
 mod journal;
 mod orphans;
+mod preview;
+mod privilege;
+mod progress;
 mod repo_menu;
 mod resolver;
 mod restart;
 mod sandbox;
+mod sources;
 mod tui_select;
 mod ui;
 mod utils;
@@ -36,7 +41,7 @@ mod wizard;
 use colored::Colorize;
 use commands::*;
 pub use commands::upgrade::parse_install_flags;
-use config::{load_config, save_config, Config};
+use config::{load_config, mutate_config, Config};
 use db::AlpmManager;
 use journal::TransactionJournal;
 use resolver::ResolverEngine;
@@ -74,7 +79,8 @@ pub fn find_matching_pin(
 }
 
 pub(crate) fn check_and_prompt_smart_unpin(mut config: Config, removed_pkgs: &[String], noconfirm: bool) {
-    let mut config_dirty = false;
+    let mut removed_pins = BTreeMap::new();
+    let mut removed_delays = BTreeMap::new();
     let interactive = io::stdin().is_terminal();
 
     for pkg in removed_pkgs {
@@ -116,7 +122,7 @@ pub(crate) fn check_and_prompt_smart_unpin(mut config: Config, removed_pkgs: &[S
                     "{}",
                     format!("✔ Removed pin rule '{}' ➔ [{}].", pattern, repo).green()
                 );
-                config_dirty = true;
+                removed_pins.insert(pattern, repo);
             }
         }
 
@@ -147,13 +153,26 @@ pub(crate) fn check_and_prompt_smart_unpin(mut config: Config, removed_pkgs: &[S
                     "{}",
                     format!("✔ Removed {}-day stability delay on '{}'.", days, pkg).green()
                 );
-                config_dirty = true;
+                removed_delays.insert(pkg.clone(), days);
             }
         }
     }
 
-    if config_dirty {
-        if let Err(e) = save_config(&config) {
+    if !removed_pins.is_empty() || !removed_delays.is_empty() {
+        if let Err(e) = mutate_config(|current| {
+            // A concurrently changed rule was not the one the user approved removing.
+            for (pattern, repo) in &removed_pins {
+                if current.pins.get(pattern) == Some(repo) {
+                    current.pins.remove(pattern);
+                }
+            }
+            for (pkg, days) in &removed_delays {
+                if current.delay.get(pkg) == Some(days) {
+                    current.delay.remove(pkg);
+                }
+            }
+            Ok(())
+        }) {
             eprintln!(
                 "{}",
                 format!("Warning: Failed to save updated config: {}", e).yellow()
@@ -171,13 +190,18 @@ fn print_help() {
     println!();
     println!("{}", "Core Package Operations:".bold());
     println!("  check, -Qu                   Check pending updates & verify pin protections");
-    println!("  upgrade, -Syu [flags]        Execute safe upgrade with True Resolver");
+    println!("  upgrade, -Syu [flags] [pkg...] Execute safe upgrade with True Resolver");
+    println!("    Requested packages get their own box, and the approval");
+    println!("    also covers auto-pulled dependencies (separate box).");
     println!("    Flags:");
     println!("      -n, --dry-run            Show transaction summary without executing");
-    println!("      -y, --refresh            Refresh sync databases (sudo pacman -Sy) first");
+    println!("      -y, --refresh            Refresh sync databases with the selected privilege tool");
     println!("      -c, --clean              Prompt to clean all orphans during upgrade");
+    println!("      --no-cache               Clean caches for successful native/AUR transactions");
     println!("      --noconfirm              Bypass interactive confirmation prompt");
     println!("  -S [flags] [repo/]pkg        Install packages (auto-pins repo/pkg with companion cascade)");
+    println!("  -S github:owner/project      Install a reviewed direct upstream release (--channel alpha)");
+    println!("  -S source-alias/pkg          Install a configured upstream release (see docs/sources.md)");
     println!("  -Sp, --print-uris <pkg...>   Print package and dependency download URIs");
     println!("  -Sl, --list [repo...]        List packages in sync repositories");
     println!("  -Sg, --groups [group...]     List package groups or packages in a group");
@@ -204,6 +228,9 @@ fn print_help() {
     );
     println!("  reset [-f]                   Reset all configurations, pins, and delays to default (-f force)");
     println!("  init [--reset]               Interactive onboarding wizard (use --reset for clean slate)");
+    println!("  capture [-n|--force]          Save explicitly installed packages to [packages]");
+    println!("  rebuild [-n|--noconfirm]      Install missing declared packages without removing extras");
+    println!("    --enforce-repos             Reinstall present repo-qualified packages from declared repos");
     println!();
     println!("{}", "System Maintenance & Hygiene:".bold());
     println!(
@@ -222,7 +249,7 @@ fn print_help() {
     println!("  rollback [id] [-n]           Restore previous package versions from cache");
     println!();
     println!("{}", "Pacman & AUR Drop-in Aliases:".bold());
-    println!("  pacpin -Syu                  Alias for 'pacpin upgrade -y'");
+    println!("  pacpin -Syu [pkg...]           Alias for 'pacpin upgrade -y' (targets join the upgrade)");
     println!("  pacpin -Qu                   Alias for 'pacpin check'");
     println!("  pacpin -Ss <query...>        Search repositories and AUR");
     println!("  pacpin -Si <pkg...>          Show remote/AUR package metadata");
@@ -243,152 +270,31 @@ fn print_version() {
     println!("There is NO WARRANTY, to the extent permitted by law.");
 }
 
-pub fn parse_pacman_cli_args(args: &[String]) -> (Vec<String>, Vec<String>) {
-    let mut targets = Vec::new();
-    let mut flags = Vec::new();
-    let mut after_double_dash = false;
-    let mut i = 0;
-
-    while i < args.len() {
-        let arg = &args[i];
-
-        if after_double_dash {
-            targets.push(arg.clone());
-            i += 1;
-            continue;
+fn parse_clean_args(args: &[String]) -> (bool, Vec<String>) {
+    let mut clean_flags = 0usize;
+    let mut rest = Vec::new();
+    for arg in args {
+        if arg.starts_with("-S") && arg[2..].chars().all(|c| c == 'c') && arg.len() > 2 {
+            clean_flags += arg.len() - 2;
+        } else if arg == "-c" || arg == "--clean" {
+            clean_flags += 1;
+        } else if arg != "clean" && arg != "clean-cache" && arg != "-S" {
+            rest.push(arg.clone());
         }
-
-        if arg == "--" {
-            after_double_dash = true;
-            i += 1;
-            continue;
-        }
-
-        let takes_arg = arg == "--ignore"
-            || arg == "--ignoregroup"
-            || arg == "--config"
-            || arg == "--cachedir"
-            || arg == "--root"
-            || arg == "-r"
-            || arg == "--dbpath"
-            || arg == "-b"
-            || arg == "--logfile"
-            || arg == "--gpgdir"
-            || arg == "--hookdir"
-            || arg == "--overwrite"
-            || arg == "--assume-installed"
-            || arg == "--color"
-            || arg == "--arch"
-            || arg == "--print-format";
-
-        if arg == "--wait" {
-            flags.push(arg.clone());
-            if i + 1 < args.len() && args[i + 1].parse::<u64>().is_ok() {
-                flags.push(args[i + 1].clone());
-                i += 1;
-            }
-        } else if takes_arg {
-            flags.push(arg.clone());
-            if i + 1 < args.len() {
-                flags.push(args[i + 1].clone());
-                i += 1;
-            }
-        } else if arg.starts_with("--ignore=")
-            || arg.starts_with("--ignoregroup=")
-            || arg.starts_with("--config=")
-            || arg.starts_with("--cachedir=")
-            || arg.starts_with("--root=")
-            || arg.starts_with("--dbpath=")
-            || arg.starts_with("--logfile=")
-            || arg.starts_with("--gpgdir=")
-            || arg.starts_with("--hookdir=")
-            || arg.starts_with("--overwrite=")
-            || arg.starts_with("--assume-installed=")
-            || arg.starts_with("--color=")
-            || arg.starts_with("--arch=")
-            || arg.starts_with("--print-format=")
-            || arg.starts_with("--wait=")
-            || arg.starts_with('-')
-        {
-            flags.push(arg.clone());
-        } else {
-            targets.push(arg.clone());
-        }
-
-        i += 1;
     }
-
-    (targets, flags)
+    (clean_flags >= 2, rest)
 }
 
-pub fn is_upgrade_invocation(args: &[String]) -> bool {
-    if args.is_empty() {
-        return false;
-    }
-    let first = &args[0];
-    if first == "upgrade" || first == "up" {
-        return true;
-    }
-    if !first.starts_with("-S") {
-        return false;
-    }
-
-    let (targets, flags_list) = parse_pacman_cli_args(&args[1..]);
-    if !targets.is_empty() {
-        return false;
-    }
-
-    // Collect all short flag characters across first arg and flags_list
-    let mut flags = std::collections::HashSet::new();
-    for a in std::iter::once(first).chain(flags_list.iter()) {
-        if a.starts_with('-') && !a.starts_with("--") {
-            for c in a[1..].chars() {
-                flags.insert(c);
-            }
-        }
-    }
-
-    // Reject if other -S sub-operations are requested:
-    // s (search), i (info), w (downloadonly), p (print-uris), l (list), g (groups), c (clean without u)
-    if flags.contains(&'s')
-        || flags.contains(&'i')
-        || flags.contains(&'w')
-        || flags.contains(&'p')
-        || flags.contains(&'l')
-        || flags.contains(&'g')
-        || (flags.contains(&'c') && !flags.contains(&'u'))
-        || flags_list.iter().any(|a| {
-            a == "--search"
-                || a == "--info"
-                || a == "--downloadonly"
-                || a == "--print"
-                || a == "--print-uris"
-                || a == "--list"
-                || a == "--groups"
-        })
-    {
-        return false;
-    }
-
-    // It's an upgrade if flags contains 'u' or 'y' or long options
-    flags.contains(&'u')
-        || flags.contains(&'y')
-        || flags_list
-            .iter()
-            .any(|a| a == "--sysupgrade" || a == "--refresh")
-}
-
-pub fn pacman_files_needs_sudo(args: &[String]) -> bool {
-    let (_, flags) = parse_pacman_cli_args(args);
-    flags.iter().any(|a| {
-        if a == "--refresh" {
-            true
-        } else if a.starts_with('-') && !a.starts_with("--") {
-            a.contains('y')
-        } else {
-            false
-        }
-    })
+fn is_clean_invocation(args: &[String]) -> bool {
+    let Some(cmd) = args.first().map(String::as_str) else { return false; };
+    cmd == "clean"
+        || cmd == "clean-cache"
+        || cmd == "-Sc"
+        || cmd == "-Scc"
+        || (cmd.starts_with("-S")
+            && (cmd.contains('c') || args.iter().any(|a| a == "-c" || a == "--clean"))
+            && !is_upgrade_invocation(args)
+            && !args.iter().skip(1).any(|a| !a.starts_with('-')))
 }
 
 fn main() {
@@ -406,7 +312,21 @@ fn main() {
         colored::control::set_override(false);
     }
 
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut args: Vec<String> = env::args().skip(1).collect();
+
+    let mut cli_privilege_override = None;
+    if let Some(pos) = args.iter().position(|a| a == "--pkexec") {
+        args.remove(pos);
+        cli_privilege_override = Some("pkexec".to_string());
+    } else if let Some(pos) = args.iter().position(|a| a == "--sudo") {
+        args.remove(pos);
+        cli_privilege_override = Some("sudo".to_string());
+    }
+
+    if is_clean_invocation(&args) && unsafe { libc::geteuid() } == 0 {
+        eprintln!("Error: Do not run pacpin as root. Run pacpin as your user (e.g. `pin clean` or `pin clean --pkexec`); it will elevate privileges automatically.");
+        exit(1);
+    }
 
     if args
         .first()
@@ -451,7 +371,7 @@ fn main() {
     }
 
     // Auto-launch wizard if no config exists and running in an interactive terminal
-    let (config, just_initialized) = if !config::config_exists() && io::stdin().is_terminal() {
+    let (mut config, just_initialized) = if !config::config_exists() && io::stdin().is_terminal() {
         if let Some(cfg) = wizard::run_first_launch_wizard(false, false) {
             (cfg, true)
         } else {
@@ -460,6 +380,13 @@ fn main() {
     } else {
         (load_config(), false)
     };
+
+    if let Some(tool) = cli_privilege_override {
+        config.options.privilege_tool = tool;
+    }
+
+    privilege::initialize(&config.options.privilege_tool, &args);
+    progress::begin_transaction();
 
     if just_initialized && args.is_empty() {
         exit(0);
@@ -474,6 +401,16 @@ fn main() {
     if cmd == "repos" || cmd == "repo-order" || cmd == "priority" {
         cmd_repos(config);
         exit(0);
+    } else if cmd == "capture" {
+        if let Err(error) = cmd_capture(config, &args[1..]) {
+            eprintln!("{}", format!("Error: {}", error).red());
+            exit(1);
+        }
+    } else if cmd == "rebuild" {
+        if let Err(error) = cmd_rebuild(config, &args[1..]) {
+            eprintln!("{}", format!("Error: {}", error).red());
+            exit(1);
+        }
     } else if cmd == "check" || cmd == "-Qu" || (cmd.starts_with("-Q") && cmd.contains('u')) {
         let mut check_args = Vec::new();
         if cmd.starts_with("-Q") && cmd.contains('q') {
@@ -481,8 +418,20 @@ fn main() {
         }
         check_args.extend_from_slice(&args[1..]);
         cmd_check(&config, &check_args);
+    } else if is_refresh_only_invocation(&args) {
+        if args.iter().any(|arg| arg == "-n" || arg == "--dry-run") {
+            println!(":: Would refresh package databases only: {} pacman {}", config.options.privilege_tool, args.join(" "));
+            exit(0);
+        }
+        match pm::forward_pacman(&config, &args, true) {
+            Ok(code) => exit(code),
+            Err(error) => {
+                eprintln!("{}", format!("Database refresh failed: {error}").red());
+                exit(1);
+            }
+        }
     } else if is_upgrade_invocation(&args) {
-        let (_targets, extra_flags) = parse_pacman_cli_args(&args[1..]);
+        let (targets, extra_flags) = parse_pacman_cli_args(&args[1..]);
         let dry_run = args.iter().any(|a| a == "-n" || a == "--dry-run")
             || args
                 .iter()
@@ -505,6 +454,7 @@ fn main() {
             noconfirm,
             autoremove,
             &extra_flags,
+            &targets,
         );
     } else if cmd == "search"
         || cmd == "-Ss"
@@ -548,29 +498,16 @@ fn main() {
             args.iter().skip(1).cloned().collect()
         };
         cmd_info(&config, &pkg_args);
-    } else if cmd == "clean"
-        || cmd == "clean-cache"
-        || cmd == "-Sc"
-        || cmd == "-Scc"
-        || (cmd.starts_with("-S")
-            && (cmd.contains('c') || args.iter().any(|a| a == "-c" || a == "--clean"))
-            && !is_upgrade_invocation(&args)
-            && !args.iter().skip(1).any(|a| !a.starts_with('-')))
-    {
-        let extra_args: Vec<String> = args
-            .iter()
-            .skip(1)
-            .filter(|a| *a != "-c" && *a != "--clean" && !a.starts_with("-Sc"))
-            .cloned()
-            .collect();
-        cmd_clean(&config, &extra_args);
+    } else if is_clean_invocation(&args) {
+        let (full, extra_args) = parse_clean_args(&args);
+        cmd_clean(&config, full, &extra_args);
     } else if cmd.starts_with("-Sw")
         || (cmd.starts_with("-S") && args.iter().any(|a| a == "-w" || a == "--downloadonly"))
     {
-        match pm::forward_pacman(&args, true) {
+        match pm::forward_pacman(&config, &args, true) {
             Ok(code) => exit(code),
             Err(e) => {
-                eprintln!("{}", format!("Failed to run sudo pacman: {}", e).red());
+                eprintln!("{}", format!("Failed to run {} pacman: {}", config.options.privilege_tool, e).red());
                 exit(1);
             }
         }
@@ -599,7 +536,7 @@ fn main() {
         cmd_sync_groups(&config, &groups);
         exit(0);
     } else if cmd.starts_with("-T") {
-        match pm::forward_pacman(&args, false) {
+        match pm::forward_pacman(&config, &args, false) {
             Ok(code) => exit(code),
             Err(e) => {
                 eprintln!("{}", format!("Failed to run pacman: {}", e).red());
@@ -640,7 +577,7 @@ fn main() {
         };
         cmd_remove(config, &sub_args, is_friendly);
     } else if cmd.starts_with("-Q") {
-        match pm::forward_pacman(&args, false) {
+        match pm::forward_pacman(&config, &args, false) {
             Ok(code) => exit(code),
             Err(e) => {
                 eprintln!("{}", format!("Failed to run pacman: {}", e).red());
@@ -649,7 +586,7 @@ fn main() {
         }
     } else if cmd.starts_with("-F") {
         let needs_sudo = pacman_files_needs_sudo(&args);
-        match pm::forward_pacman(&args, needs_sudo) {
+        match pm::forward_pacman(&config, &args, needs_sudo) {
             Ok(code) => exit(code),
             Err(e) => {
                 eprintln!("{}", format!("Failed to run pacman: {}", e).red());
@@ -657,10 +594,10 @@ fn main() {
             }
         }
     } else if cmd.starts_with("-U") || cmd.starts_with("-D") {
-        match pm::forward_pacman(&args, true) {
+        match pm::forward_pacman(&config, &args, true) {
             Ok(code) => exit(code),
             Err(e) => {
-                eprintln!("{}", format!("Failed to run sudo pacman: {}", e).red());
+                eprintln!("{}", format!("Failed to run {} pacman: {}", config.options.privilege_tool, e).red());
                 exit(1);
             }
         }
@@ -679,153 +616,13 @@ fn main() {
                 tx_id = Some(id);
             }
         }
-        TransactionJournal::rollback(tx_id, dry_run, allow_partial, noconfirm);
+        TransactionJournal::rollback(tx_id, dry_run, allow_partial, noconfirm, &config.options.privilege_tool);
     } else if cmd == "run" {
-        let mut opts = sandbox::TryOptions::for_run();
-        let mut positional = Vec::new();
-        let mut pass_through = Vec::new();
-        let mut after_delimiter = false;
-
-        let mut i = 1;
-        while i < args.len() {
-            let a = &args[i];
-            if after_delimiter {
-                pass_through.push(a.clone());
-                i += 1;
-                continue;
-            }
-            if a == "--" {
-                after_delimiter = true;
-                i += 1;
-                continue;
-            }
-            if a == "--sandbox" || a == "--sandboxed" {
-                opts.no_sandbox = false;
-                opts.is_run_mode = false;
-            } else if a == "--allow-unverified" {
-                opts.allow_unverified = true;
-            } else if a == "--noconfirm" || a == "-y" {
-                opts.noconfirm = true;
-            } else if a == "--bin" {
-                if i + 1 < args.len() {
-                    opts.bin = Some(args[i + 1].clone());
-                    i += 1;
-                }
-            } else if let Some(stripped) = a.strip_prefix("--bin=") {
-                opts.bin = Some(stripped.to_string());
-            } else if positional.is_empty() && !a.starts_with('-') {
-                positional.push(a.clone());
-            } else {
-                pass_through.push(a.clone());
-            }
-            i += 1;
-        }
-
-        if positional.is_empty() {
-            eprintln!(
-                "{}",
-                "Error: 'pacpin run' requires a package target."
-                    .red()
-                    .bold()
-            );
-            eprintln!("Usage: pacpin run [options] [repo/]package [arguments...]");
-            eprintln!("Runs an official, AUR, Flatpak, or Nix package directly on host without permanent installation.");
-            eprintln!();
-            eprintln!("Options:");
-            eprintln!(
-                "  --sandbox              Run in Bubblewrap container (unsandboxed by default)"
-            );
-            eprintln!("  --bin <name>           Specify exact executable binary name if package provides multiple");
-            eprintln!("  --allow-unverified     Proceed even if repository metadata lacks a SHA256 checksum");
-            eprintln!();
-            eprintln!("Examples:");
-            eprintln!("  pacpin run fastfetch");
-            eprintln!("  pacpin run yt-dlp 'https://youtube.com/watch?v=...'");
-            eprintln!("  pacpin run ffmpeg -i screencast.mkv output.mp4");
-            eprintln!("  pacpin run jq . package.json");
-            exit(1);
-        }
-
-        let pkg = &positional[0];
-        sandbox::cmd_try(pkg, &pass_through, &opts);
+        cmd_run(&args[1..]);
     } else if cmd == "try" {
-        let mut opts = sandbox::TryOptions::default();
-        let mut positional = Vec::new();
-        let mut pass_through = Vec::new();
-        let mut after_delimiter = false;
-
-        let mut i = 1;
-        while i < args.len() {
-            let a = &args[i];
-            if after_delimiter {
-                pass_through.push(a.clone());
-                i += 1;
-                continue;
-            }
-            if a == "--" {
-                after_delimiter = true;
-                i += 1;
-                continue;
-            }
-            if a == "--no-sandbox" || a == "--bare" || a == "--unsandboxed" {
-                opts.no_sandbox = true;
-            } else if a == "--net" || a == "--network" || a == "--share-net" {
-                opts.share_net = true;
-            } else if a == "--rw" || a == "--rw-cwd" || a == "--write-cwd" {
-                opts.rw_cwd = true;
-            } else if a == "--gui" {
-                opts.gui = true;
-            } else if a == "--audio" {
-                opts.audio = true;
-            } else if a == "--allow-unverified" {
-                opts.allow_unverified = true;
-            } else if a == "--noconfirm" || a == "-y" {
-                opts.noconfirm = true;
-            } else if a == "--bin" {
-                if i + 1 < args.len() {
-                    opts.bin = Some(args[i + 1].clone());
-                    i += 1;
-                }
-            } else if let Some(stripped) = a.strip_prefix("--bin=") {
-                opts.bin = Some(stripped.to_string());
-            } else if positional.is_empty() && !a.starts_with('-') {
-                positional.push(a.clone());
-            } else {
-                pass_through.push(a.clone());
-            }
-            i += 1;
-        }
-
-        if positional.is_empty() {
-            eprintln!(
-                "{}",
-                "Error: 'pacpin try' requires a package target."
-                    .red()
-                    .bold()
-            );
-            eprintln!("Usage: pacpin try [options] [repo/]package [arguments...]");
-            eprintln!("Runs native Arch packages in a Bubblewrap container; Flatpak uses its own sandbox.");
-            eprintln!();
-            eprintln!("Options:");
-            eprintln!("  --no-sandbox, --bare   Bypass Bubblewrap containerization and run directly on host");
-            eprintln!("  --net, --network       Share host network access (unshared by default)");
-            eprintln!("  --rw, --write-cwd      Mount current working directory read-write (read-only by default)");
-            eprintln!("  --gui                  Grant X11/Wayland and DRI access for graphical applications");
-            eprintln!("  --audio                Grant /dev/snd access for audio playback");
-            eprintln!("  --bin <name>           Specify exact executable binary name if package provides multiple");
-            eprintln!("  --allow-unverified     Proceed even if repository metadata lacks a SHA256 checksum");
-            eprintln!();
-            eprintln!("Examples:");
-            eprintln!("  pacpin try jq . foo.json");
-            eprintln!("  pacpin try --gui flatpak/org.gnome.Calculator");
-            eprintln!("  pacpin run nix/ripgrep -i 'foo'  # Nix executes on the host");
-            exit(1);
-        }
-
-        let pkg = &positional[0];
-        sandbox::cmd_try(pkg, &pass_through, &opts);
+        cmd_try(&args[1..]);
     } else if cmd == "needrestart" || cmd == "restart-check" {
-        restart::RestartInspector::print_restart_advisory(&[]);
+        restart::RestartInspector::print_restart_advisory(&[], &config.options.privilege_tool);
         exit(0);
     } else if cmd == "delay" {
         if args.len() < 3 || args[2].parse::<u32>().is_err() {
@@ -836,54 +633,26 @@ fn main() {
             eprintln!("Usage: pacpin delay <pkg> <days> (e.g. pacpin delay openssl 3)");
             exit(1);
         }
-        cmd_delay(config, &args[1], args[2].parse::<u32>().unwrap());
+        cmd_delay(&args[1], args[2].parse::<u32>().unwrap());
     } else if cmd == "undelay" {
         if args.len() < 2 {
             eprintln!("{}", "Error: 'pacpin undelay' requires <pkg>.".red());
             eprintln!("Usage: pacpin undelay <pkg>");
             exit(1);
         }
-        cmd_undelay(config, &args[1]);
+        cmd_undelay(&args[1]);
     } else if cmd == "list" {
         cmd_list(&config);
     } else if cmd == "orphans" || cmd == "autoremove" {
         let clean = args.iter().any(|a| a == "-c" || a == "--clean") || cmd == "autoremove";
         let noconfirm = args.iter().any(|a| a == "--noconfirm");
-        cmd_orphans(clean, noconfirm);
+        cmd_orphans(&config, clean, noconfirm);
     } else if cmd == "keep" || cmd == "adopt" {
-        if args.len() < 2 {
-            eprintln!(
-                "{}",
-                "Error: 'pacpin keep' requires at least one package name.".red()
-            );
-            eprintln!("Usage: pacpin keep <pkg1> [pkg2...]");
-            exit(1);
-        }
-        let pkgs = &args[1..];
-        println!(
-            "{} Marking {} package(s) as explicitly installed (sudo pacman -D --asexplicit)...",
-            "::".cyan(),
-            pkgs.len()
-        );
-        let status = Command::new("sudo")
-            .arg("pacman")
-            .arg("-D")
-            .arg("--asexplicit")
-            .args(pkgs)
-            .status();
-        match status {
-            Ok(s) if s.success() => {
-                println!("{}", "✔ Package(s) successfully marked as explicit! They will no longer appear as orphans.".green());
-            }
-            Ok(s) => exit(s.code().unwrap_or(1)),
-            Err(e) => {
-                eprintln!("{}", format!("Failed to run pacman: {}", e).red());
-                exit(1);
-            }
-        }
+        cmd_keep(&config, &args[1..]);
     } else if cmd == "pin" || cmd == "add-pin" || cmd == "add-pins" {
         let mut known_repos = AlpmManager::discover_repos();
         known_repos.push("aur".to_string());
+        known_repos.extend(config.sources.keys().cloned());
 
         match parse_pin_args(&args[1..], &known_repos) {
             Ok((repo, patterns)) => cmd_pin(config, repo, patterns),
@@ -901,7 +670,7 @@ fn main() {
             eprintln!("Usage: pacpin unpin <pattern> (e.g. pacpin unpin 'linux-firmware*')");
             exit(1);
         }
-        cmd_unpin(config, &args[1]);
+        cmd_unpin(&args[1]);
     } else if cmd.starts_with('-') {
         let helper = &config.options.helper;
         let status = if is_command_available(helper) {
@@ -910,7 +679,7 @@ fn main() {
             Command::new("pacman").args(&args).status()
         };
         match status {
-            Ok(s) => exit(s.code().unwrap_or(0)),
+            Ok(s) => exit(s.code().unwrap_or(1)),
             Err(e) => {
                 eprintln!("{}", format!("Failed to run command: {}", e).red());
                 exit(1);
@@ -926,79 +695,16 @@ fn main() {
     }
 }
 
-fn parse_pin_args(
-    pin_args: &[String],
-    known_repos: &[String],
-) -> Result<(String, Vec<String>), String> {
-    let mut file_patterns = Vec::new();
-    let mut positional = Vec::new();
-    let mut i = 0;
-    while i < pin_args.len() {
-        let arg = &pin_args[i];
-        if arg == "-f" || arg == "--file" {
-            if i + 1 >= pin_args.len() {
-                return Err("'-f/--file' requires a file path.".to_string());
-            }
-            let file_path = &pin_args[i + 1];
-            match std::fs::read_to_string(file_path) {
-                Ok(content) => {
-                    for line in content.lines() {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                            file_patterns.push(trimmed.to_string());
-                        }
-                    }
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "Error reading package list file '{}': {}",
-                        file_path, e
-                    ));
-                }
-            }
-            i += 2;
-        } else {
-            positional.push(arg.clone());
-            i += 1;
-        }
-    }
-
-    if positional.is_empty() {
-        Err("'pacpin pin' requires a repository name.".to_string())
-    } else if positional.len() == 1 {
-        if file_patterns.is_empty() {
-            return Err(
-                "'pacpin pin' requires both a repository and at least one package.".to_string(),
-            );
-        }
-        Ok((positional[0].clone(), file_patterns))
-    } else if positional.len() == 2 && file_patterns.is_empty() {
-        if known_repos.iter().any(|r| r == &positional[1])
-            && !known_repos.iter().any(|r| r == &positional[0])
-        {
-            Ok((positional[1].clone(), vec![positional[0].clone()]))
-        } else {
-            Ok((positional[0].clone(), vec![positional[1].clone()]))
-        }
-    } else {
-        let (r, mut p) = if known_repos.iter().any(|r| r == &positional[0]) {
-            (positional[0].clone(), positional[1..].to_vec())
-        } else if known_repos.iter().any(|r| r == positional.last().unwrap()) {
-            let last_idx = positional.len() - 1;
-            (
-                positional[last_idx].clone(),
-                positional[..last_idx].to_vec(),
-            )
-        } else {
-            (positional[0].clone(), positional[1..].to_vec())
-        };
-        p.extend(file_patterns);
-        Ok((r, p))
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clean_flags_preserve_full_cache_wipe() {
+        let args = |parts: &[&str]| parts.iter().map(|part| (*part).to_string()).collect::<Vec<_>>();
+        assert_eq!(super::parse_clean_args(&args(&["-Sc"])), (false, vec![]));
+        assert_eq!(super::parse_clean_args(&args(&["-Scc", "--noconfirm"])), (true, vec!["--noconfirm".to_string()]));
+        assert_eq!(super::parse_clean_args(&args(&["-S", "-c", "-c"])), (true, vec![]));
+        assert_eq!(super::parse_clean_args(&args(&["clean-cache"])), (false, vec![]));
+    }
     use super::*;
 
     #[test]
@@ -1140,6 +846,12 @@ mod tests {
         assert!(is_upgrade_invocation(&to_vec(&["-Suy"])));
         assert!(is_upgrade_invocation(&to_vec(&["-Su"])));
         assert!(is_upgrade_invocation(&to_vec(&["-Sy"])));
+        assert!(is_refresh_only_invocation(&to_vec(&["-Sy", "--noconfirm"])));
+        assert!(is_refresh_only_invocation(&to_vec(&["-Syy"])));
+        assert!(is_refresh_only_invocation(&to_vec(&["-S", "--refresh"])));
+        assert!(!is_refresh_only_invocation(&to_vec(&["-Syu"])));
+        assert!(!is_refresh_only_invocation(&to_vec(&["-Sy", "--sysupgrade"])));
+        assert!(!is_refresh_only_invocation(&to_vec(&["-Sy", "ollama"])));
         assert!(is_upgrade_invocation(&to_vec(&["-Syuu"])));
         assert!(is_upgrade_invocation(&to_vec(&["-S", "-y", "-u"])));
         assert!(is_upgrade_invocation(&to_vec(&["-S", "-u", "-y"])));
@@ -1152,7 +864,7 @@ mod tests {
         // Non-upgrade forms (should not match upgrade)
         assert!(!is_upgrade_invocation(&to_vec(&["-S"])));
         assert!(!is_upgrade_invocation(&to_vec(&["-S", "ripgrep"])));
-        assert!(!is_upgrade_invocation(&to_vec(&["-Syu", "ripgrep"])));
+        assert!(!is_upgrade_invocation(&to_vec(&["-Sy", "ripgrep"])));
         assert!(!is_upgrade_invocation(&to_vec(&["-Ss", "ripgrep"])));
         assert!(!is_upgrade_invocation(&to_vec(&["-S", "-s", "ripgrep"])));
         assert!(!is_upgrade_invocation(&to_vec(&["-Si", "ripgrep"])));
@@ -1180,6 +892,15 @@ mod tests {
             "--assume-installed",
             "foo:1.0"
         ])));
+
+        // Targeted upgrades: explicit targets join the upgrade engine.
+        assert!(is_upgrade_invocation(&to_vec(&["-Syu", "ripgrep"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-Su", "ripgrep"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-S", "-u", "ripgrep"])));
+        assert!(is_upgrade_invocation(&to_vec(&["upgrade", "ripgrep"])));
+        assert!(is_upgrade_invocation(&to_vec(&["up", "extra/ripgrep"])));
+        assert!(is_upgrade_invocation(&to_vec(&["-Syu", "extra/ripgrep"])));
+        assert!(!is_refresh_only_invocation(&to_vec(&["-Syu", "ripgrep"])));
     }
 
     #[test]
@@ -1232,7 +953,8 @@ mod tests {
         let (targets, flags) = parse_pacman_cli_args(&args);
         assert_eq!(targets, vec!["bar"]);
         assert_eq!(flags, args[..7]);
-        assert!(!is_upgrade_invocation(&to_vec(&[
+        // A genuine bare target with -u joins the upgrade engine now.
+        assert!(is_upgrade_invocation(&to_vec(&[
             "-Syu", "--ignore", "linux", "--overwrite", "*",
             "--assume-installed", "foo=1.0", "bar",
         ])));
@@ -1313,9 +1035,10 @@ mod tests {
         assert!(opts.forwarded_flags.is_empty());
 
         // Forwarding unrecognized flags while consuming internal ones
-        let opts = parse_install_flags(&to_vec(&["-yu", "--overwrite", "*", "--cachedir=/tmp"]));
+        let opts = parse_install_flags(&to_vec(&["-yu", "--overwrite", "*", "--cachedir=/tmp", "--no-cache"]));
         assert!(opts.refresh);
         assert!(opts.sysupgrade);
+        assert!(opts.no_cache);
         assert_eq!(opts.forwarded_flags, vec!["--overwrite", "*", "--cachedir=/tmp"]);
     }
 }

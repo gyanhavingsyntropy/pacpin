@@ -41,17 +41,18 @@ pub fn cmd_check(config: &Config, args: &[String]) {
     }
 
     // Spawn external integrations check concurrently with ALPM & AUR resolution unless disabled
-    let ext_handle = if !no_flatpak {
+    let ext_handle = if !repo_only && !aur_only {
         let ext_config = config.clone();
         Some(thread::spawn(move || {
-            let ext_providers = IntegrationsManager::get_active_providers(&ext_config);
+            let mut ext_providers = IntegrationsManager::get_active_providers(&ext_config);
+            if no_flatpak { ext_providers.retain(|p| p.name() != "Flatpak"); }
             IntegrationsManager::check_updates_parallel(&ext_providers)
         }))
     } else {
         None
     };
 
-    let manager = match AlpmManager::with_repo_order(&config.repo_order) {
+    let mut manager = match AlpmManager::with_repo_order(&config.repo_order) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}", format!("Error initializing ALPM: {}", e).red());
@@ -119,7 +120,7 @@ pub fn cmd_check(config: &Config, args: &[String]) {
         } else if no_flatpak {
             "repositories and AUR"
         } else {
-            "repositories, AUR, and Flatpak"
+            "repositories, AUR, configured release sources, and external managers"
         };
         println!(
             "\n{}",
@@ -157,7 +158,15 @@ pub fn cmd_check(config: &Config, args: &[String]) {
             println!("{}", ext.name);
         }
     } else {
-        render_transaction_view(&res, &config.options.helper, &external_updates);
+        let targets: Vec<String> = res.updates.iter().filter_map(|p| p.candidate.as_ref().filter(|c| !c.is_aur).map(|c| format!("{}/{}", c.repo, p.name))).collect();
+        let names = res.updates.iter().map(|p| p.name.clone()).collect();
+        match crate::preview::prepare_native_preview(&mut manager, &targets) {
+            Ok(preview) => { ui::render_transaction_plan(&res, &config.options.helper, &external_updates, Some(ui::PlanDetails { preview: &preview, explicit_names: &names, requested: &[] })); }
+            Err(error) => {
+                eprintln!(":: Native dependency preview unavailable: {error}. Totals below cover listed updates only.");
+                render_transaction_view(&res, &config.options.helper, &external_updates);
+            }
+        }
 
         if config.features.smart_orphans && !orphans.is_empty() {
             let tot_size: i64 = orphans.iter().map(|o| o.isize).sum();

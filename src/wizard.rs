@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::config::{get_config_path, save_config, Config, Features, Options};
+use crate::config::{get_config_path, save_config, save_config_if_unchanged, Config, Features, Options};
 use crate::integrations::{FlatpakProvider, IntegrationProvider, NixProvider, PipxProvider};
 use crate::ui::print_banner;
 use colored::Colorize;
@@ -302,6 +302,7 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
     let enable_integrations = enable_flatpak || enable_nix || enable_pipx;
 
     let config = Config {
+        sources: existing_cfg.as_ref().map(|cfg| cfg.sources.clone()).unwrap_or_default(),
         features: Features {
             pinning: enable_pinning,
             stability_delays: enable_delays,
@@ -310,7 +311,7 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
             vendor_stickiness,
             shell_aliases: enable_aliases,
         },
-        options: Options { helper },
+        options: Options { helper, ..Options::default() },
         repo_order,
         pins,
         exclude,
@@ -320,9 +321,15 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
             nix: enable_nix,
             pipx: enable_pipx,
         },
+        packages: existing_cfg.as_ref().map(|cfg| cfg.packages.clone()).unwrap_or_default(),
     };
 
-    if let Err(e) = save_config(&config) {
+    let saved = if reset {
+        save_config(&config).map_err(|e| e.to_string())
+    } else {
+        save_config_if_unchanged(&existing_cfg.unwrap_or_default(), &config)
+    };
+    if let Err(e) = saved {
         eprintln!("{}", format!("Error saving configuration: {}", e).red());
         return None;
     }
@@ -335,10 +342,12 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
     println!("{}", "✔ Configuration saved successfully!".green().bold());
     println!("  Path: {}", config_path.display().to_string().cyan());
     println!("\nYou're all set! Try running:");
-    println!("  • {} to verify your repository setup", "pin check".bold().cyan());
-    println!("  • {} to perform a full system upgrade", "pin -Syu".bold().cyan());
-    println!("  • {} to manage or inspect orphaned packages", "pin orphans".bold().cyan());
-    println!("  {}", "(Aliases for 'pin' and 'pacpin' have been configured in your shell)\n".dimmed());
+    println!("  • {} to verify your repository setup", "pacpin check".bold().cyan());
+    println!("  • {} to perform a full system upgrade", "pacpin -Syu".bold().cyan());
+    println!("  • {} to manage or inspect orphaned packages", "pacpin orphans".bold().cyan());
+    if config.features.shell_aliases {
+        println!("  {}", "Reload your shell configuration to use the pin alias.\n".dimmed());
+    }
 
     Some(config)
 }

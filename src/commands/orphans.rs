@@ -23,7 +23,7 @@ use crate::db::{AlpmManager, OrphanPackage};
 use crate::orphans::OrphanManager;
 use crate::ui::{self, print_banner};
 
-pub fn cmd_orphans(clean: bool, noconfirm: bool) {
+pub fn cmd_orphans(config: &crate::config::Config, clean: bool, noconfirm: bool) {
     print_banner();
     let manager = match AlpmManager::new() {
         Ok(m) => m,
@@ -56,7 +56,7 @@ pub fn cmd_orphans(clean: bool, noconfirm: bool) {
         };
         let removed = if !selected.is_empty() {
             check_pacman_lock();
-            OrphanManager::execute_removal(&selected)
+            OrphanManager::execute_removal(&selected, &config.options.privilege_tool)
         } else { false };
         let remaining: Vec<OrphanPackage> = orphans
             .iter()
@@ -64,6 +64,7 @@ pub fn cmd_orphans(clean: bool, noconfirm: bool) {
             .cloned()
             .collect();
         OrphanManager::save_known(&remaining);
+        if !selected.is_empty() && !removed { exit(1); }
     } else {
         OrphanManager::save_known(&orphans);
         println!(

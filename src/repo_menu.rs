@@ -38,7 +38,7 @@ impl Drop for TerminalGuard {
 }
 
 pub fn run_repo_menu(initial_repos: &[String]) -> Option<Vec<String>> {
-    if !io::stdin().is_terminal() {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         eprintln!("Interactive repository menu requires a terminal.");
         return None;
     }
@@ -76,7 +76,7 @@ pub fn run_repo_menu(initial_repos: &[String]) -> Option<Vec<String>> {
         let term_width = terminal_size::terminal_size()
             .map(|(w, _)| w.0 as usize)
             .unwrap_or(80);
-        let box_width = term_width.clamp(60, 84);
+        let box_width = term_width.saturating_sub(1).clamp(1, 84);
 
         // Render UI
         let _ = queue!(out, MoveTo(0, 0), Clear(ClearType::All));
@@ -152,6 +152,10 @@ pub fn run_repo_menu(initial_repos: &[String]) -> Option<Vec<String>> {
             } else {
                 match code {
                     // Navigation Up
+                    KeyCode::Home => selected = 0,
+                    KeyCode::End => selected = repos.len().saturating_sub(1),
+                    KeyCode::PageUp => selected = selected.saturating_sub(8),
+                    KeyCode::PageDown => selected = (selected + 8).min(repos.len().saturating_sub(1)),
                     KeyCode::Up | KeyCode::Char('k') => {
                         status_msg = None;
                         if modifiers.contains(KeyModifiers::SHIFT) {
@@ -237,6 +241,11 @@ fn render_menu_ui<W: Write>(
     add_input: &str,
     status_msg: &Option<(String, bool)>,
 ) {
+    let height = terminal_size::terminal_size().map(|(_, h)| h.0 as usize).unwrap_or(24);
+    if box_width < 72 || repos.len() + 14 > height {
+        render_compact(out, repos, selected, box_width, height, adding_mode, add_input, status_msg);
+        return;
+    }
     let inner_width = box_width.saturating_sub(2);
     let border_color = |s: &str| s.cyan().bold();
 
@@ -245,7 +254,7 @@ fn render_menu_ui<W: Write>(
     let _ = queue!(out, Print(border_color(&top)));
 
     // Header Title
-    let title = "BIOS REPOSITORY PRIORITY & SEARCH ORDER";
+    let title = "REPOSITORY PRIORITY & SEARCH ORDER";
     let title_pad = inner_width.saturating_sub(title.len()) / 2;
     let title_line = format!(
         "│{}{}{}│\r\n",
@@ -387,4 +396,38 @@ fn render_menu_ui<W: Write>(
     // Bottom border
     let bottom = format!("└{}┘\r\n", "─".repeat(inner_width));
     let _ = queue!(out, Print(border_color(&bottom)));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_compact<W: Write>(out: &mut W, repos: &[String], selected: usize, width: usize, height: usize, adding: bool, input: &str, status: &Option<(String, bool)>) {
+    let visible = repos.len().min(height.saturating_sub(7)).max(1);
+    let offset = selected.saturating_sub(visible - 1);
+    let mut line = |text: String| { let _ = write!(out, "{}\r\n", crate::ui::truncate_str(&text, width)); };
+    line("Repository priority".into());
+    line("↑↓ select • +/- reorder".into());
+    line("a add • d delete • Home/End".into());
+    for (index, repo) in repos.iter().enumerate().skip(offset).take(visible) {
+        line(format!("{} {}. [{}]", if index == selected { "▶" } else { " " }, index + 1, repo));
+    }
+    line(format!("Selected {}/{} • highest first", selected + 1, repos.len()));
+    line(status.as_ref().map(|(text, _)| text.clone()).unwrap_or_default());
+    line(if adding { format!("Enter adds • Name: {input}") } else { "Enter saves • Esc/q cancels".into() });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn compact_repository_menu_fits_and_reaches_the_last_entry() {
+        let repos: Vec<_> = (0..50).map(|i| format!("repo-{i}")).collect();
+        for width in [24, 32, 40, 80] {
+            let mut out = Vec::new();
+            render_compact(&mut out, &repos, 49, width, 18, false, "", &None);
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.lines().all(|line| crate::ui::str_width(line) <= width));
+            assert!(text.lines().count() <= 18);
+            assert!(text.contains("repo-49"));
+            assert!(text.contains("Enter saves"));
+        }
+    }
 }

@@ -22,7 +22,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrphanPackage {
@@ -284,9 +283,13 @@ impl OrphanManager {
         }
     }
 
-    pub fn execute_removal(selected: &[String]) -> bool {
+    pub fn execute_removal(selected: &[String], privilege_tool: &str) -> bool {
         if selected.is_empty() {
             return true;
+        }
+        if let Some(target) = selected.iter().find(|name| !crate::utils::is_safe_pkg_name(name)) {
+            eprintln!("{}", format!("Refusing unsafe orphan target '{}'.", target).red());
+            return false;
         }
 
         println!(
@@ -295,12 +298,12 @@ impl OrphanManager {
             selected.join(" ").bold()
         );
 
-        let mut args = vec!["pacman", "-Rns", "--noconfirm"];
+        let mut args = vec!["pacman", "-Rns", "--noconfirm", "--"];
         let refs: Vec<&str> = selected.iter().map(|s| s.as_str()).collect();
         args.extend(refs);
 
-        let remove_cmd = format!("sudo {}", args.join(" "));
-        let status = Command::new("sudo").args(&args).status();
+        let remove_cmd = format!("{privilege_tool} {}", args.join(" "));
+        let status = crate::privilege::command(privilege_tool).args(&args).status();
 
         match status {
             Ok(s) if s.success() => {

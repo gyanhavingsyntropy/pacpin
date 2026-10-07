@@ -28,12 +28,15 @@
 11. **Companion Cascade Detection**: Automatically detects split packages (sharing `%BASE%`) and prefix-related dependencies when pinning or installing to prevent version desynchronization.
 12. **Transaction Snapshots & Rollback**: Logs transaction state to `~/.local/state/pacpin/history.jsonl` and enables 1-click package rollback (`pacpin rollback`) directly from the local pacman cache.
 13. **Single-Confirmation**: Prompts once before execution; passes `--noconfirm` to low-level runners (`pacman` and `paru`).
+14. **Upstream Release Sources (experimental)**: GitHub, GitLab, HTTPS catalogs, and local/company catalogs share declarative recipes and the same verified native-install pipeline. Use `pin -S alias/package`; [configuration and trust limits](docs/sources.md).
 
 ---
 
 ## Configuration (`~/.config/pacpin/config.toml`)
 
 ```toml
+repo_order = ["core", "cachyos", "extra", "multilib"]
+
 [features]
 pinning = true
 vendor_stickiness = false
@@ -44,8 +47,8 @@ shell_aliases = true
 
 [options]
 helper = "paru"
-
-repo_order = ["core", "cachyos", "extra", "multilib"]
+# Used by `pin clean` and its AUR helper's pacman invocation.
+privilege_tool = "sudo" # sudo, doas, or pkexec
 
 [pins]
 "amd-ucode" = "core"
@@ -63,7 +66,17 @@ cachyos = ["linux-firmware*"]
 flatpak = true
 nix = false
 pipx = true
+
+[packages]
+pacman = ["core/pacman", "extra/git", "flatpak"]
+aur = ["paru-bin"]
+flatpak_user = ["flathub/org.gnome.Calculator"]
+flatpak_system = []
 ```
+
+`pin capture --dry-run` previews a package list based on explicitly installed packages; `pin capture` saves it to `[packages]` (use `--force` to replace an existing list). `pin rebuild --dry-run` previews a rebuild, and `pin rebuild` installs only missing entries. Existing packages absent from the list are never removed. An already-installed package is not reinstalled by default; `pin rebuild --enforce-repos` explicitly reinstalls repo-qualified entries from their listed repositories. Use `--noconfirm` only after reviewing the plan.
+
+Pacman's local database does not reliably record which repository originally supplied a package. Capture uses a matching pin or a unique current sync-repository match as a best-effort source guess, not proof of original provenance; review all entries, especially unqualified and foreign packages, before using the list elsewhere. Configure the same repositories, an AUR helper, and Flatpak remotes on the new machine first. This rebuild restores package presence, not versions, services, system settings, or dotfiles. Nix and Pipx are not yet part of `[packages]`.
 
 ---
 
@@ -73,7 +86,7 @@ pipx = true
 | Command | Pacman / AUR Equivalent | Description |
 | :--- | :--- | :--- |
 | `pacpin check` (`pin check`, `pin -Qu`) | `pacman -Qu` | Check pending updates and verify active pin protections |
-| `pacpin upgrade` (`pin -Syu`, `pin up`) | `pacman -Syu` | Safe system upgrade with True Resolver (`-y` refresh, `-n` dry-run, `-c` clean orphans) |
+| `pacpin upgrade` (`pin -Syu`, `pin up`) | `pacman -Syu` | Safe system upgrade with True Resolver (`-y` refresh, `-n` dry-run, `-c` clean orphans). Explicit `pin -Syu <pkg...>` targets join the upgrade in their own box, and approval covers the solver-expanded plan (new dependencies, removals) |
 | `pacpin -S [repo/]pkg` (`pin install`) | `pacman -S`, `paru -S` | Install package(s); auto-pins `repo/pkg` with companion cascade (`-y` refresh, `-n` dry-run) |
 | `pacpin -Sp <pkg...>` (`pin -Sp`) | `pacman -Sp` | Natively resolve and print package and missing dependency download URIs via ALPM |
 | `pacpin -Sl [repo...]` (`pin -Sl`) | `pacman -Sl` | List packages in sync repositories with installation status |
@@ -82,6 +95,14 @@ pipx = true
 | `pacpin search <query...>` (`pin -Ss`) | `paru -Ss`, `pacman -Ss` | Search official repositories and the AUR simultaneously |
 | `pacpin info <pkg...>` (`pin -Si`) | `paru -Si`, `pacman -Si` | View package metadata, dependencies, and upstream repository info |
 | `pacpin clean` (`pin -Sc`) | `pacman -Sc`, `paru -Sc` | Clean cached package archives and AUR build directories |
+
+After you confirm an interactive upgrade with sudo, pacpin can download repository packages into pacman's cache while the orphan selector is open. The shared footer shows this download; the selector preserves its complete inventory in scrollback and supports page navigation, Home/End, and one Enter to confirm. pacpin waits for that download-only operation to finish before installing. With pkexec or doas, repository downloads stay in the normal foreground operation. If prefetch fails, the normal upgrade downloads the packages. Selected orphans are removed only after a successful upgrade and a fresh check of the installed package graph.
+
+The final plan summary follows dependency and removal details. Its native counts and sizes include the prepared transaction's additional packages: for example, `41 upgrades + 7 new dependencies`, with no `+ 0` when there are none. Sources and other managers retain unknown sizes rather than appearing to add zero bytes.
+
+`--no-cache` cleans only the native/AUR caches involved in successful manager transactions. Sources remove their temporary workspaces separately. Cleanup reports completion, failure, or a reason for skipping; failed-manager archives remain available for recovery. A requested cleanup failure makes the command fail even when package installation succeeded. Cleanup finishes before restart advice.
+
+Cache removal after installation does not eliminate temporary installation space. pacpin checks estimated native root/cache capacity before downloading and again before installing; source builds also check their final installation destination. Downloads, build scratch, final net growth, and temporary rewrite space are separate requirements. These estimates cannot guarantee space for every snapshot, quota, concurrent writer, or package hook.
 
 ### Declarative Rules & Configuration
 | Command | Description |
@@ -95,6 +116,8 @@ pipx = true
 | `pacpin list` | List active engine features, pins, exclusions, delays, and repo priority |
 | `pacpin reset [-f]` | Reset all configurations, pins, and delays to default (creates automatic timestamped backup) |
 | `pacpin init [--reset]` | Interactive onboarding wizard to configure preferences from scratch |
+| `pacpin capture [-n|--force]` | Save explicitly installed packages and Flatpak apps to `[packages]` (`-n` previews) |
+| `pacpin rebuild [-n|--noconfirm] [--enforce-repos]` | Install missing listed packages without deleting extras; optionally reinstall from declared repositories |
 
 ### System Maintenance & Hygiene
 | Command | Description |
@@ -106,7 +129,7 @@ pipx = true
 ### Power Tools & Sandboxing
 | Command | Description |
 | :--- | :--- |
-| `pacpin try [--no-sandbox] [repo/]pkg [args...]` (`pin run`) | Run native Arch packages in an ephemeral Bubblewrap container (`--no-sandbox` / `--bare` runs on the host) |
+| `pacpin try [--no-sandbox] [repo/]pkg [args...]` (`pin run`) | Run native Arch packages in an ephemeral Bubblewrap container (`--no-sandbox` / `--bare` runs on the host; host execution cannot remap absolute data paths such as `/usr/share` fonts, so data-heavy apps should use sandboxed `try`) |
 | `pacpin history [id]` | View transaction history timeline or inspect full package diff |
 | `pacpin rollback [id] [-n]` | Restore previous package versions from pacman cache |
 
@@ -123,12 +146,20 @@ pipx = true
 ## Building from Source
 
 ### Prerequisites
-Building `pacpin` requires `pacman` / `libalpm` (C libraries and headers), `bubblewrap` (for container sandboxing), and a modern Rust toolchain (Rust 1.85+, Edition 2024 required by `alpm 5.0.2`):
+Building `pacpin` requires `pacman` / `libalpm`, `libarchive` (system libraries and headers), `pkgconf`, and a modern Rust toolchain (Rust 1.85+, Edition 2024 required by `alpm 5.0.2`). `bubblewrap` is required at runtime for container sandboxing. Package extraction links to the system libarchive and uses its native tar/gzip/xz/zstd/bzip2 support; keep this system dependency updated. Separate decompressor commands are no longer used for extraction.
 
 ```bash
 # On Arch Linux / CachyOS
-sudo pacman -S --needed base-devel git rust pacman bubblewrap
+sudo pacman -S --needed base-devel git rust pacman libarchive pkgconf
 ```
+
+Bubblewrap is optional until you use native `pin try` or `pin run --sandbox`.
+It is not installed by `pin init`: on first use, pacpin offers to install it
+through its normal package-install workflow and verifies that isolation works.
+Without an interactive terminal (or with `--noconfirm`), a missing Bubblewrap
+causes a clear error; preinstall it with `pin install bubblewrap`. Pacpin never
+silently falls back to unsandboxed execution. Libarchive is a required shared
+library, not an on-demand tool; Arch's pacman already depends on it.
 
 ### Build & Install
 ```bash

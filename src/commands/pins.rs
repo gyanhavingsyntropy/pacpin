@@ -19,11 +19,82 @@ use std::process::exit;
 
 use colored::Colorize;
 
-use crate::config::{save_config, Config};
+use crate::config::{mutate_config, Config};
 use crate::db::AlpmManager;
 use crate::repo_menu;
 use crate::resolver::ResolverEngine;
 use crate::ui::{print_banner, prompt_multiselect};
+
+pub fn parse_pin_args(
+    pin_args: &[String],
+    known_repos: &[String],
+) -> Result<(String, Vec<String>), String> {
+    let mut file_patterns = Vec::new();
+    let mut positional = Vec::new();
+    let mut i = 0;
+    while i < pin_args.len() {
+        let arg = &pin_args[i];
+        if arg == "-f" || arg == "--file" {
+            if i + 1 >= pin_args.len() {
+                return Err("'-f/--file' requires a file path.".to_string());
+            }
+            let file_path = &pin_args[i + 1];
+            match std::fs::read_to_string(file_path) {
+                Ok(content) => {
+                    for line in content.lines() {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                            file_patterns.push(trimmed.to_string());
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Error reading package list file '{}': {}",
+                        file_path, e
+                    ));
+                }
+            }
+            i += 2;
+        } else {
+            positional.push(arg.clone());
+            i += 1;
+        }
+    }
+
+    if positional.is_empty() {
+        Err("'pacpin pin' requires a repository name.".to_string())
+    } else if positional.len() == 1 {
+        if file_patterns.is_empty() {
+            return Err(
+                "'pacpin pin' requires both a repository and at least one package.".to_string(),
+            );
+        }
+        Ok((positional[0].clone(), file_patterns))
+    } else if positional.len() == 2 && file_patterns.is_empty() {
+        if known_repos.iter().any(|r| r == &positional[1])
+            && !known_repos.iter().any(|r| r == &positional[0])
+        {
+            Ok((positional[1].clone(), vec![positional[0].clone()]))
+        } else {
+            Ok((positional[0].clone(), vec![positional[1].clone()]))
+        }
+    } else {
+        let (r, mut p) = if known_repos.iter().any(|r| r == &positional[0]) {
+            (positional[0].clone(), positional[1..].to_vec())
+        } else if known_repos.iter().any(|r| r == positional.last().unwrap()) {
+            let last_idx = positional.len() - 1;
+            (
+                positional[last_idx].clone(),
+                positional[..last_idx].to_vec(),
+            )
+        } else {
+            (positional[0].clone(), positional[1..].to_vec())
+        };
+        p.extend(file_patterns);
+        Ok((r, p))
+    }
+}
 
 pub fn cmd_list(config: &Config) {
     print_banner();
@@ -186,6 +257,8 @@ pub fn cmd_list(config: &Config) {
         for (name, installed_ver, inst_db, pinned_repo, cand_info, delay_info) in custom_matches {
             let mut status_str = if let Some((repo, version)) = cand_info {
                 format!("➔ [{}] {}", repo, version)
+            } else if config.sources.contains_key(&pinned_repo) {
+                format!("➔ [{}] upstream release source", pinned_repo)
             } else {
                 format!("➔ {}", format!("[{}] NOT FOUND", pinned_repo).red())
             };
@@ -212,7 +285,7 @@ pub fn cmd_list(config: &Config) {
     println!();
 }
 
-pub fn cmd_repos(mut config: Config) {
+pub fn cmd_repos(config: Config) {
     let manager = match AlpmManager::with_repo_order(&config.repo_order) {
         Ok(m) => m,
         Err(e) => {
@@ -222,8 +295,10 @@ pub fn cmd_repos(mut config: Config) {
     };
     let current_repos = manager.repos();
     if let Some(new_order) = repo_menu::run_repo_menu(current_repos) {
-        config.repo_order = new_order.clone();
-        if let Err(e) = save_config(&config) {
+        if let Err(e) = mutate_config(|current| {
+            current.repo_order = new_order.clone();
+            Ok(())
+        }) {
             eprintln!("{}", format!("Failed to save config: {}", e).red());
             exit(1);
         }
@@ -255,7 +330,7 @@ pub fn cmd_repos(mut config: Config) {
     }
 }
 
-pub fn cmd_pin(mut config: Config, repo: String, patterns: Vec<String>) {
+pub fn cmd_pin(config: Config, repo: String, patterns: Vec<String>) {
     print_banner();
 
     let is_valid_repo_name = !repo.is_empty()
@@ -283,6 +358,7 @@ pub fn cmd_pin(mut config: Config, repo: String, patterns: Vec<String>) {
 
     let mut known_repos = manager.repos().to_vec();
     known_repos.push("aur".to_string());
+    known_repos.extend(config.sources.keys().cloned());
     if !known_repos.iter().any(|r| r == &repo) {
         eprintln!(
             "{}",
@@ -308,6 +384,12 @@ pub fn cmd_pin(mut config: Config, repo: String, patterns: Vec<String>) {
     }
 
     for pattern in &patterns {
+        if let Some(source) = config.sources.get(&repo) {
+            if !source.packages.contains_key(pattern) {
+                eprintln!("Error: Source pins require an exact configured package recipe: {repo}/{pattern}");
+                exit(1);
+            }
+        }
         if !crate::utils::is_safe_pattern(pattern) || glob::Pattern::new(pattern).is_err() {
             eprintln!(
                 "{}",
@@ -321,6 +403,7 @@ pub fn cmd_pin(mut config: Config, repo: String, patterns: Vec<String>) {
     let mut all_companions = Vec::new();
     let existing_set: std::collections::HashSet<String> = to_pin.iter().cloned().collect();
     for pat in &patterns {
+        if config.sources.contains_key(&repo) { continue; }
         if !pat.contains('*') && !pat.contains('?') && !pat.contains('[') {
             let companions = manager.find_companions(pat, &repo, &config.pins);
             for c in companions {
@@ -346,11 +429,12 @@ pub fn cmd_pin(mut config: Config, repo: String, patterns: Vec<String>) {
         to_pin.extend(selected);
     }
 
-    for p in &to_pin {
-        config.pins.insert(p.clone(), repo.clone());
-    }
-
-    if let Err(e) = save_config(&config) {
+    if let Err(e) = mutate_config(|current| {
+        for p in &to_pin {
+            current.pins.insert(p.clone(), repo.clone());
+        }
+        Ok(())
+    }) {
         eprintln!("{}", format!("Failed to save config: {}", e).red());
         exit(1);
     }
@@ -380,13 +464,16 @@ pub fn cmd_pin(mut config: Config, repo: String, patterns: Vec<String>) {
     }
 }
 
-pub fn cmd_unpin(mut config: Config, pattern: &str) {
+pub fn cmd_unpin(pattern: &str) {
     print_banner();
-    if config.pins.remove(pattern).is_some() {
-        if let Err(e) = save_config(&config) {
+    let removed = match mutate_config(|current| Ok(current.pins.remove(pattern).is_some())) {
+        Ok(removed) => removed,
+        Err(e) => {
             eprintln!("{}", format!("Failed to save config: {}", e).red());
             exit(1);
         }
+    };
+    if removed {
         println!("{}", format!("✔ Unpinned '{}'.", pattern).green());
     } else {
         println!(
