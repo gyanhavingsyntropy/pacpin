@@ -385,7 +385,7 @@ pub fn render_orphans_summary(orphans: &[crate::db::OrphanPackage]) {
         println!(
             "  {}",
             format!(
-                "▶ Pure Orphans ({} unneeded — {}) [Safe to remove]:",
+                "▶ Pure Orphans ({} unneeded — {}) [pre-selected]:",
                 pure.len(),
                 format_size(pure_size)
             )

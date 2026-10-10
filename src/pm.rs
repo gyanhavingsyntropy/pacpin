@@ -11,6 +11,8 @@ use std::process::{Command, Stdio};
 mod continuation;
 mod workspace;
 mod rebuild;
+mod orphans;
+pub use orphans::remove_orphans;
 pub use rebuild::{validate_rebuild, rebuild_aur};
 pub use continuation::{execute_aur, ensure_independent, continuation_archive_check, AurBuildFailurePermit, AurOperation};
 
@@ -781,6 +783,20 @@ pub fn info(config: &Config, pkg_args: &[String]) -> Result<i32, String> {
 }
 
 /// Cleans package cache via AUR helper or pacman, with support for scoping to native-only or AUR-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheScope { All, Native, Aur }
+
+pub fn cache_scope(extra_args: &[String]) -> Result<CacheScope, String> {
+    let native = extra_args.iter().any(|arg| arg == "--repo");
+    let aur = extra_args.iter().any(|arg| arg == "--aur" || arg == "-a");
+    match (native, aur) {
+        (true, true) => Err("Cache cleanup cannot combine --repo with --aur".into()),
+        (true, false) => Ok(CacheScope::Native),
+        (false, true) => Ok(CacheScope::Aur),
+        (false, false) => Ok(CacheScope::All),
+    }
+}
+
 pub fn clean_scoped(
     config: &Config,
     full: bool,
@@ -793,9 +809,9 @@ pub fn clean_scoped(
     }
     crate::config::validate_privilege_tool(&config.options.privilege_tool)?;
     check_lock()?;
-    let is_aur_only = extra_args.iter().any(|arg| arg == "--aur" || arg == "-a");
+    let is_aur_only = cache_scope(extra_args)? == CacheScope::Aur;
     if !is_aur_only {
-        prune_stale_empty_download_directories(config);
+        prune_download_directories(config, full)?;
     }
     let helper = &config.options.helper;
     let use_helper = !force_native_only && crate::is_command_available(helper);
@@ -825,17 +841,20 @@ pub fn clean_scoped(
     }
     // `pacman -Scc --noconfirm` answers its destructive [y/N] prompt with No.
     // Answer only the known cache-clean questions after pacpin's own approval.
-    if full {
+    let input = if full {
         // Queue the bounded answers before spawning. Writing to a child's
         // pipe after it fails early could terminate pacpin with SIGPIPE,
         // hiding the actual cleanup status and skipping restart advice.
         let input = cache_input(&cache_answers(TransactionJournal::get_cache_dirs().len(), is_aur_only))
             .map_err(|error| format!("Could not prepare cache-clean answers: {error}"))?;
-        cmd.stdin(Stdio::from(std::os::fd::OwnedFd::from(input)));
-    }
-    let status = cmd.status();
+        Stdio::from(std::os::fd::OwnedFd::from(input))
+    } else { Stdio::inherit() };
+    let status = crate::progress::run_with_stdin(&mut cmd, crate::progress::Manager::Cache, "Cleaning package cache", input);
     match status {
-        Ok(s) => Ok(s.code().unwrap_or(1)),
+        Ok(s) => {
+            if s.success() { crate::progress::completed(crate::progress::Manager::Cache); }
+            Ok(s.code().unwrap_or(1))
+        }
         Err(e) => Err(format!("Clean execution failed: {}", e)),
     }
 }
@@ -934,35 +953,55 @@ pub fn transaction_cache_cleanup(config: &Config, requested: bool, native: Optio
     success
 }
 
-fn prune_stale_empty_download_directories(config: &Config) {
-    let Ok(output) = Command::new("pacman-conf").arg("CacheDir").output() else { return; };
-    if !output.status.success() { return; }
+fn prune_download_directories(config: &Config, full: bool) -> Result<(), String> {
+    let output = crate::progress::capture_output(Command::new("pacman-conf").arg("CacheDir"))
+        .map_err(|error| format!("Cannot inspect native cache directories: {error}"))?;
+    if !output.status.success() { return Err("Native cache directory lookup failed".into()); }
+    let mut empty = Vec::new();
     let mut stale = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let now = SystemTime::now();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let cache_dir = std::path::Path::new(line);
-        let Ok(entries) = std::fs::read_dir(cache_dir) else { continue; };
-        for entry in entries.flatten() {
-            if is_stale_download_directory(&entry, now) {
-                stale.push(entry.path());
+        let path = std::path::Path::new(line);
+        if !path.is_absolute() { return Err("Native cache path must be absolute".into()); }
+        let cache_dir = match path.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("Cannot inspect native cache {}: {error}", path.display())),
+        };
+        if !seen.insert(cache_dir.clone()) { continue; }
+        let entries = std::fs::read_dir(&cache_dir).map_err(|error| format!("Cannot scan native cache {}: {error}", cache_dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("Cannot scan native cache: {error}"))?;
+            if !entry.file_name().to_string_lossy().starts_with("download-") || !entry.file_type().is_ok_and(|kind| kind.is_dir()) { continue; }
+            if full && is_stale_download_directory(&entry, now) { stale.push(entry.path()); }
+            else { empty.push(entry.path()); }
+        }
+    }
+    for (paths, recursive) in [(&empty, false), (&stale, true)] {
+        if paths.is_empty() { continue; }
+        check_lock()?;
+        let mut command = crate::privilege::command(&config.options.privilege_tool);
+        if recursive {
+            // Full native cleanup only: canonical cache children, no symlink
+            // traversal or crossing filesystem boundaries. Recent/non-full
+            // directories are handled only by rmdir, which cannot erase files.
+            command.args(["/usr/bin/rm", "-rf", "--one-file-system", "--preserve-root=all"]);
+        } else { command.arg("/usr/bin/rmdir"); }
+        command.arg("--").args(paths);
+        let status = crate::progress::run(&mut command, crate::progress::Manager::Cache, "Clearing download directories", || {})
+            .map_err(|error| format!("Download directory cleanup failed: {error}"))?;
+        if !status.success() { return Err(format!("Download directory cleanup exited with {status}; recent or non-empty directories were preserved where removal was unsafe")); }
+        for path in paths {
+            match path.symlink_metadata() {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+                Err(error) => return Err(format!("Cannot verify download directory cleanup {}: {error}", path.display())),
+                Ok(_) => return Err(format!("Download directory remains after cleanup: {}", path.display())),
             }
+            println!(":: Removed inactive ALPM download directory {}", path.display());
         }
     }
-    if stale.is_empty() { return; }
-    // rmdir cannot remove non-empty directories, and the age/lock checks
-    // prevent us from touching a newly created ALPM download sandbox.
-    let _ = crate::privilege::command(&config.options.privilege_tool)
-        .arg("/usr/bin/rmdir")
-        .arg("--")
-        .args(&stale)
-        .status();
-    for path in stale {
-        if path.exists() {
-            eprintln!(":: Warning: {} remains in the pacman cache; inspect it when no package manager is active. pacman may report a cache scan error.", path.display());
-        } else {
-            println!(":: Removed stale, empty ALPM download directory {}", path.display());
-        }
-    }
+    Ok(())
 }
 
 fn is_stale_download_directory(entry: &std::fs::DirEntry, now: SystemTime) -> bool {
@@ -984,7 +1023,8 @@ fn build_clean_command(config: &Config, full: bool, extra_args: &[String], use_h
         return Err("--sudo is an AUR-helper option; set [options] privilege_tool for pacman fallback".into());
     }
     let flag = if full { "-Scc" } else { "-Sc" };
-    let is_aur_only = extra_args.iter().any(|arg| arg == "--aur" || arg == "-a");
+    let is_aur_only = cache_scope(extra_args)? == CacheScope::Aur;
+    if is_aur_only && !use_helper { return Err("AUR cache cleanup requires an available AUR helper".into()); }
     let mut cmd = if use_helper {
         let mut cmd = Command::new(&config.options.helper);
         cmd.arg(flag);
@@ -1005,7 +1045,7 @@ fn build_clean_command(config: &Config, full: bool, extra_args: &[String], use_h
         cmd.arg("/usr/bin/pacman").arg(flag);
         cmd
     };
-    cmd.args(extra_args.iter().filter(|arg| arg.as_str() != "--noconfirm"));
+    cmd.args(extra_args.iter().filter(|arg| arg.as_str() != "--noconfirm" && (use_helper || arg.as_str() != "--repo")));
     if !full { cmd.arg("--noconfirm"); }
     Ok(cmd)
 }
@@ -1013,6 +1053,17 @@ fn build_clean_command(config: &Config, full: bool, extra_args: &[String], use_h
 #[cfg(test)]
 mod clean_tests {
     use super::*;
+    #[test]
+    fn cache_scope_is_explicit_and_native_fallback_consumes_helper_selector() {
+        assert_eq!(cache_scope(&[]).unwrap(), CacheScope::All);
+        assert_eq!(cache_scope(&["--repo".into()]).unwrap(), CacheScope::Native);
+        assert_eq!(cache_scope(&["-a".into()]).unwrap(), CacheScope::Aur);
+        assert!(cache_scope(&["--repo".into(), "--aur".into()]).is_err());
+        let config = Config::default();
+        let native = build_clean_command(&config, true, &["--repo".into()], false).unwrap();
+        assert_eq!(argv(&native), ["sudo", "/usr/bin/pacman", "-Scc"]);
+        assert!(build_clean_command(&config, true, &["--aur".into()], false).is_err());
+    }
     #[test]
     fn aur_privilege_override_is_explicit_and_helper_specific() {
         assert_eq!(helper_privilege_args("/usr/bin/paru", "pkexec").unwrap(), ["--sudo", "pkexec"]);

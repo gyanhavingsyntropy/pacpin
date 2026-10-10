@@ -100,9 +100,15 @@ After you confirm an interactive upgrade with sudo, pacpin can download reposito
 
 Confirmed orphan cleanup is recorded separately from the known-package inventory. If an upgrade fails or removal cannot finish, a later full upgrade offers cleanup again, even with no package updates and an unchanged known list. Stored selections are a reminder, not permission to remove packages without a new review. Declining the new review stops repeated prompts for that unchanged list. Read-only orphan listings, scoped upgrades and `--noconfirm` without explicit autoremove preserve pending cleanup. Older state gets one fresh review when this tracking is first introduced. `pin orphans -c` also resolves pending cleanup.
 
+Removal checks the entire selection against the installed dependency graph. Dependencies needed by a retained package, including an unchecked optional orphan, are kept with an explanation. Removal is limited to the confirmed targets; unchecked dependencies remain installed. Orphan removal and cache cleanup appear as separate footer steps; completed upgrades remain checked while cleanup runs. `--keep-going` does not enable orphan removal after an upgrade failure.
+
 The final plan summary follows dependency and removal details. Its native counts and sizes include the prepared transaction's additional packages: for example, `41 upgrades + 7 new dependencies`, with no `+ 0` when there are none. Sources and other managers retain unknown sizes rather than appearing to add zero bytes.
 
 `--no-cache` cleans only the native/AUR caches involved in successful manager transactions. Sources remove their temporary workspaces separately. Cleanup reports completion, failure, or a reason for skipping; failed-manager archives remain available for recovery. A requested cleanup failure makes the command fail even when package installation succeeded. Cleanup finishes before restart advice.
+
+Full native cleanup also clears inactive ALPM `download-*` directories inside configured native caches, including sandbox-owned partial downloads. The database must be unlocked and nonempty directories must be at least two minutes old. Recent nonempty downloads and partial (`-Sc`) cleanup preserve their contents and report incomplete cleanup. Symlink targets and other filesystems are preserved; AUR-only cleanup never scans native caches.
+
+Use `pin clean -Scc --repo` for native caches or `pin clean -Scc --aur` for AUR caches. Both scopes exclude enabled integration cleanups, including in dry runs. The two selectors cannot be combined; AUR cache cleanup requires an available helper.
 
 ### Choose upgrade managers and temporary storage
 

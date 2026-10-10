@@ -253,15 +253,17 @@ pub fn cmd_upgrade(
                     exit(1);
                 }
             }
-            let removed = OrphanManager::execute_removal(&selected_orphans, &config.options.privilege_tool);
+            let result = OrphanManager::execute_removal(&selected_orphans, &config.options.privilege_tool);
+            let removal_ok = result.is_ok();
+            let removed = result.unwrap_or_else(|error| { eprintln!(":: Warning: {error}"); Vec::new() });
             let remaining: Vec<OrphanPackage> = orphans
                 .iter()
-                .filter(|o| !removed || !selected_orphans.contains(&o.name))
+                .filter(|o| !removed.contains(&o.name))
                 .cloned()
                 .collect();
             OrphanManager::save_known(&remaining);
             let recorded = OrphanManager::finish_review(&remaining);
-            if !removed || !recorded { exit(1); }
+            if !removal_ok || !recorded { exit(1); }
         } else if scope.includes_native() && !dry_run && OrphanManager::load_known().is_none() {
             OrphanManager::save_known(&orphans);
         }
@@ -514,7 +516,7 @@ pub fn cmd_upgrade(
             println!("\n{}", "Dry-Run: Orphan removal only if --autoremove is selected and upgrade succeeds:".bold());
             println!(
                 "  ➔ {}\n",
-                format!("{} pacman -Rns --noconfirm {}", config.options.privilege_tool, automatic_orphans.join(" ")).cyan()
+                format!("{} pacman -Rn --noconfirm -- {}", config.options.privilege_tool, automatic_orphans.join(" ")).cyan()
             );
         }
         return;
@@ -890,11 +892,12 @@ pub fn cmd_upgrade(
                 if safe_selection.len() != selected_orphans.len() {
                     eprintln!("{}", ":: Some projected orphans are still required or were already removed; skipping those selections.".yellow());
                 }
-                let removed = OrphanManager::execute_removal(&safe_selection, &config.options.privilege_tool);
-                if !safe_selection.is_empty() && !removed { all_success = false; }
+                let result = OrphanManager::execute_removal(&safe_selection, &config.options.privilege_tool);
+                all_success &= result.is_ok();
+                let removed = result.unwrap_or_else(|error| { eprintln!(":: Warning: {error}"); Vec::new() });
                 let remaining: Vec<OrphanPackage> = actual_orphans
                     .into_iter()
-                    .filter(|o| !removed || !safe_selection.contains(&o.name))
+                    .filter(|o| !removed.contains(&o.name))
                     .collect();
                 OrphanManager::save_known(&remaining);
                 all_success &= OrphanManager::finish_review(&remaining);

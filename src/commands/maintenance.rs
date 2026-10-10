@@ -24,8 +24,12 @@ use crate::integrations::IntegrationsManager;
 use crate::pm;
 
 pub fn cmd_clean(config: &Config, full: bool, extra_args: &[String]) {
-    let aur_only = extra_args.iter().any(|s| s == "--aur" || s == "-a");
-    let providers = if aur_only { Vec::new() } else { IntegrationsManager::get_active_providers(config) };
+    let cache_scope = match pm::cache_scope(extra_args) {
+        Ok(scope) => scope,
+        Err(error) => { eprintln!("Error: {error}"); exit(2); }
+    };
+    let aur_only = cache_scope == pm::CacheScope::Aur;
+    let providers = if cache_scope == pm::CacheScope::All { IntegrationsManager::get_active_providers(config) } else { Vec::new() };
     if extra_args.iter().any(|s| s == "--dry-run" || s == "-n") {
         match pm::clean_preview(config, full, extra_args) {
             Ok(command) => println!(":: Dry-run cache cleanup: {command}"),
@@ -43,7 +47,7 @@ pub fn cmd_clean(config: &Config, full: bool, extra_args: &[String]) {
             exit(1);
         }
         let scope = if full { "ALL cached packages (including installed versions)" } else { "unused cached packages" };
-        print!(":: Remove {scope}{}? [y/N] ", if aur_only { " from AUR" } else if providers.iter().any(|p| p.supports_clean()) { " and clean enabled integrations" } else { "" });
+        print!(":: Remove {scope}{}? [y/N] ", if aur_only { " from AUR" } else if cache_scope == pm::CacheScope::Native { " from native repositories" } else if providers.iter().any(|p| p.supports_clean()) { " and clean enabled integrations" } else { "" });
         let _ = io::stdout().flush();
         let mut answer = String::new();
         if io::stdin().read_line(&mut answer).is_err() || !answer.trim().eq_ignore_ascii_case("y") {

@@ -56,6 +56,8 @@ pub enum Manager {
     Nix,
     Pipx,
     Hooks,
+    Orphans,
+    Cache,
 }
 impl Manager {
     fn label(self) -> &'static str {
@@ -67,6 +69,17 @@ impl Manager {
             Self::Nix => "Nix",
             Self::Pipx => "Pipx",
             Self::Hooks => "Hooks",
+            Self::Orphans => "Orphans",
+            Self::Cache => "Cache",
+        }
+    }
+
+    fn completion(self) -> &'static str {
+        match self {
+            Self::Orphans => "Removal complete",
+            Self::Cache => "Cleanup complete",
+            Self::Hooks => "Hooks complete",
+            _ => "Upgrade complete",
         }
     }
 }
@@ -240,6 +253,18 @@ fn phase_text(manager: Manager, text: &str, previous: &str) -> String {
     if lower.contains("[y/n]") || lower.contains("[y/n") || lower.contains("proceed with") { return "Awaiting confirmation".into(); }
     if lower.starts_with("error:") || lower.contains("failed") { return "Operation failed".into(); }
     let stage = |phase: &str| phase_with_metrics(manager, &clean, phase);
+    if manager == Manager::Orphans {
+        if lower.contains("checking dependencies") { return "Checking dependencies".into(); }
+        if lower.contains("removing") || lower.contains("processing package changes") { return stage("Removing packages"); }
+        if lower.contains("hooks") { return "Running removal hooks".into(); }
+        return previous.into();
+    }
+    if manager == Manager::Cache {
+        if lower.contains("unused repositories") { return "Cleaning repository metadata".into(); }
+        if lower.contains("download") && lower.contains("director") { return "Clearing download leftovers".into(); }
+        if lower.contains("removing all files") || lower.contains("cleaning") { return "Cleaning package cache".into(); }
+        return previous.into();
+    }
     if lower.contains("dkms") { return stage("Building kernel modules"); }
     if lower.contains("post-transaction") || lower.contains("hooks") { return stage("Running post-install hooks"); }
     if lower.contains("resolving dependencies") || lower.contains("conflicting packages") { return stage("Resolving dependencies"); }
@@ -256,7 +281,7 @@ fn phase_text(manager: Manager, text: &str, previous: &str) -> String {
 }
 
 fn phase_with_metrics(manager: Manager, text: &str, phase: &str) -> String {
-    if !matches!(manager, Manager::Native | Manager::Aur) { return phase.into(); }
+    if !matches!(manager, Manager::Native | Manager::Aur | Manager::Orphans) { return phase.into(); }
     let mut metrics = Vec::new();
     if let Some(counter) = text.trim_start().strip_prefix('(').and_then(|line| line.split_once(')').map(|(counter, _)| counter.trim())) {
         if counter.split_once('/').is_some_and(|(done, total)| done.trim().parse::<u64>().is_ok() && total.trim().parse::<u64>().is_ok()) {
@@ -396,7 +421,7 @@ impl Footer {
         write!(out, "\x1b7\x1b[{row};1H\x1b[0m\x1b[2K{}", "─".repeat(width))?;
         let mut current_row = row + 1;
         for manager in COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&m| m != self.manager) {
-            let text = format!("{}: ✔ Upgrade complete", manager.label());
+            let text = format!("{}: ✔ {}", manager.label(), manager.completion());
             write!(out, "\x1b[{current_row};1H\x1b[2K{}", crate::ui::truncate_str(&text, width))?;
             current_row += 1;
         }
@@ -444,6 +469,7 @@ struct Observer {
     escape: u8,
     ready: bool,
     latest: String,
+    interrupted: bool,
 }
 impl Observer {
     fn feed(&mut self, bytes: &[u8], on_ready: &mut impl FnMut()) {
@@ -486,6 +512,7 @@ impl Observer {
                 b'\r' | b'\n' => {
                     let line = String::from_utf8_lossy(&self.line).trim().to_owned();
                     if !line.is_empty() {
+                        self.interrupted |= line == "Interrupt signal received";
                         on_line(&line);
                         if !self.ready && downloads_finished(&line) {
                             self.ready = true;
@@ -572,14 +599,34 @@ pub fn run_observed(
     command: &mut Command,
     manager: Manager,
     label: &str,
+    on_ready: impl FnMut(),
+    on_line: impl FnMut(&str),
+) -> io::Result<ExitStatus> {
+    run_observed_with_stdin(command, manager, label, on_ready, on_line, None)
+}
+
+/// Preserve explicitly prepared input (e.g. approved cache-clean answers)
+/// while sharing terminal ownership, output relay and child tracking.
+pub fn run_with_stdin(command: &mut Command, manager: Manager, label: &str, stdin: Stdio) -> io::Result<ExitStatus> {
+    run_observed_with_stdin(command, manager, label, || {}, |_| {}, Some(stdin))
+}
+
+fn run_observed_with_stdin(
+    command: &mut Command,
+    manager: Manager,
+    label: &str,
     mut on_ready: impl FnMut(),
     mut on_line: impl FnMut(&str),
+    stdin: Option<Stdio>,
 ) -> io::Result<ExitStatus> {
     crate::sandbox::init_signal_handlers();
+    ensure_not_terminating()?;
     // A later operation for the same manager is pending again (e.g. an ABI
     // rebuild hook after an AUR upgrade). Retain only other completed managers.
     COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&done| done != manager);
     let interactive = interactive();
+    let preset_input = stdin.is_some();
+    if let Some(stdin) = stdin { command.stdin(stdin); }
     // Pacman's stage names are observed to avoid competing with its downloads.
     command.env("LC_ALL", "C");
     let mut footer = None;
@@ -609,8 +656,8 @@ pub fn run_observed(
         let slave = unsafe { File::from_raw_fd(slave) };
         // Keep PTY newline processing: sudo can temporarily put the inherited
         // terminal in raw mode, so relayed output must already contain CRLF.
+        if !preset_input { command.stdin(Stdio::inherit()); }
         command
-            .stdin(Stdio::inherit())
             .stdout(Stdio::from(slave.try_clone()?))
             .stderr(Stdio::from(slave));
         read_fd = master.as_raw_fd();
@@ -631,7 +678,7 @@ pub fn run_observed(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let mut phase = if matches!(command.get_program().to_str(), Some("sudo" | "pkexec" | "doas")) { "Authorizing package operation".to_string() } else { label.to_string() };
+    let mut phase = if !matches!(manager, Manager::Orphans | Manager::Cache) && matches!(command.get_program().to_str(), Some("sudo" | "pkexec" | "doas")) { "Authorizing package operation".to_string() } else { label.to_string() };
     let mut observer = Observer {
         latest: label.into(),
         ..Default::default()
@@ -680,15 +727,29 @@ pub fn run_observed(
         }
     }
     let status = child.0.wait()?;
+    if observer.interrupted && matches!(manager, Manager::Native | Manager::Aur | Manager::Sources | Manager::Orphans | Manager::Cache) {
+        crate::sandbox::interrupt();
+    }
+    ensure_not_terminating()?;
     if !observer.line.is_empty() {
         on_line(&String::from_utf8_lossy(&observer.line));
     }
     Ok(status)
 }
 
+fn ensure_not_terminating() -> io::Result<()> {
+    // A manager may finish successfully while SIGINT interrupts its hook.
+    // The signal handler is still cleaning up; do not race it by accepting
+    // that status or starting another operation.
+    if crate::sandbox::is_terminating() {
+        crate::sandbox::interrupt()
+    } else { Ok(()) }
+}
+
 /// Bounded read-only tool capture with the same child tracking as foreground
 /// operations. Drain both pipes concurrently even after the capture limit.
 pub fn capture_output(command: &mut Command) -> io::Result<std::process::Output> {
+    ensure_not_terminating()?;
     fn read_bounded(mut stream: impl Read) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         let mut buffer = [0u8; 4096];
@@ -710,6 +771,7 @@ pub fn capture_output(command: &mut Command) -> io::Result<std::process::Output>
     if status.is_err() { let _ = child.0.kill(); let _ = child.0.wait(); }
     let stdout = output.join().map_err(|_| io::Error::other("Output reader failed"))??;
     let stderr = errors.join().map_err(|_| io::Error::other("Error reader failed"))??;
+    ensure_not_terminating()?;
     Ok(std::process::Output { status: status?, stdout, stderr })
 }
 
@@ -729,7 +791,9 @@ impl BackgroundCommand {
     }
 
     fn wait_with_progress(&mut self) -> io::Result<ExitStatus> {
+        ensure_not_terminating()?;
         if let Some(status) = self.child.0.try_wait()? {
+            ensure_not_terminating()?;
             return Ok(status);
         }
         for line in crate::ui::wrap_field(":: Waiting for repository downloads to finish...", "", "  ", crate::ui::get_terminal_width()) {
@@ -745,6 +809,7 @@ impl BackgroundCommand {
         };
         loop {
             if let Some(status) = self.child.0.try_wait()? {
+                ensure_not_terminating()?;
                 return Ok(status);
             }
             let display_failed = footer.as_mut().is_some_and(|display| {
@@ -768,6 +833,7 @@ impl Drop for BackgroundCommand {
     }
 }
 pub fn start_background(command: &mut Command) -> io::Result<BackgroundCommand> {
+    ensure_not_terminating()?;
     let (mut reader, writer) = UnixStream::pair()?;
     command.env("LC_ALL", "C").stdin(Stdio::null())
         .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer.try_clone()?)))
@@ -850,6 +916,37 @@ pub fn wait_for_sources(handle: &std::thread::JoinHandle<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_interruption_marker_is_exact_and_survives_fragmented_output() {
+        let mut observer = Observer::default();
+        observer.feed(b"hook says: Interrupt signal received\n", &mut || {});
+        assert!(!observer.interrupted);
+        observer.feed(b"\x1b[31mInterrupt signal ", &mut || {});
+        observer.feed(b"received\x1b[0m\r\n", &mut || {});
+        assert!(observer.interrupted);
+    }
+    #[test]
+    fn housekeeping_phases_and_completion_describe_actual_operations() {
+        assert_eq!(phase_text(Manager::Orphans, "checking dependencies...", "Starting"), "Checking dependencies");
+        assert_eq!(phase_text(Manager::Orphans, "(2/6) removing ninja [###] 100%", "Starting"), "Removing packages (2/6, 100%)");
+        assert_eq!(phase_text(Manager::Orphans, "[sudo] password for user:", "Starting"), "Awaiting authorization");
+        assert_eq!(phase_text(Manager::Cache, "Do you want to remove ALL files from cache? [y/N]", "Starting"), "Awaiting confirmation");
+        assert_eq!(phase_text(Manager::Cache, "removing all files from cache...", "Starting"), "Cleaning package cache");
+        assert_eq!(phase_text(Manager::Cache, "error: could not remove directory", "Starting"), "Operation failed");
+        assert_eq!(Manager::Orphans.completion(), "Removal complete");
+        assert_eq!(Manager::Cache.completion(), "Cleanup complete");
+    }
+
+    #[test]
+    fn prepared_cache_input_survives_shared_execution_and_real_failure_status() {
+        let _guard = crate::sandbox::CHILD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::io::Write;
+        let (input, mut output) = UnixStream::pair().unwrap();
+        output.write_all(b"y\nn\n").unwrap();
+        output.shutdown(std::net::Shutdown::Write).unwrap();
+        let status = run_with_stdin(Command::new("/bin/sh").args(["-c", "read first; read second; test \"$first:$second\" = y:n || exit 99; exit 7"]), Manager::Cache, "Cleaning package cache", Stdio::from(std::os::fd::OwnedFd::from(input))).unwrap();
+        assert_eq!(status.code(), Some(7));
+    }
     #[test]
     fn observed_lines_preserve_split_colored_failure_markers() {
         let mut observer = Observer::default();

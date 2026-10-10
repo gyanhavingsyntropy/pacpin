@@ -89,7 +89,7 @@ package() {
         remember_inventory()
         pending.write_text('["pacpin-ui-orphan"]')
         fail_sudo = helpers / "sudo"
-        fail_sudo.write_text('#!/bin/sh\nif [ "$1" = pacman ] && [ "$2" = -Rns ]; then echo "Injected orphan removal failure" >&2; exit 7; fi\nexec /usr/bin/sudo "$@"\n')
+        fail_sudo.write_text('#!/bin/sh\nif [ "$1" = pacman ] && [ "$2" = -Rn ]; then echo "Injected orphan removal failure" >&2; exit 7; fi\nexec /usr/bin/sudo "$@"\n')
         fail_sudo.chmod(0o755)
         original_path = self.env["PATH"]
         self.env["PATH"] = f"{helpers}:{original_path}"

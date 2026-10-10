@@ -59,18 +59,20 @@ pub fn cmd_orphans(config: &crate::config::Config, clean: bool, noconfirm: bool)
             eprintln!(":: {error}; cleanup aborted before removal.");
             exit(1);
         }
-        let removed = if !selected.is_empty() {
+        let result = if !selected.is_empty() {
             check_pacman_lock();
             OrphanManager::execute_removal(&selected, &config.options.privilege_tool)
-        } else { false };
+        } else { Ok(Vec::new()) };
+        let removal_ok = result.is_ok();
+        let removed = result.unwrap_or_else(|error| { eprintln!(":: Warning: {error}"); Vec::new() });
         let remaining: Vec<OrphanPackage> = orphans
             .iter()
-            .filter(|o| !removed || !selected.contains(&o.name))
+            .filter(|o| !removed.contains(&o.name))
             .cloned()
             .collect();
         OrphanManager::save_known(&remaining);
         let recorded = OrphanManager::finish_review(&remaining);
-        if (!selected.is_empty() && !removed) || !recorded { exit(1); }
+        if !removal_ok || !recorded { exit(1); }
     } else {
         OrphanManager::save_known(&orphans);
         println!(

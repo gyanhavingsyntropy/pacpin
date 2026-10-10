@@ -368,13 +368,46 @@ impl OrphanManager {
         }
     }
 
-    pub fn execute_removal(selected: &[String], privilege_tool: &str) -> bool {
+    /// Retain providers needed by packages outside the removal set, including
+    /// their transitive dependencies. ALPM owns version/provides semantics.
+    fn safe_selection(handle: &Alpm, selected: &[String]) -> Result<Vec<String>, String> {
+        let installed = handle.localdb().pkgs().iter().collect::<Vec<_>>();
+        let mut safe = selected.iter().filter(|name| installed.iter().any(|pkg| pkg.name() == name.as_str()))
+            .cloned().collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        safe.retain(|name| seen.insert(name.clone()));
+        loop {
+            let removing = installed.iter().filter(|pkg| safe.iter().any(|name| name == pkg.name())).copied().collect::<Vec<_>>();
+            let missing = handle.check_deps(installed.iter(), removing.iter(), alpm::AlpmListMut::<&alpm::Pkg>::new(), true);
+            if missing.is_empty() { return Ok(safe); }
+            let mut retained = Vec::new();
+            for dependency in missing.iter() {
+                let Some(provider) = dependency.causing_pkg().filter(|name| safe.iter().any(|selected| selected == name)) else {
+                    return Err(format!("Cannot safely prepare orphan removal: {} requires {}", dependency.target(), dependency.depend()));
+                };
+                for line in crate::ui::wrap_field(&format!(":: Keeping {provider}: required by retained {}", dependency.target()), "", "  ", crate::ui::get_terminal_width()) {
+                    println!("{line}");
+                }
+                retained.push(provider.to_owned());
+            }
+            safe.retain(|name| !retained.contains(name));
+        }
+    }
+
+    pub fn execute_removal(selected: &[String], privilege_tool: &str) -> Result<Vec<String>, String> {
         if selected.is_empty() {
-            return true;
+            return Ok(Vec::new());
         }
         if let Some(target) = selected.iter().find(|name| !crate::utils::is_safe_pkg_name(name)) {
-            eprintln!("{}", format!("Refusing unsafe orphan target '{}'.", target).red());
-            return false;
+            return Err(format!("Refusing unsafe orphan target '{target}'"));
+        }
+
+        let manager = crate::db::AlpmManager::new().map_err(|error| format!("Cannot recheck orphan dependencies: {error}"))?;
+        let selected = Self::safe_selection(manager.handle(), selected)?;
+        Self::record_selection(&selected)?;
+        if selected.is_empty() {
+            println!(":: No selected orphans can be removed without removing a retained package.");
+            return Ok(selected);
         }
 
         println!(
@@ -383,56 +416,50 @@ impl OrphanManager {
             selected.join(" ").bold()
         );
 
-        let mut args = vec!["pacman", "-Rns", "--noconfirm", "--"];
-        let refs: Vec<&str> = selected.iter().map(|s| s.as_str()).collect();
-        args.extend(refs);
-
-        let remove_cmd = format!("{privilege_tool} {}", args.join(" "));
-        let status = crate::privilege::command(privilege_tool).args(&args).status();
-
-        match status {
-            Ok(s) if s.success() => {
-                let tx_packages: Vec<serde_json::Value> = selected
-                    .iter()
-                    .map(|name| serde_json::json!({ "name": name, "removed": true }))
-                    .collect();
-                let _ = TransactionJournal::record_transaction(
-                    "remove_orphans",
-                    tx_packages,
-                    &remove_cmd,
-                );
-                println!(
-                    "\n{}",
-                    format!(
-                        "✔ Removed {} orphaned package(s) successfully.",
-                        selected.len()
-                    )
-                    .green()
-                );
-                true
-            }
-            Ok(s) => {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "Warning: Orphan removal exited with status code {}.",
-                        s.code().unwrap_or(1)
-                    )
-                    .yellow()
-                );
-                false
-            }
-            Err(e) => {
-                eprintln!("{}", format!("Failed to run sudo pacman: {}", e).red());
-                false
-            }
-        }
+        let remove_cmd = format!("{privilege_tool} pacman -Rn --noconfirm -- {}", selected.join(" "));
+        crate::pm::remove_orphans(&selected, privilege_tool)?;
+        let tx_packages: Vec<serde_json::Value> = selected
+            .iter()
+            .map(|name| serde_json::json!({ "name": name, "removed": true }))
+            .collect();
+        let _ = TransactionJournal::record_transaction("remove_orphans", tx_packages, &remove_cmd);
+        println!("\n{}", format!("✔ Removed {} orphaned package(s) successfully.", selected.len()).green());
+        Ok(selected)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removal_keeps_dependencies_of_retained_optional_parent_and_their_dependencies() {
+        use crate::db::test_support::{AlpmFixture, FixturePackage as P};
+        let fixture = AlpmFixture::new(&[
+            P::with_depends("evince", "1-1", &["gspell>=2", "libsynctex"]),
+            P::with_depends("gspell", "2-1", &["spell-backend"]),
+            P::new("libsynctex", "1-1"), P::new("spell-backend", "1-1"), P::new("ninja", "1-1"),
+        ], &[]);
+        let names = ["gspell", "libsynctex", "spell-backend", "ninja"].map(str::to_owned);
+        assert_eq!(OrphanManager::safe_selection(fixture.manager.handle(), &names).unwrap(), ["ninja"]);
+        let all = ["evince", "gspell", "libsynctex", "spell-backend", "ninja"].map(str::to_owned);
+        assert_eq!(OrphanManager::safe_selection(fixture.manager.handle(), &all).unwrap(), all);
+    }
+
+    #[test]
+    fn removal_respects_versioned_virtual_providers_and_remaining_provider() {
+        use crate::db::test_support::{AlpmFixture, FixturePackage as P};
+        let mut provider = P::new("virtual-spell", "1-1");
+        provider.provides = &["gspell=2"];
+        let fixture = AlpmFixture::new(&[P::with_depends("evince", "1-1", &["gspell>=2"]), provider, P::new("gspell", "2-1")], &[]);
+        assert_eq!(OrphanManager::safe_selection(fixture.manager.handle(), &["gspell".into()]).unwrap(), ["gspell"]);
+        let safe = OrphanManager::safe_selection(fixture.manager.handle(), &["gspell".into(), "virtual-spell".into()]).unwrap();
+        assert_eq!(safe.len(), 1, "one provider can be removed when the other is retained");
+        let mut too_old = P::new("old-spell", "1-1");
+        too_old.provides = &["gspell=1"];
+        let fixture = AlpmFixture::new(&[P::with_depends("evince", "1-1", &["gspell>=2"]), too_old, P::new("gspell", "2-1")], &[]);
+        assert!(OrphanManager::safe_selection(fixture.manager.handle(), &["gspell".into()]).unwrap().is_empty());
+    }
 
     #[test]
     fn test_orphan_is_pure() {

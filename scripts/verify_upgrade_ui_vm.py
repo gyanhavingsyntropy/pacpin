@@ -222,7 +222,7 @@ package() {{
                 path.unlink()
         run("sudo", "-n", "pacman", "-Sy", "--noconfirm")
 
-    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello", orphan_choice=None, expect_no_orphan_prompt=False):
+    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello", orphan_choice=None, expect_no_orphan_prompt=False, orphans=None, cache=None, cancel_manager=None, completed_before_cache=None, cancel_marker=None):
         result = self.root / f"{name}.status"
         result.unlink(missing_ok=True)
         raw = self.root / f"{name}.raw.txt"
@@ -271,7 +271,11 @@ package() {{
                 self.rc("send-text", "--stdin", input="y\n")
                 confirmed = True
             if orphan_choice is not None and selection_started is None and "Showing " in screen and "Enter confirms" in screen:
-                self.rc("send-text", "--stdin", input=orphan_choice)
+                if isinstance(orphan_choice, str):
+                    self.rc("send-text", "--stdin", input=orphan_choice)
+                else:
+                    for key in orphan_choice:
+                        self.rc("send-key", key)
                 selection_started = time.monotonic()
             if orphan_choice is not None and selection_started and not selection_enter and time.monotonic() - selection_started > 0.3:
                 self.rc("send-key", "enter")
@@ -300,8 +304,20 @@ package() {{
             if cancel and not cancelled and "Sources:" in screen and "MiB" in screen:
                 self.rc("send-key", "ctrl+c")
                 cancelled = True
+            if cancel_manager and not cancelled and re.search(rf"(?:^|\n){cancel_manager}: (?!✔)", screen) and (cancel_marker is None or cancel_marker in screen):
+                if cancel_marker and not (self.root / "db/db.lck").exists():
+                    raise AssertionError("Cancellation fixture did not hold the ALPM database lock")
+                self.rc("send-key", "ctrl+c")
+                cancelled = True
             time.sleep(0.08)
-        all_text = self.rc("get-text", "--extent", "all")
+        # The status file is independent of Kitty's display event loop.
+        # Wait for its trailing output to render before judging scrollback.
+        render_deadline = time.monotonic() + 2
+        while True:
+            all_text = self.rc("get-text", "--extent", "all")
+            if "PACPIN_AFTER_TRANSACTION" in all_text or time.monotonic() >= render_deadline:
+                break
+            time.sleep(.05)
         (self.root / f"{name}.screen.txt").write_text(all_text)
         (self.root / f"{name}.frames.json").write_text(json.dumps(snapshots))
         status = int(result.read_text())
@@ -328,6 +344,14 @@ package() {{
             failures.append("Native shown although it was never invoked")
         if any("Finished; waiting" in frame for frame in snapshots):
             failures.append("blanket manager completion")
+        for manager, expected in [("Orphans", orphans), ("Cache", cache)]:
+            present = any(re.search(rf"(?:^|\n){manager}: (?!✔)", frame) for frame in snapshots)
+            if expected is not None and present != expected:
+                failures.append(f"{manager} footer scope mismatch: expected {expected}, observed {present}")
+        if cancel_manager and not cancelled:
+            failures.append(f"Ctrl-C during {cancel_manager} was not exercised")
+        if completed_before_cache and not any(f"{completed_before_cache}: ✔" in frame and re.search(r"(?:^|\n)Cache: (?!✔)", frame) for frame in snapshots):
+            failures.append(f"completed {completed_before_cache} row absent during cleanup")
         if source and (success or source_completed) and not native and not any(re.search(r"(?:^|\n)Sources:", frame) for frame in snapshots):
             failures.append("source-only progress missing")
         if not source and any(re.search(r"(?:^|\n)Sources:", frame) for frame in snapshots):
@@ -367,7 +391,7 @@ package() {{
         if source and args[0] == "-Su" and not self.baseline and "Unknown" not in raw_text and "+ unknown" not in raw_text:
             failures.append("unknown source sizes shown as a complete total")
         final_screen = self.rc("get-text", "--extent", "screen")
-        if re.search(r"(?:^|\n)(?:Pacman|AUR|Sources|Flatpak|Nix|Pipx|Hooks):", final_screen):
+        if re.search(r"(?:^|\n)(?:Pacman|AUR|Sources|Flatpak|Nix|Pipx|Hooks|Orphans|Cache):", final_screen):
             failures.append("active footer left behind after the command ended")
         if expected_error and expected_error not in raw_text:
             failures.append(f"expected error missing: {expected_error}")
@@ -732,7 +756,7 @@ exec /usr/bin/sudo "$@"
         (orphan / "desc").write_text("%NAME%\npacpin-ui-orphan-failure\n\n%VERSION%\n1-1\n\n%REASON%\n1\n\n%SIZE%\n1\n\n")
         (orphan / "files").write_text("%FILES%\n\n")
         sudo = helpers / "sudo"
-        sudo.write_text('#!/bin/sh\nif [ "$1" = pacman ] && [ "$2" = -Rns ]; then echo PACPIN_ORPHAN_REMOVAL_FAILURE >&2; exit 23; fi\nexec /usr/bin/sudo "$@"\n')
+        sudo.write_text('#!/bin/sh\nif [ "$1" = pacman ] && [ "$2" = -Rn ]; then echo PACPIN_ORPHAN_REMOVAL_FAILURE >&2; exit 23; fi\nexec /usr/bin/sudo "$@"\n')
         sudo.chmod(0o755)
         self.env["PATH"] = f"{helpers}:{original_path}"
         try:

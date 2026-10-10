@@ -200,14 +200,21 @@ fn should_clean_stale_sandbox(path: &Path) -> bool {
 pub fn init_signal_handlers() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let _ = ctrlc::set_handler(move || {
-            TERMINATING.store(true, Ordering::SeqCst);
-            kill_active_children();
-            cleanup_active_targets();
-            crate::progress::restore_terminal();
-            std::process::exit(130);
-        });
+        let _ = ctrlc::set_handler(|| interrupt());
     });
+}
+
+/// Sudo may own the foreground terminal when pacman receives Ctrl-C. Its
+/// interruption diagnostic must use the same cleanup path as our own SIGINT.
+pub fn interrupt() -> ! {
+    if TERMINATING.swap(true, Ordering::SeqCst) {
+        // Another thread owns cleanup; let it release native locks and exit.
+        loop { std::thread::park_timeout(std::time::Duration::from_millis(20)); }
+    }
+    kill_active_children();
+    cleanup_active_targets();
+    crate::progress::restore_terminal();
+    std::process::exit(130);
 }
 
 struct SandboxGuard {
