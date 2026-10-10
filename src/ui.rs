@@ -466,8 +466,19 @@ pub fn prompt_orphan_selection(
         if let Some(selected) =
             crate::tui_select::run_checkbox_menu(title, subtitle, &checkbox_items)
         {
+            let notice = if selected.is_empty() {
+                ":: Orphan cleanup skipped (no packages selected).".into()
+            } else {
+                format!(":: Orphan review confirmed: {} package{} selected for removal{}.",
+                    selected.len(), if selected.len() == 1 { "" } else { "s" },
+                    if is_after_upgrade { " after a successful upgrade" } else { "" })
+            };
+            for line in wrap_field(&notice, "", "  ", get_terminal_width()) {
+                println!("{line}");
+            }
             return selected;
         } else {
+            println!(":: Orphan cleanup skipped.");
             return Vec::new();
         }
     }

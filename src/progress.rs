@@ -669,11 +669,43 @@ pub struct BackgroundCommand {
 }
 impl BackgroundCommand {
     pub fn wait(mut self) -> io::Result<ExitStatus> {
-        let result = self.child.0.wait();
+        let result = self.wait_with_progress();
         if result.is_err() { let _ = self.child.0.kill(); let _ = self.child.0.wait(); }
         if let Some(reader) = self.reader.take() { let _ = reader.join(); }
         *NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()) = None;
         result
+    }
+
+    fn wait_with_progress(&mut self) -> io::Result<ExitStatus> {
+        if let Some(status) = self.child.0.try_wait()? {
+            return Ok(status);
+        }
+        for line in crate::ui::wrap_field(":: Waiting for repository downloads to finish...", "", "  ", crate::ui::get_terminal_width()) {
+            println!("{line}");
+        }
+        // The selector has returned and released its footer. Keep the same
+        // background download visible until its actual exit status is known.
+        // Input remains in normal mode so Ctrl-C uses the shared signal path.
+        let mut footer = if interactive() {
+            Footer::new(Manager::Native, false).ok()
+        } else {
+            None
+        };
+        loop {
+            if let Some(status) = self.child.0.try_wait()? {
+                return Ok(status);
+            }
+            let display_failed = footer.as_mut().is_some_and(|display| {
+                let phase = NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner());
+                display.resize().and_then(|_| display.draw(phase.as_deref().unwrap_or("Waiting for download result"))).is_err()
+            });
+            if display_failed {
+                // A display failure must not terminate a healthy pacman child
+                // or replace its real transaction outcome with a UI error.
+                footer = None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 }
 impl Drop for BackgroundCommand {
@@ -858,6 +890,17 @@ mod tests {
     }
 
     #[test]
+    fn background_wait_preserves_failure_and_clears_download_state() {
+        let _serial = crate::sandbox::CHILD_TEST_LOCK.lock().unwrap();
+        let child = start_background(Command::new("sh").args([
+            "-c", "printf 'Downloading fixture 25%%\\r'; sleep 0.2; exit 7",
+        ])).unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(7));
+        assert!(NATIVE_BACKGROUND.lock().unwrap().is_none());
+        assert!(TERMINAL.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn pty_preserves_prompt_output_footer_and_terminal_settings() {
         const CHILD: &str = "PACPIN_PROGRESS_PTY_TEST";
         if std::env::var_os(CHILD).is_some() {
@@ -883,6 +926,29 @@ mod tests {
                 Manager::Sources, "Second operation", || {}).unwrap();
             assert!(status.success());
             assert_eq!(unsafe { libc::tcsetattr(0, libc::TCSANOW, &before) }, 0);
+            clear_sources();
+            queued_sources();
+            let download = start_background(Command::new("sh").args(["-c",
+                "printf 'Downloading fixture.pkg.tar.zst 25%%\\r'; sleep 1; printf 'Downloading fixture.pkg.tar.zst 75%%\\r'; sleep 1; exit 7",
+            ])).unwrap();
+            let selected = selection_operation(|| crate::ui::prompt_orphan_selection(&[
+                crate::db::OrphanPackage {
+                    name: "fixture-orphan".into(), version: "1-1".into(), isize: 1,
+                    desc: "No host package operations".into(), is_projected: false,
+                    dropped_by: Vec::new(), optional_for: Vec::new(),
+                },
+            ], true));
+            assert_eq!(selected, ["fixture-orphan"]);
+            assert_eq!(download.wait().unwrap().code(), Some(7));
+            assert!(NATIVE_BACKGROUND.lock().unwrap().is_none());
+            println!("BACKGROUND_WAIT_FINISHED");
+            println!("FINISHED_PREFETCH_BEFORE");
+            let mut finished = start_background(Command::new("sh").args(["-c", "exit 0"])).unwrap();
+            while finished.child.0.try_wait().unwrap().is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(finished.wait().unwrap().success());
+            println!("FINISHED_PREFETCH_AFTER");
             let mut after: libc::termios = unsafe { std::mem::zeroed() };
             assert_eq!(unsafe { libc::tcgetattr(0, &mut after) }, 0);
             assert_eq!(before.c_lflag, after.c_lflag);
@@ -938,6 +1004,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut output = Vec::new();
         let mut answered = false;
+        let mut selection_confirmed = false;
         loop {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -972,6 +1039,10 @@ mod tests {
                     0
                 );
             }
+            if !selection_confirmed && String::from_utf8_lossy(&output).contains("Enter confirms") {
+                master.write_all(b"\r").unwrap();
+                selection_confirmed = true;
+            }
         }
         assert!(
             child.0.wait().unwrap().success(),
@@ -979,6 +1050,10 @@ mod tests {
             String::from_utf8_lossy(&output)
         );
         let output = String::from_utf8_lossy(&output);
+        let finished_wait = output.split("FINISHED_PREFETCH_BEFORE").nth(1).unwrap().split("FINISHED_PREFETCH_AFTER").next().unwrap();
+        assert!(!finished_wait.contains("Waiting for repository downloads"), "already-finished download displayed a wait: {output}");
+        assert!(!finished_wait.contains("Pacman:"), "already-finished download displayed an active footer: {output}");
+        assert!(output.contains("No host package operations\r\n\r\nPure orphans are pre-selected ([x]). Optional plugins are unchecked ([ ]).\r\n\r\n"), "selector sections have no blank line: {output}");
         // A footer refresh may occur between a line and its newline. Remove
         // only the DEC save/restore display updates before checking CRLF.
         let mut normal_output = output.to_string();
@@ -994,6 +1069,10 @@ mod tests {
             "native output retained",
             "stderr retained",
             "source terminal retained",
+            "Orphan review confirmed: 1 package selected",
+            "Waiting for repository downloads to finish...",
+            "Downloading packages (75%)",
+            "BACKGROUND_WAIT_FINISHED",
         ] {
             assert!(output.contains(text), "missing {text}: {output}");
         }

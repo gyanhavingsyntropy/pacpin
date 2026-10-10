@@ -51,7 +51,7 @@ pub fn run_checkbox_menu(title: &str, subtitle: &str, initial: &[CheckboxItem]) 
     for (index, item) in initial.iter().enumerate() {
         for line in crate::ui::wrap_field(&format!("{}) {} — {}", index + 1, item.label, item.description), "  ", "    ", width) { println!("{line}"); }
     }
-    println!("{subtitle}");
+    println!("\n{subtitle}\n");
     if crate::progress::selection_height() < FIXED_ROWS + 2 {
         print!("Select numbers ('all', 'none'; Enter keeps checked defaults): ");
         io::stdout().flush().ok()?;

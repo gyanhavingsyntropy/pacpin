@@ -36,6 +36,8 @@ def transcript(path):
 
 
 class SlowRepository(http.server.SimpleHTTPRequestHandler):
+    download_delay = 0.035
+
     def log_message(self, *_):
         pass
 
@@ -43,7 +45,7 @@ class SlowRepository(http.server.SimpleHTTPRequestHandler):
         while chunk := source.read(64 * 1024):
             output.write(chunk)
             if self.path.endswith((".pkg.tar.zst", "source.tar")):
-                time.sleep(0.035)
+                time.sleep(self.download_delay)
 
 
 class Checks:
@@ -206,7 +208,7 @@ package() {{
                 path.unlink()
         run("sudo", "-n", "pacman", "-Sy", "--noconfirm")
 
-    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False):
+    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False):
         result = self.root / f"{name}.status"
         result.unlink(missing_ok=True)
         raw = self.root / f"{name}.raw.txt"
@@ -263,11 +265,14 @@ package() {{
             if repo_menu and not cancelled and "Repository priority" in screen:
                 self.rc("send-text", "--stdin", input="q")
                 cancelled = True
-            if selection_started and not selection_enter and time.monotonic() - selection_started > 0.6:
+            if selection_started and not selection_enter and time.monotonic() - selection_started > selection_delay:
                 # A single Enter while search is active must confirm too.
                 self.rc("send-text", "--stdin", input="/pacpin-ui-orphan")
                 self.rc("send-key", "enter")
                 selection_enter = True
+            if selection_wait_cancel and not cancelled and "Waiting for repository downloads to finish..." in " ".join(screen.split()):
+                self.rc("send-key", "ctrl+c")
+                cancelled = True
             if resize and not resized and re.search(r"(?:Pacman|Sources):", screen):
                 self.rc("resize-os-window", "--width", "40", "--height", "18", "--unit", "cells")
                 resized = True
@@ -315,8 +320,12 @@ package() {{
             failures.append("live footer resize not exercised")
         if cancel and not cancelled:
             failures.append("Ctrl-C during download not exercised")
-        if (selection_cancel or repo_menu) and not cancelled:
+        if (selection_cancel or selection_wait_cancel or repo_menu) and not cancelled:
             failures.append("menu cancellation not exercised")
+        if selection and not selection_enter:
+            failures.append("single Enter confirmation not exercised")
+        if selection_wait and not any("Waiting for repository downloads to finish..." in " ".join(frame.split()) and re.search(r"(?:^|\n)Pacman:.*(?:Downloading|Verifying)", frame) for frame in snapshots):
+            failures.append("repository download footer missing after Enter while downloads remain active")
         raw_text = transcript(raw)
         plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", raw_text)
         # Initial plan boxes must fit even though COLUMNS is deliberately 120.
@@ -335,6 +344,8 @@ package() {{
             failures.append(f"expected error missing: {expected_error}")
         if not success and "Sources upgrade completed successfully" in raw_text:
             failures.append("source failure reported as success")
+        if selection and "Orphan cleanup skipped (no packages selected)." not in " ".join(plain.split()):
+            failures.append("orphan confirmation did not print the empty selection result")
         if not success and ":: Sources: Waiting for repository downloads to finish" in raw_text:
             failures.append("queued source work still reported as waiting after native failure")
         scratch_after = {str(path) for base in ["/tmp", "/var/tmp"] for path in Path(base).glob("pacpin-source-*")}
@@ -564,12 +575,30 @@ exec /usr/bin/sudo "$@"
             (directory / "desc").write_text(f"%NAME%\npacpin-ui-orphan-{index:02}\n\n%VERSION%\n1-1\n\n%DESC%\nComplete optional inventory fixture\n\n%REASON%\n1\n\n%SIZE%\n1\n\n")
             (directory / "files").write_text("%FILES%\n\n")
         self.cfg.write_text(original_cfg.replace("smart_orphans = false", "smart_orphans = true"))
+        original_delay = SlowRepository.download_delay
         try:
-            self.case("orphan-selection-download-and-enter", ["-Su"], native=True, source=True, confirm=True, selection=True, width=40)
+            # Hold the real native download open well past Enter. The original
+            # 1 MiB fixture could finish before the selector's 0.6-second review.
+            SlowRepository.download_delay = 0.35
+            self.case("orphan-selection-download-and-enter", ["-Su"], native=True, source=True, confirm=True, selection=True, selection_wait=True, width=40)
             screen = (self.root / "orphan-selection-download-and-enter.screen.txt").read_text()
             for index in range(25):
                 assert f"pacpin-ui-orphan-{index:02}" in screen
             assert all(path.exists() for path in (self.root / "db/local").glob("pacpin-ui-orphan-*"))
+            self.seed()
+            self.publish(2)
+            self.catalog(2)
+            SlowRepository.download_delay = original_delay
+            self.case("orphan-selection-download-already-finished", ["-Su", "--autoremove"], native=True, source=True, confirm=True, selection=True, selection_delay=2, width=80)
+            completed_raw = transcript(self.root / "orphan-selection-download-already-finished.raw.txt")
+            assert "Waiting for repository downloads to finish..." not in completed_raw
+            self.seed()
+            self.publish(2)
+            self.catalog(2)
+            SlowRepository.download_delay = 0.35
+            self.case("orphan-selection-wait-interrupted", ["-Su", "--autoremove"], native=True, source=True, confirm=True, selection=True, selection_wait=True, selection_wait_cancel=True, success=False, width=40)
+            assert run("pacman", "-Q", "pacpin-ui-native").strip().endswith("1.0.0-1")
+            assert not (self.root / "db/db.lck").exists(), "interrupted post-selection wait retained its lock"
             self.seed()
             self.publish(2)
             self.catalog(2)
@@ -583,6 +612,7 @@ exec /usr/bin/sudo "$@"
             assert run("pacman", "-Q", "pacpin-ui-native").strip().endswith("1.0.0-1")
             assert not (self.root / "db/db.lck").exists(), "interrupted native prefetch retained its lock"
         finally:
+            SlowRepository.download_delay = original_delay
             self.cfg.write_text(original_cfg)
             for path in (self.root / "db/local").glob("pacpin-ui-orphan-*"):
                 shutil.rmtree(path)
