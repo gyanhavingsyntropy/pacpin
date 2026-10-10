@@ -130,7 +130,7 @@ package() {{ install -Dm644 /etc/os-release "$pkgdir/opt/{name}/app"; }}
         flatpak.write_text('#!/bin/sh\necho INTEGRATION_SCOPE_LEAK\nexit 23\n')
         flatpak.chmod(0o755)
         original_cfg = self.cfg.read_text()
-        self.cfg.write_text(original_cfg.replace("integrations = false", "integrations = true") + '\n[integrations]\nflatpak = true\n')
+        self.cfg.write_text(original_cfg.replace("integrations = false", "integrations = true").replace("flatpak = false", "flatpak = true"))
         try:
             for scope in ["--repo", "--aur"]:
                 name = "scoped-cache-excludes-integrations-" + scope[2:]
