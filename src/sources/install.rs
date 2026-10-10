@@ -3,8 +3,7 @@ use crate::sandbox::{register_cleanup_target, unregister_cleanup_target};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -16,128 +15,15 @@ pub struct PrefetchedPlan {
 
 static PREFETCH_CACHE: Mutex<Option<HashMap<String, PrefetchedPlan>>> = Mutex::new(None);
 
-const OS_RESERVE: u64 = 5 * 1024 * 1024 * 1024 / 2;
 const BUILD_RESERVE: u64 = 64 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug)]
-struct Capacity {
-    bytes: u64,
-    inodes: u64,
-    ram: bool,
-}
-
-fn quota_remaining(hard: u64, soft: u64, used: u64, unit: u64) -> Option<u64> {
-    // Respect soft limits too, rather than relying on a grace period during builds.
-    [hard, soft]
-        .into_iter()
-        .filter(|limit| *limit != 0)
-        .min()
-        .map(|limit| limit.saturating_mul(unit).saturating_sub(used))
-}
-
-fn capacity(path: &Path) -> Result<Capacity, String> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let mut fs_stat: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: paths are NUL terminated and output structures are correctly sized.
-    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0
-        || unsafe { libc::statfs(c_path.as_ptr(), &mut fs_stat) } != 0
-    {
-        return Err(io::Error::last_os_error().to_string());
-    }
-    if unsafe { libc::access(c_path.as_ptr(), libc::W_OK) } != 0 {
-        return Err(format!(
-            "Scratch directory is not writable: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let mut result = Capacity {
-        bytes: stat.f_bavail.saturating_mul(stat.f_frsize),
-        // Filesystems such as Btrfs report zero when inodes are allocated
-        // dynamically, rather than exposing a fixed inode pool.
-        inodes: if stat.f_files == 0 {
-            u64::MAX
-        } else {
-            stat.f_favail
-        },
-        ram: fs_stat.f_type == libc::TMPFS_MAGIC,
-    };
-    let dir = File::open(path).map_err(|e| e.to_string())?;
-    let metadata = dir.metadata().map_err(|e| e.to_string())?;
-    // A setgid parent assigns its group to newly created build directories.
-    let gid = if metadata.mode() & libc::S_ISGID != 0 {
-        metadata.gid()
-    } else {
-        unsafe { libc::getegid() }
-    };
-    for (kind, id) in [(0, unsafe { libc::geteuid() }), (1, gid)] {
-        let mut quota: libc::dqblk = unsafe { std::mem::zeroed() };
-        // SAFETY: fd remains open, Q_GETQUOTA only reads this identity's quota,
-        // and the kernel writes into a live Linux dqblk with the matching ABI.
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_quotactl_fd,
-                dir.as_raw_fd(),
-                libc::QCMD(libc::Q_GETQUOTA, kind),
-                id,
-                &mut quota as *mut libc::dqblk,
-            )
-        };
-        if rc != 0 {
-            let error = io::Error::last_os_error();
-            // No active quota, unsupported filesystem, or an older kernel.
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::ESRCH | libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL)
-            ) {
-                continue;
-            }
-            return Err(format!(
-                "Cannot inspect quota for {}: {error}",
-                path.display()
-            ));
-        }
-        if let Some(bytes) = quota_remaining(
-            quota.dqb_bhardlimit,
-            quota.dqb_bsoftlimit,
-            quota.dqb_curspace,
-            1024,
-        ) {
-            result.bytes = result.bytes.min(bytes);
-        }
-        if let Some(inodes) = quota_remaining(
-            quota.dqb_ihardlimit,
-            quota.dqb_isoftlimit,
-            quota.dqb_curinodes,
-            1,
-        ) {
-            result.inodes = result.inodes.min(inodes);
-        }
-    }
-    Ok(result)
-}
-
-fn fits(capacity: Capacity, bytes: u64, inodes: u64, available_memory: u64) -> bool {
-    capacity.bytes >= bytes
-        && capacity.inodes >= inodes
-        && (!capacity.ram || available_memory >= bytes.saturating_add(OS_RESERVE))
-}
-
-fn mem_available_bytes() -> Option<u64> {
-    let content = fs::read_to_string("/proc/meminfo").ok()?;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let num_str = rest.split_whitespace().next()?;
-            let kb: u64 = num_str.parse().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
-}
+use crate::scratch::{capacity, fits, mem_available_bytes, Capacity, OS_RESERVE};
+#[cfg(test)]
+use crate::scratch::quota_remaining;
 
 fn choose_scratch_base(bytes: u64, inodes: u64) -> Result<PathBuf, String> {
+    if crate::scratch::policy() != crate::scratch::Policy::Auto {
+        return crate::scratch::choose(crate::scratch::policy(), bytes, inodes);
+    }
     select_scratch_base(
         [std::env::temp_dir(), PathBuf::from("/var/tmp")]
             .into_iter()
@@ -231,7 +117,8 @@ impl Workdir {
     ) -> Result<(), String> {
         let space = capacity(&self.0)?;
         let available_memory = mem_available_bytes().unwrap_or(0);
-        if fits(space, additional_bytes, additional_inodes, available_memory) {
+        if crate::scratch::accepts(crate::scratch::policy(), space)
+            && fits(space, additional_bytes, additional_inodes, available_memory) {
             return Ok(());
         }
         // Before extraction the workspace contains only the verified artifact.
@@ -264,7 +151,11 @@ impl Workdir {
         // Only the download is needed initially. Its length and the expanded
         // payload are checked separately as soon as they become known.
         let base = choose_scratch_base(expected_bytes.unwrap_or(64 * 1024), 1)?;
-        Self::new_with_base(&base)
+        let work = Self::new_with_base(&base)?;
+        if crate::scratch::policy() != crate::scratch::Policy::Auto {
+            crate::progress::source_message(format!(":: Sources temporary workspace: {} ({:?})", work.0.display(), crate::scratch::policy()));
+        }
+        Ok(work)
     }
 }
 impl Drop for Workdir {
@@ -637,12 +528,23 @@ fn build(plan: &Plan, work: &Path, artifact: &Path) -> Result<PathBuf, String> {
 }
 
 pub fn execute(config: &mut Config, plan: &Plan, needed: bool) -> Result<(), String> {
+    execute_inner(config, plan, needed, None)
+}
+pub fn execute_independent(config: &mut Config, plan: &Plan, permit: &crate::pm::AurBuildFailurePermit) -> Result<(), String> {
+    execute_inner(config, plan, true, Some(permit))
+}
+fn execute_inner(config: &mut Config, plan: &Plan, needed: bool, permit: Option<&crate::pm::AurBuildFailurePermit>) -> Result<(), String> {
     // Revalidate even cached plans; never bypass policy at the privilege boundary.
     validate_config(config)?;
     if !plan.persist_source && config.sources.get(&plan.alias) != Some(&plan.source) {
         return Err("Source configuration changed after planning; check again".into());
     }
     crate::pm::check_lock()?;
+    if let Some(permit) = permit {
+        permit.validate()?;
+        let manager = crate::db::AlpmManager::with_repo_order(&config.repo_order).map_err(|e| e.to_string())?;
+        crate::pm::ensure_independent(&manager, &plan.name, &plan.recipe.depends, permit.failed_packages())?;
+    }
     crate::preview::check_package_root_capacity(0, 0)?;
     let (mut work, artifact) = if let Some(prefetched) = take_prefetched(plan) {
         println!(
@@ -685,6 +587,13 @@ pub fn execute(config: &mut Config, plan: &Plan, needed: bool) -> Result<(), Str
         );
     }
     let installed = manager.handle().localdb().pkg(plan.name.as_str()).ok();
+    if let Some(permit) = permit {
+        let dependencies = loaded.depends().into_iter().map(|d| d.to_string()).collect::<Vec<_>>();
+        crate::pm::ensure_independent(&manager, &plan.name, &dependencies, permit.failed_packages())?;
+        if loaded.has_scriptlet() || !loaded.conflicts().is_empty() || !loaded.replaces().is_empty() {
+            return Err("Continuation cannot install packages with scriptlets, conflicts or replacements".into());
+        }
+    }
     crate::preview::check_package_root_capacity(loaded.isize(), installed.map(|p| p.isize()).unwrap_or(0))?;
     let before = manager
         .handle()
@@ -694,6 +603,10 @@ pub fn execute(config: &mut Config, plan: &Plan, needed: bool) -> Result<(), Str
         .map(|p| p.version().to_string());
     drop(loaded);
     drop(manager);
+    if let Some(permit) = permit {
+        crate::pm::continuation_archive_check(config, &package, &plan.name)?;
+        permit.begin_source_install()?;
+    }
     let mut command = crate::privilege::command(&config.options.privilege_tool);
     command.args(["pacman", "-U", "--noconfirm"]);
     command.args(crate::progress::pacman_progress_args());

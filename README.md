@@ -102,7 +102,94 @@ The final plan summary follows dependency and removal details. Its native counts
 
 `--no-cache` cleans only the native/AUR caches involved in successful manager transactions. Sources remove their temporary workspaces separately. Cleanup reports completion, failure, or a reason for skipping; failed-manager archives remain available for recovery. A requested cleanup failure makes the command fail even when package installation succeeded. Cleanup finishes before restart advice.
 
+### Choose upgrade managers and temporary storage
+
+```sh
+pin upgrade --sources-only                 # configured upstream Sources only
+pin upgrade --aur-only                     # AUR targets only
+pin upgrade --sources-only --use-ram       # Sources download / packaging in tmpfs
+pin upgrade --aur-only --use-ram            # Paru clones / downloads / builds in tmpfs
+TMPDIR=/path/to/disk/scratch pin upgrade --sources-only --use-storage
+pin -S aur/antigravity --use-ram            # one AUR package
+pin -S source-alias/package --use-storage   # one Source package
+pin -Syu --keep-going                      # guarded Sources continuation after AUR failure
+```
+
+`--sources-only` and `--aur-only` are mutually exclusive and exclude other integration upgrades. Native repository databases are not refreshed in scoped runs, including when spelled `-Syu`; AUR helpers can still install required build dependencies through pacman. Keep the native system current before AUR updates. Scoped runs do not remove orphans automatically; use `pin orphans -c` separately.
+
+`--use-ram` and `--use-storage` are mutually exclusive, invocation-only preferences for Sources and Paru temporary workspaces. Defaults retain automatic Sources allocation and the helper's existing AUR workspace. Forced RAM requires tmpfs, quotas/inodes and the 2.5 GiB OS reserve; it never silently falls back to disk. Forced storage requires a writable non-tmpfs filesystem, using `TMPDIR` or `/var/tmp`. No mount or filesystem repair is performed. AUR build footprints are unknown: the starting capacity check cannot guarantee a large compilation will fit. Tmpfs can also be swapped by Linux. These flags do not move already-installed files, native pacman downloads, helper metadata, or installed build dependencies out of root. Root installation capacity remains required.
+
+Paru receives a private clone directory and makepkg directory environment overrides. Successful temporary workspaces are removed; failed AUR workspaces are retained with their path for inspection (RAM contents disappear on reboot). Custom clone/makepkg/chroot/local-repository flags conflict with this policy; other helpers fail explicitly rather than ignoring the request. Sources retain their automatic temporary-workspace cleanup.
+
+`--keep-going` is opt-in and limited to recognized makepkg build failures under the default native/dependency policy with Paru. It requires no observed native installation, an unchanged pacman database and log, an unlocked database, and satisfied installed dependencies. AUR build-dependency installations therefore conservatively disable continuation. Unknown failures, interruptions and native extraction/commit failures stop the run. Only Sources opt in: each exact approved package is checked independently, including transitive installed dependencies, actual archive dependencies, a prepared ALPM transaction with no extra packages/removals, and root/scratch capacity. Packages with scriptlets, conflicts or replacements are excluded. Successful Sources are recorded individually; the AUR failure still produces a nonzero exit, skips orphan cleanup and preserves failed AUR caches. This is not a recovery command for damaged packages.
+
+For an eligible continuation run, Paru uses `/usr/bin/pacman` and `/usr/bin/makepkg` without chroot or local-repository installation. Custom forwarded helper flags disable continuation. Any attempted Sources installation without verified completion blocks later packages even if the pacman log has not changed.
+
 Cache removal after installation does not eliminate temporary installation space. pacpin checks estimated native root/cache capacity before downloading and again before installing; source builds also check their final installation destination. Downloads, build scratch, final net growth, and temporary rewrite space are separate requirements. These estimates cannot guarantee space for every snapshot, quota, concurrent writer, or package hook.
+
+### Post-update hooks
+
+Configure actions in `config.toml` for `pin upgrade`, `pin -Su`, or `pin -Syu`:
+
+```toml
+[hooks.rounded-blur]
+watch = ["mutter", "gnome-shell"]
+action = "rebuild-aur"
+packages = ["gnome-rounded-blur"]
+
+[hooks.refresh-user-data]
+watch = ["some-installed-package"]
+action = "script"
+command = ["/home/you/.local/bin/refresh-user-data", "--refresh"]
+```
+
+Hooks appear before the final plan summary, including in dry runs. Each matching
+hook runs once after successful transactions and verified installed version
+changes, before orphan/cache cleanup and restart advice. Several watched updates
+still cause one execution. New installs, unchanged versions, failed transactions,
+and unverified updates do not trigger hooks. Hook failure makes the run fail and
+skips remaining hooks; already installed updates are not rolled back.
+
+Conditions combine: `watch = ["pkg-a", "pkg-b"]` means **a OR b**;
+`watch_all = ["pkg-a", "pkg-b"]` means **a AND b**;
+`unless_updated = ["pkg-c"]` vetoes the hook if **c** also changed version.
+Omit `watch` when using only `watch_all`. If both positive lists are present,
+at least one `watch` package and every `watch_all` package must change. An alternative
+to the first rounded-blur hook is:
+
+```toml
+[hooks.rounded-blur]
+watch = ["mutter", "gnome-shell"]
+unless_updated = ["gnome-rounded-blur"]
+action = "rebuild-aur"
+packages = ["gnome-rounded-blur"]
+```
+
+This runs after either GNOME package changes, unless rounded-blur was also updated.
+Conditions are checked against the approved plan and again against installed
+versions after successful transactions. Hook actions do not trigger further hooks.
+
+Script arguments are passed literally, without an implicit shell. Use an absolute
+executable path. Scripts run as the invoking regular user with `/` as their working
+directory; `PACPIN_HOOK` names the hook and `PACPIN_UPDATED_PACKAGES` contains the
+verified watched package names separated by spaces. Nested pacpin invocations
+inheriting `PACPIN_HOOK` skip hooks to prevent recursion. Scripts own their effects;
+pacpin does not infer package installs or cache ownership from script output.
+Configure only scripts you trust. Hooks watch approved native, AUR and Sources
+package updates; Flatpak/Nix/Pipx IDs are not triggers. Hooks are not run by ordinary
+`pin -S`, recovery, or package managers invoked independently of pacpin.
+
+AUR rebuild hooks currently support Paru and already installed foreign packages
+only. They force rebuilding the current AUR recipe even when its version is
+unchanged, reuse privilege/scratch settings and participate in AUR `--no-cache`
+cleanup. A failed rebuild preserves its cache. `--sources-only` skips AUR rebuild
+hooks and explains why; script hooks can still watch Sources packages.
+
+The [Blur My Shell upstream guide](https://github.com/aunetx/blur-my-shell/blob/master/scripts/GUIDE.md)
+requires rebuilding rounded-blur after GNOME Shell/Mutter updates and logging out
+after installation. The library recipe must also support the new GNOME version;
+the guide mentions a compatibility patch for GNOME 51. A hook cannot make an
+incompatible upstream recipe build successfully.
 
 ### Declarative Rules & Configuration
 | Command | Description |

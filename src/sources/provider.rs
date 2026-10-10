@@ -152,4 +152,14 @@ impl IntegrationProvider for SourceProvider {
         });
     }
     fn supports_prefetch(&self) -> bool { true }
+    fn supports_aur_failure_continuation(&self) -> bool { true }
+    fn execute_after_aur_failure(&self, update: &ExternalUpdate, permit: &mut crate::pm::AurBuildFailurePermit) -> Result<bool, io::Error> {
+        let plans = self.approved.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let plan = plans.iter().find(|p| update.id == format!("{}/{}", p.alias, p.name) && update.version == p.version)
+            .ok_or_else(|| io::Error::other("Source update changed after approval"))?;
+        let mut config = self.config.clone();
+        install::execute_independent(&mut config, plan, permit).map_err(io::Error::other)?;
+        permit.source_completed().map_err(|e| io::Error::other(format!("{} installed, but further continuation is blocked: {e}", plan.name)))?;
+        Ok(true)
+    }
 }

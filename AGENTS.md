@@ -13,6 +13,9 @@
 - Derive status rows, completion messages, prefetch, cleanup, and flags from the approved transaction and the manager actually invoked.
 - Do not display an AUR row or claim AUR completion when no AUR operation ran. Apply the same rule to native packages, Sources, Flatpak, Nix, and other integrations.
 - Provider capabilities must be explicit and default to unsupported. Do not assume a generic integration supports source downloads or source scratch handling.
+- Upgrade scope controls must exclude unrelated checks, refreshes, downloads, status rows and cleanup. `--sources-only` / `--aur-only` never refresh native repositories; AUR-required build dependencies are a distinct possible native transaction. Keep pacpin controls out of helper arguments, respecting option values and `--` targets.
+- Scratch flags select temporary storage only. Forced RAM/disk must match the filesystem, retain quota/inode/RAM checks and root installation checks, and never silently fall back to the other medium. AUR build size is unknown: do not describe its starting check as a full footprint guarantee. Configure Paru through its supported clone directory and makepkg environment, unprivileged, with explicit rejection for unsupported helpers.
+- Continuation is opt-in with `--keep-going`, only after positive build-failure evidence and unchanged native database/log with healthy installed dependencies. Native/unknown failures and interruptions stop the run. Providers default to unsupported; Sources validate exact approved plans, transitive and actual archive dependencies and the prepared native transaction before continuing. Keep the original failed stage and nonzero result visible; never mark it completed or purge its cache because an independent package succeeded.
 - Distinguish downloading, checksum verification, packaging, installation, and successful completion. A completed prefetch is not a completed upgrade.
 - Keep pacman output and hooks visible. Background workers must not write directly into a foreground manager's terminal display.
 - Use the shared progress renderer for foreground installation and upgrade commands. Native, AUR, Sources, Flatpak, Nix, and Pipx should identify the active manager consistently. Add a concurrent Sources row only to native/AUR operations with actual source work; a shared renderer does not authorize sharing manager-specific flags, scratch rules, or cleanup.
@@ -20,6 +23,8 @@
 - For interactive sudo operations, the user expects fresh authentication once per pacpin invocation and reuse throughout that invocation, including AUR builds. Reset only the current terminal ticket lazily before the first actual privileged operation, keep it renewed without prompting during long operations, and leave read-only commands, dry runs, other privilege tools, and other terminals unaffected. Test consecutive invocations in the same terminal with an existing ticket.
 
 ## Centralize external interactions
+
+- Post-update hooks belong to the hooks boundary. Preview configured actions before final approval; trigger once per hook only from verified installed version changes after successful transactions. Evaluate any/all/unless conditions against the plan and verified results; unknown or failed updates cannot satisfy positive conditions. Run scripts as the regular user through shared tracked execution with literal arguments and concise footer phases. Rebuilds use the typed AUR adapter, respect scope/scratch/privilege policy, omit `--needed`, report real failure and include actual AUR work in cache cleanup. Do not recursively trigger hooks or infer script effects from its text. Ordinary installs/recovery currently do not run upgrade hooks; keep this limitation explicit until their outer orchestration supports the same contract.
 
 - Command handlers and orchestration code must call dedicated boundary APIs instead of spawning package managers or implementing their side effects independently. Route native/AUR execution through `pm` and its helper adapter (`aur` owns AUR metadata), Sources through `sources`, and Flatpak/Nix/Pipx through their integration adapters. A module name alone does not establish centralization: inspect callers for bypasses.
 - Prefer typed operations such as install, refresh, clean and remove over arbitrary command strings from callers. The boundary owns argument validation, supported flags, privilege policy and operation-specific outcomes.
@@ -72,6 +77,8 @@ Use small local catalog and package fixtures in the VM instead of multi-gigabyte
 Record the reproduction command, VM environment, assertions, and results in the repository. If the VM is unavailable, report that verification as incomplete; do not claim the terminal issue is fixed based on compilation or raw-output substring tests.
 
 The reusable verifier is `scripts/verify_upgrade_ui_vm.py`. Transfer it and the release binary into the live guest, start the Kitty socket described below, then run **inside the guest**:
+
+All VM suites share the terminal and temporarily replace guest pacman.conf. Run them sequentially; the shared verifier lock rejects concurrent suites. Preserve an earlier failure when chaining shell commands (`set -e`), rather than allowing a skipped `if` branch to reset the shell status to success.
 
 ```sh
 PACPIN_DISPOSABLE_VM=1 python /tmp/verify_upgrade_ui_vm.py /tmp/pacpin \

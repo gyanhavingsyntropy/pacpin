@@ -51,9 +51,23 @@ pub fn cmd_upgrade(
     check_pacman_lock();
     print_banner();
 
-    let ext_providers = IntegrationsManager::get_active_providers(config);
+    let scope = match crate::runtime::UpgradeScope::parse(extra_flags) {
+        Ok(scope) => scope, Err(error) => { eprintln!("Error: {error}"); exit(2); }
+    };
+    let keep_going = crate::runtime::has_control(extra_flags, "--keep-going");
+    if !scope.includes_native() && autoremove {
+        eprintln!("Error: scoped upgrades cannot include orphan removal; use pin orphans -c separately"); exit(2);
+    }
+    let mut provider_config = config.clone();
+    if scope != crate::runtime::UpgradeScope::All { provider_config.features.integrations = false; }
+    if scope == crate::runtime::UpgradeScope::Aur { provider_config.sources.clear(); }
+    let ext_providers = IntegrationsManager::get_active_providers(&provider_config)
+        .into_iter().filter(|p| scope.includes_runner(p.name())).collect::<Vec<_>>();
+    if !scope.includes_native() && refresh {
+        println!(":: Scoped upgrade: native repository databases are not refreshed. AUR builds may still require native build dependencies.");
+    }
 
-    if refresh && !dry_run {
+    if refresh && !dry_run && scope.includes_native() {
         println!(
             ":: Refreshing package databases ({} pacman -Sy)...",
             config.options.privilege_tool
@@ -105,11 +119,18 @@ pub fn cmd_upgrade(
             exit(1);
         }
     };
-    for warn in manager.verify_syncdbs() {
+    for warn in if scope == crate::runtime::UpgradeScope::Sources { Vec::new() } else { manager.verify_syncdbs() } {
         eprintln!("{}", format!(":: Warning: {}", warn).yellow());
     }
     let resolver = ResolverEngine::new(&manager);
-    let mut res = resolver.resolve_all(config);
+    let mut res = if scope == crate::runtime::UpgradeScope::Sources {
+        ResolveResult { installed_count: manager.handle().localdb().pkgs().len(), repos: Vec::new(), packages: std::collections::HashMap::new(), updates: Vec::new(), held_packages: Vec::new(), unresolved_pins: Vec::new() }
+    } else { resolver.resolve_all(config) };
+    res.updates.retain(|p| if p.candidate.as_ref().is_some_and(|c| c.is_aur) { scope.includes_aur() } else { scope.includes_native() });
+    if !scope.includes_native() {
+        res.held_packages.retain(|p| scope.includes_aur() && p.candidate.as_ref().is_some_and(|c| c.is_aur));
+        res.unresolved_pins.retain(|(_, repo)| scope.includes_aur() && repo == "aur");
+    }
     // Ignored packages leave the plan entirely (display, preview, targets,
     // journal): pacman answers "Install anyway?" affirmatively for
     // explicitly listed targets under --noconfirm, so forwarding the flags
@@ -137,7 +158,7 @@ pub fn cmd_upgrade(
         res.held_packages
             .retain(|held| !ignored.contains(&held.name));
     }
-    let orphans = if config.features.smart_orphans || autoremove {
+    let orphans = if scope.includes_native() && (config.features.smart_orphans || autoremove) {
         manager.get_orphans(&res.updates)
     } else {
         Vec::new()
@@ -167,6 +188,10 @@ pub fn cmd_upgrade(
             exit(1);
         }
     };
+    if !scope.includes_native() && !requested_targets.native.is_empty()
+        || !scope.includes_aur() && !requested_targets.aur.is_empty() {
+        eprintln!("Error: requested targets do not belong to the selected upgrade scope"); exit(2);
+    }
     let requested_names: HashSet<String> = requested_targets
         .items
         .iter()
@@ -189,7 +214,7 @@ pub fn cmd_upgrade(
         ui::render_requested_box(&requested_targets.items);
     }
     let updates = res_view.updates.clone();
-    let orphan_list_changed = if config.features.smart_orphans {
+    let orphan_list_changed = if scope.includes_native() && config.features.smart_orphans {
         OrphanManager::has_changed(&orphans)
     } else {
         false
@@ -229,7 +254,7 @@ pub fn cmd_upgrade(
                 .cloned()
                 .collect();
             OrphanManager::save_known(&remaining);
-        } else if !dry_run && OrphanManager::load_known().is_none() {
+        } else if scope.includes_native() && !dry_run && OrphanManager::load_known().is_none() {
             OrphanManager::save_known(&orphans);
         }
         return;
@@ -309,6 +334,18 @@ pub fn cmd_upgrade(
         );
         exit(1);
     }
+    let mut hook_expected: std::collections::BTreeMap<String, String> = preview.adds.iter()
+        .filter(|p| !ignored.contains(&p.name)).map(|p| (p.name.clone(), p.version.clone())).collect();
+    for update in updates.iter().filter(|u| !ignored.contains(&u.name)) {
+        if let Some(candidate) = &update.candidate { hook_expected.insert(update.name.clone(), candidate.version.clone()); }
+    }
+    for update in external_updates.iter().filter(|u| u.runner == "Sources") {
+        hook_expected.insert(update.name.clone(), update.version.clone());
+    }
+    let hook_plan = match crate::hooks::Plan::new(config, crate::hooks::versions(&manager), hook_expected, scope) {
+        Ok(plan) => plan, Err(error) => { eprintln!("Error: {error}"); exit(1); }
+    };
+    hook_plan.preview();
     ui::render_transaction_plan(&res_view, &config.options.helper, &external_updates, Some(ui::PlanDetails {
         preview: &preview,
         explicit_names: &explicit_names,
@@ -351,7 +388,11 @@ pub fn cmd_upgrade(
     let no_cache = config.options.no_cache
         || extra_flags.iter().any(|f| f == "--no-cache" || f == "--clean-cache");
 
-    let forwarded_pacman_flags: Vec<&str> = extra_flags
+    let manager_flags = crate::runtime::manager_flags(extra_flags);
+    if !aur_targets.is_empty() {
+        if let Err(error) = pm::validate_aur_scratch(config, &manager_flags) { eprintln!("Error: {error}"); exit(2); }
+    }
+    let forwarded_pacman_flags: Vec<&str> = manager_flags
         .iter()
         .filter(|f| {
             let s = f.as_str();
@@ -438,12 +479,14 @@ pub fn cmd_upgrade(
     }
 
     if dry_run {
+        if keep_going { println!("Dry-Run: --keep-going permits independent Sources only after a verified AUR build failure; the overall run still fails."); }
+        if let Some(description) = crate::scratch::describe_plan(external_updates.iter().any(|u| u.runner == "Sources"), !aur_targets.is_empty() || hook_plan.has_aur()) { println!("Dry-Run: {description}"); }
         println!("{}", "Dry-Run: Synthesized Upgrade Commands:".bold());
         println!("  ➔ {}\n", full_cmd.cyan());
         if no_cache {
             println!("{}", "Dry-Run: Cache Cleanup Action (--no-cache):".bold());
             let has_native = !pacman_targets.is_empty();
-            let has_aur = !aur_targets.is_empty();
+            let has_aur = !aur_targets.is_empty() || hook_plan.has_aur();
             if has_native && has_aur {
                 println!("  ➔ Purge both native pacman cache and AUR build cache\n");
             } else if has_native {
@@ -569,6 +612,7 @@ pub fn cmd_upgrade(
     let mut executed_commands: Vec<String> = Vec::new();
     let mut exit_status = Ok(std::process::ExitStatus::default());
     let mut all_success = true;
+    let mut continuation_permit = None;
     let mut native_ok = false;
     let mut aur_ok = false;
 
@@ -665,15 +709,18 @@ pub fn cmd_upgrade(
             ext_prefetch_handle = IntegrationsManager::spawn_prefetch(&ext_providers, &external_updates);
         }
         let helper = &config.options.helper;
-        let mut args = vec!["-S", "--needed", "--aur", "--noconfirm"];
-        args.extend(helper_flags.iter().copied());
-        if no_cache {
-            args.push("--cleanafter");
-        }
-        args.extend(forwarded_pacman_flags.iter().cloned());
-        args.push("--");
-        args.extend(aur_targets.iter().map(|s| s.as_str()));
-        let status = crate::privilege::prepare(&config.options.privilege_tool).and_then(|()| crate::progress::run(Command::new(helper).args(&args), crate::progress::Manager::Aur, "Building / installing AUR packages", || {}));
+        let options = pm::InstallOptions { needed: true, noconfirm: true, no_cache,
+            forwarded_flags: forwarded_pacman_flags.iter().map(|s| (*s).to_owned()).collect(), ..Default::default() };
+        let report = pm::execute_aur(config, &aur_targets, &options, pm::AurOperation::Install, keep_going);
+        let status = report.map(|report| {
+            if !report.status.success() && keep_going {
+                match report.continuation {
+                    Ok(permit) => { println!(":: AUR build failed without observed native changes; checking independent Sources (--keep-going)."); continuation_permit = Some(permit); }
+                    Err(reason) => eprintln!(":: Continuation disabled: {reason}"),
+                }
+            }
+            report.status
+        });
         match status {
             Ok(s) if s.success() => {
                 aur_ok = true;
@@ -739,6 +786,11 @@ pub fn cmd_upgrade(
                 all_success = false;
             }
         }
+    } else if let Some(mut permit) = continuation_permit.filter(|_| !external_updates.is_empty()) {
+        for (cmd, success) in IntegrationsManager::execute_after_aur_failure(&ext_providers, &external_updates, &mut permit) {
+            if success { executed_commands.push(cmd); }
+        }
+        println!(":: The AUR stage failed; this run remains unsuccessful. Orphan cleanup is skipped.");
     } else if !external_updates.is_empty() {
         println!(":: External upgrades skipped because an earlier package transaction failed. Download verification does not mean installation succeeded.");
     }
@@ -808,7 +860,10 @@ pub fn cmd_upgrade(
 
     }
 
-    if all_success && (config.features.smart_orphans || autoremove) {
+    let hook_outcome = hook_plan.run(config, all_success, noconfirm);
+    all_success &= hook_outcome.success;
+
+    if all_success && scope.includes_native() && (config.features.smart_orphans || autoremove) {
         // Projected orphans may still be required, or no longer installed,
         // after the real transaction.
         match AlpmManager::with_repo_order(&config.repo_order) {
@@ -830,9 +885,13 @@ pub fn cmd_upgrade(
         }
     }
 
+    let aur_cleanup = match (if !aur_targets.is_empty() && (native_ok || pacman_targets.is_empty()) { Some(aur_ok) } else { None }, hook_outcome.aur) {
+        (Some(initial), Some(hook)) => Some(initial && hook),
+        (initial, hook) => initial.or(hook),
+    };
     let cleanup_ok = pm::transaction_cache_cleanup(config, no_cache,
         (!pacman_targets.is_empty()).then_some(native_ok),
-        if !aur_targets.is_empty() && (native_ok || pacman_targets.is_empty()) { Some(aur_ok) } else { None });
+        aur_cleanup);
 
     if !applied_updates.is_empty() {
         restart::RestartInspector::print_restart_advisory(&applied_updates, &config.options.privilege_tool);
@@ -1267,6 +1326,8 @@ fn revalidate_orphan_selection(
 }
 
 pub fn parse_install_flags(flags: &[String]) -> pm::InstallOptions {
+    let manager_flags = crate::runtime::manager_flags(flags);
+    let flags = manager_flags.as_slice();
     let channel = flags.iter().enumerate().find_map(|(index, flag)| {
         let value = flag.strip_prefix("--channel=").or_else(|| (flag == "--channel").then(|| flags.get(index + 1)).flatten().map(String::as_str))?;
         match value {

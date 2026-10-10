@@ -312,6 +312,7 @@ pub fn install_targets(
         );
     }
     if options.dry_run {
+        if let Some(description) = crate::scratch::describe_plan(true, false) { println!("Dry-Run: {description}"); }
         return Ok(Vec::new());
     }
     install::confirm(options.noconfirm)?;
@@ -331,7 +332,7 @@ pub fn install_direct(
     options: &crate::pm::InstallOptions,
 ) -> Result<Vec<String>, String> {
     if !options.forwarded_flags.is_empty() || options.refresh || options.sysupgrade {
-        return Err("Direct source installs accept only --channel, --dry-run, --noconfirm, and --needed".into());
+        return Err("Direct source installs do not accept native transaction flags; run 'pin -Syu' separately, then install the direct source".into());
     }
     let direct = direct::parse(target)?.ok_or("Not a direct source target")?;
     let (name, source, recipe) = if let Some(known) = direct::known_recipe(&direct, channel.clone()) {
@@ -375,7 +376,10 @@ pub fn install_direct(
         plan.recipe.binaries,
         plan.recipe.depends.join(", ")
     );
-    if options.dry_run { return Ok(Vec::new()); }
+    if options.dry_run {
+        if let Some(description) = crate::scratch::describe_plan(true, false) { println!("Dry-Run: {description}"); }
+        return Ok(Vec::new());
+    }
     install::confirm(options.noconfirm)?;
     install::execute(config, &plan, options.needed)?;
     Ok(vec![format!("{}/{}", plan.alias, plan.name)])

@@ -55,6 +55,7 @@ pub enum Manager {
     Flatpak,
     Nix,
     Pipx,
+    Hooks,
 }
 impl Manager {
     fn label(self) -> &'static str {
@@ -65,6 +66,7 @@ impl Manager {
             Self::Flatpak => "Flatpak",
             Self::Nix => "Nix",
             Self::Pipx => "Pipx",
+            Self::Hooks => "Hooks",
         }
     }
 }
@@ -228,6 +230,7 @@ fn native_footer(text: &str, width: usize) -> String {
 }
 
 fn phase_text(manager: Manager, text: &str, previous: &str) -> String {
+    if manager == Manager::Hooks { return previous.into(); }
     let clean = clean_text(text);
     let lower = clean.to_lowercase();
     if lower.contains("waiting for repository downloads") { return "Queued; waiting for repository downloads".into(); }
@@ -444,6 +447,9 @@ struct Observer {
 }
 impl Observer {
     fn feed(&mut self, bytes: &[u8], on_ready: &mut impl FnMut()) {
+        self.feed_observed(bytes, on_ready, &mut |_| {});
+    }
+    fn feed_observed(&mut self, bytes: &[u8], on_ready: &mut impl FnMut(), on_line: &mut impl FnMut(&str)) {
         for &byte in bytes {
             // Consume CSI and OSC sequences even when split across reads.
             match self.escape {
@@ -480,6 +486,7 @@ impl Observer {
                 b'\r' | b'\n' => {
                     let line = String::from_utf8_lossy(&self.line).trim().to_owned();
                     if !line.is_empty() {
+                        on_line(&line);
                         if !self.ready && downloads_finished(&line) {
                             self.ready = true;
                             on_ready();
@@ -554,9 +561,24 @@ pub fn run(
     command: &mut Command,
     manager: Manager,
     label: &str,
+    on_ready: impl FnMut(),
+) -> io::Result<ExitStatus> {
+    run_observed(command, manager, label, on_ready, |_| {})
+}
+
+/// Observe normalized output in the shared executor, without intercepting
+/// authentication input or hiding the package manager's original diagnostics.
+pub fn run_observed(
+    command: &mut Command,
+    manager: Manager,
+    label: &str,
     mut on_ready: impl FnMut(),
+    mut on_line: impl FnMut(&str),
 ) -> io::Result<ExitStatus> {
     crate::sandbox::init_signal_handlers();
+    // A later operation for the same manager is pending again (e.g. an ABI
+    // rebuild hook after an AUR upgrade). Retain only other completed managers.
+    COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&done| done != manager);
     let interactive = interactive();
     // Pacman's stage names are observed to avoid competing with its downloads.
     command.env("LC_ALL", "C");
@@ -635,7 +657,7 @@ pub fn run(
                 Ok(n) => {
                     io::stdout().write_all(&buf[..n])?;
                     io::stdout().flush()?;
-                    observer.feed(&buf[..n], &mut on_ready);
+                    observer.feed_observed(&buf[..n], &mut on_ready, &mut on_line);
                 }
                 Err(error) if interactive && error.raw_os_error() == Some(libc::EIO) => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -658,7 +680,37 @@ pub fn run(
         }
     }
     let status = child.0.wait()?;
+    if !observer.line.is_empty() {
+        on_line(&String::from_utf8_lossy(&observer.line));
+    }
     Ok(status)
+}
+
+/// Bounded read-only tool capture with the same child tracking as foreground
+/// operations. Drain both pipes concurrently even after the capture limit.
+pub fn capture_output(command: &mut Command) -> io::Result<std::process::Output> {
+    fn read_bounded(mut stream: impl Read) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer)?;
+            if count == 0 { return Ok(bytes); }
+            let keep = count.min(32_768usize.saturating_sub(bytes.len()));
+            bytes.extend_from_slice(&buffer[..keep]);
+        }
+    }
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = ChildGuard(command.spawn()?);
+    crate::sandbox::register_child(child.0.id());
+    let stdout = child.0.stdout.take().ok_or_else(|| io::Error::other("Missing stdout pipe"))?;
+    let stderr = child.0.stderr.take().ok_or_else(|| io::Error::other("Missing stderr pipe"))?;
+    let output = std::thread::spawn(move || read_bounded(stdout));
+    let errors = std::thread::spawn(move || read_bounded(stderr));
+    let status = child.0.wait();
+    if status.is_err() { let _ = child.0.kill(); let _ = child.0.wait(); }
+    let stdout = output.join().map_err(|_| io::Error::other("Output reader failed"))??;
+    let stderr = errors.join().map_err(|_| io::Error::other("Error reader failed"))??;
+    Ok(std::process::Output { status: status?, stdout, stderr })
 }
 
 /// Background downloads cannot own the input terminal or emit foreground
@@ -798,6 +850,22 @@ pub fn wait_for_sources(handle: &std::thread::JoinHandle<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observed_lines_preserve_split_colored_failure_markers() {
+        let mut observer = Observer::default();
+        let mut lines = Vec::new();
+        for fragment in [b"\x1b[31m==> ER".as_slice(), b"ROR:\x1b[0m A failure occurred in build().\r\n:: Processing package changes...\n"] {
+            observer.feed_observed(fragment, &mut || {}, &mut |line| lines.push(line.to_owned()));
+        }
+        assert_eq!(lines, ["==> ERROR: A failure occurred in build().", ":: Processing package changes..."]);
+    }
+    #[test]
+    fn bounded_capture_drains_both_streams_and_preserves_failure() {
+        let _guard = crate::sandbox::CHILD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let output = capture_output(Command::new("/bin/sh").args(["-c", "head -c 65536 /dev/zero; head -c 65536 /dev/zero >&2; exit 7"])).unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout.len(), 32768); assert_eq!(output.stderr.len(), 32768);
+    }
     #[test]
     fn footer_describes_phases_without_echoing_prompts_or_hook_logs() {
         assert_eq!(phase_text(Manager::Native, "[sudo] password for user:", "Starting"), "Awaiting authorization");

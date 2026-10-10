@@ -165,6 +165,8 @@ impl PackageManifest {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Config {
     #[serde(default)]
+    pub hooks: BTreeMap<String, crate::hooks::Hook>,
+    #[serde(default)]
     pub sources: BTreeMap<String, crate::sources::Source>,
     #[serde(default)]
     pub features: Features,
@@ -275,6 +277,10 @@ pub fn load_config() -> Config {
         }
     };
 
+    if let Err(e) = crate::hooks::validate(&config) {
+        eprintln!("Error: Invalid post-update hook configuration: {e}");
+        std::process::exit(1);
+    }
     if let Err(e) = crate::sources::validate_config(&config) {
         eprintln!("Error: Invalid package source configuration: {e}");
         std::process::exit(1);

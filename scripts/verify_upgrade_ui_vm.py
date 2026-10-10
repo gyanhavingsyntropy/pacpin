@@ -6,6 +6,7 @@ The guest pacman config is restored on exit. Never run this on the host.
 """
 import argparse
 import functools
+import fcntl
 import hashlib
 import http.server
 import json
@@ -33,6 +34,19 @@ def transcript(path):
     # metadata rather than terminal output and must not count as a prompt.
     return "\n".join(line for line in path.read_text(errors="replace").splitlines()
                      if not line.startswith(("Script started on ", "Script done on ")))
+
+
+def serialized_verifier(main):
+    """All suites temporarily own guest pacman.conf and the same terminal."""
+    @functools.wraps(main)
+    def wrapped():
+        with open("/tmp/pacpin-vm-verifier.lock", "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SystemExit("Another pacpin VM verifier is running; run suites sequentially")
+            return main()
+    return wrapped
 
 
 class SlowRepository(http.server.SimpleHTTPRequestHandler):
@@ -208,12 +222,13 @@ package() {{
                 path.unlink()
         run("sudo", "-n", "pacman", "-Sy", "--noconfirm")
 
-    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False):
+    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello"):
         result = self.root / f"{name}.status"
         result.unlink(missing_ok=True)
         raw = self.root / f"{name}.raw.txt"
         # Deliberately stale: live terminal dimensions must beat COLUMNS.
-        command = shlex.join(["env", *[f"{key}={self.env[key]}" for key in ["HOME", "PATH", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "LD_PRELOAD", "PACPIN_UI_SLOW_ARTIFACT"]], "COLUMNS=120", str(self.binary), *args])
+        env_keys = ["HOME", "PATH", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "LD_PRELOAD", "PACPIN_UI_SLOW_ARTIFACT"] + (["TMPDIR"] if "TMPDIR" in self.env else [])
+        command = shlex.join(["env", *[f"{key}={self.env[key]}" for key in env_keys], "COLUMNS=120", str(self.binary), *args])
         if password:
             # Consecutive runs share script's controlling tty and sudo ticket.
             # pacpin itself must require fresh authentication for the next run.
@@ -284,6 +299,10 @@ package() {{
         (self.root / f"{name}.screen.txt").write_text(all_text)
         (self.root / f"{name}.frames.json").write_text(json.dumps(snapshots))
         status = int(result.read_text())
+        if allow_ram_refusal and status != 0 and "Insufficient scratch capacity for Ram policy" in transcript(raw):
+            # MemAvailable can change while the command plans/extracts. Accept
+            # only the explicit RAM guard, never an arbitrary build failure.
+            success = False
         failures = []
         if (status == 0) != success:
             failures.append(f"exit status {status}")
@@ -303,7 +322,7 @@ package() {{
             failures.append("Native shown although it was never invoked")
         if any("Finished; waiting" in frame for frame in snapshots):
             failures.append("blanket manager completion")
-        if source and success and not native and not any(re.search(r"(?:^|\n)Sources:", frame) for frame in snapshots):
+        if source and (success or source_completed) and not native and not any(re.search(r"(?:^|\n)Sources:", frame) for frame in snapshots):
             failures.append("source-only progress missing")
         if not source and any(re.search(r"(?:^|\n)Sources:", frame) for frame in snapshots):
             failures.append("Sources shown although it was never invoked")
@@ -338,11 +357,11 @@ package() {{
         if source and args[0] == "-Su" and not self.baseline and "Unknown" not in raw_text and "+ unknown" not in raw_text:
             failures.append("unknown source sizes shown as a complete total")
         final_screen = self.rc("get-text", "--extent", "screen")
-        if re.search(r"(?:^|\n)(?:Pacman|AUR|Sources|Flatpak|Nix|Pipx):", final_screen):
+        if re.search(r"(?:^|\n)(?:Pacman|AUR|Sources|Flatpak|Nix|Pipx|Hooks):", final_screen):
             failures.append("active footer left behind after the command ended")
         if expected_error and expected_error not in raw_text:
             failures.append(f"expected error missing: {expected_error}")
-        if not success and "Sources upgrade completed successfully" in raw_text:
+        if not success and not source_completed and "Sources upgrade completed successfully" in raw_text:
             failures.append("source failure reported as success")
         if selection and "Orphan cleanup skipped (no packages selected)." not in " ".join(plain.split()):
             failures.append("orphan confirmation did not print the empty selection result")
@@ -355,12 +374,12 @@ package() {{
         if query.returncode not in [0, 1]:
             raise RuntimeError(query.stderr)
         versions = query.stdout.strip().splitlines()
-        if success and source and not any(line == "pacpin-ui-source 2.0.0-1" for line in versions):
+        if (success or source_completed) and source and not any(line == "pacpin-ui-source 2.0.0-1" for line in versions):
             failures.append("source installed version is not 2.0.0-1")
         if success and native and not any(line == "pacpin-ui-native 2.0.0-1" for line in versions):
             failures.append("native installed version is not 2.0.0-1")
-        if aur and success and not any(line.startswith("hello 2.") for line in versions):
-            failures.append("real AUR hello package was not installed")
+        if aur and success and not any(line.startswith(f"{aur_package} 2.") for line in versions):
+            failures.append(f"AUR fixture {aur_package} was not installed")
         self.results.append({"case": name, "status": status, "failures": failures, "frames": len(snapshots), "resized": resized, "cancelled": cancelled, "installed": versions})
         if password:
             self.results[-1]["password_prompts"] = raw_text.count("PACPIN_AUTH_PASSWORD:")
@@ -943,6 +962,7 @@ exec /usr/bin/sudo "$@"
         self.server.shutdown()
 
 
+@serialized_verifier
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=Path)

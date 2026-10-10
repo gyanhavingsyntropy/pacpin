@@ -63,3 +63,11 @@ The upgrade orchestrator skips external upgrades after an AUR failure. Codex
 remains `0.162.0alpha.16-1`; its installed size is 430.09 MiB. Root free space was
 approximately 202 MiB when checked. This change does not alter failure ordering,
 retry packages, or install Codex. No recovery feature was developed.
+
+## Follow-up verification
+
+the VM storage server became available. The later disposable Garuda audit verified orphan Enter
+while downloads were active, Enter after downloads completed, Ctrl-C during
+selection and the post-selection wait, terminal restoration, and database lock
+release. See [the runtime/hooks verification report](2026-10-11-runtime-hooks.md)
+for the executed checks, evidence and confirmed VM shutdown.

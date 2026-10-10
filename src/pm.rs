@@ -7,6 +7,16 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::process::{Command, Stdio};
+
+mod continuation;
+mod workspace;
+mod rebuild;
+pub use rebuild::{validate_rebuild, rebuild_aur};
+pub use continuation::{execute_aur, ensure_independent, continuation_archive_check, AurBuildFailurePermit, AurOperation};
+
+pub fn validate_aur_scratch(config: &Config, flags: &[String]) -> Result<(), String> {
+    workspace::validate(&config.options.helper, crate::scratch::policy(), flags)
+}
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use colored::*;
@@ -436,6 +446,7 @@ pub fn install(
     }
 
     let helper_flags = if aur_targets.is_empty() { Vec::new() } else { helper_privilege_args(&config.options.helper, &config.options.privilege_tool)? };
+    if !aur_targets.is_empty() { validate_aur_scratch(config, &options.forwarded_flags)?; }
     if !aur_targets.is_empty() && !options.dry_run {
         crate::preview::check_package_root_capacity(0, 0)?;
     }
@@ -451,6 +462,7 @@ pub fn install(
     let full_cmd = command_strs.join(" && ");
 
     if options.dry_run {
+        if let Some(description) = crate::scratch::describe_plan(false, !aur_targets.is_empty()) { println!("Dry-Run: {description}"); }
         println!("\n{}", "Dry-Run: Synthesized Installation Commands:".bold());
         println!("  ➔ {}", full_cmd.cyan());
         if options.no_cache {
@@ -536,28 +548,8 @@ pub fn install(
 
     if all_success && !aur_targets.is_empty() {
         let helper = &config.options.helper;
-        let mut args = vec![aur_op, "--aur"];
-        args.extend(helper_flags.iter().copied());
-        if options.needed {
-            args.push("--needed");
-        }
-        if options.noconfirm {
-            args.push("--noconfirm");
-        }
-        if options.no_cache {
-            args.push("--cleanafter");
-        }
-        for f in &options.forwarded_flags {
-            args.push(f.as_str());
-        }
-        args.push("--");
-        args.extend(aur_targets.iter().map(|s| s.as_str()));
-        let status = crate::privilege::prepare(&config.options.privilege_tool).and_then(|()| crate::progress::run(
-            Command::new(helper).args(&args),
-            crate::progress::Manager::Aur,
-            "Building / installing AUR packages",
-            || {},
-        ));
+        let operation = match aur_op { "-Su" => AurOperation::Upgrade, "-Syu" => AurOperation::RefreshUpgrade, _ => AurOperation::Install };
+        let status = execute_aur(config, &aur_targets, options, operation, false).map(|report| report.status);
         match status {
             Ok(s) if s.success() => {
                 aur_ok = true;

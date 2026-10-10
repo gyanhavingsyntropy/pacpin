@@ -1,5 +1,9 @@
 //! Pacman-compatible argument classification shared by command dispatch.
 
+pub(crate) fn takes_value(arg: &str) -> bool {
+    matches!(arg, "--ignore" | "--ignoregroup" | "--config" | "--cachedir" | "--root" | "-r" | "--dbpath" | "-b" | "--logfile" | "--gpgdir" | "--hookdir" | "--overwrite" | "--assume-installed" | "--color" | "--arch" | "--print-format" | "--channel")
+}
+
 pub fn parse_pacman_cli_args(args: &[String]) -> (Vec<String>, Vec<String>) {
     let mut targets = Vec::new();
     let mut flags = Vec::new();
@@ -21,23 +25,7 @@ pub fn parse_pacman_cli_args(args: &[String]) -> (Vec<String>, Vec<String>) {
             continue;
         }
 
-        let takes_arg = arg == "--ignore"
-            || arg == "--ignoregroup"
-            || arg == "--config"
-            || arg == "--cachedir"
-            || arg == "--root"
-            || arg == "-r"
-            || arg == "--dbpath"
-            || arg == "-b"
-            || arg == "--logfile"
-            || arg == "--gpgdir"
-            || arg == "--hookdir"
-            || arg == "--overwrite"
-            || arg == "--assume-installed"
-            || arg == "--color"
-            || arg == "--arch"
-            || arg == "--print-format";
-        let takes_arg = takes_arg || arg == "--channel";
+        let takes_arg = takes_value(arg);
 
         if arg == "--wait" {
             flags.push(arg.clone());

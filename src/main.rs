@@ -21,6 +21,7 @@ pub mod commands;
 mod config;
 mod db;
 mod download;
+mod hooks;
 pub mod pm;
 mod integrations;
 mod journal;
@@ -31,7 +32,9 @@ mod progress;
 mod repo_menu;
 mod resolver;
 mod restart;
+mod runtime;
 mod sandbox;
+mod scratch;
 mod sources;
 mod tui_select;
 mod ui;
@@ -198,6 +201,11 @@ fn print_help() {
     println!("      -y, --refresh            Refresh sync databases with the selected privilege tool");
     println!("      -c, --clean              Prompt to clean all orphans during upgrade");
     println!("      --no-cache               Clean caches for successful native/AUR transactions");
+    println!("      --sources-only           Upgrade configured Sources only");
+    println!("      --aur-only               Upgrade AUR targets only (build dependencies may use pacman)");
+    println!("      --keep-going             Try independent Sources after a verified AUR build failure");
+    println!("      --use-ram                Use tmpfs for Sources / Paru temporary build files");
+    println!("      --use-storage            Use disk for Sources / Paru temporary build files");
     println!("      --noconfirm              Bypass interactive confirmation prompt");
     println!("  -S [flags] [repo/]pkg        Install packages (auto-pins repo/pkg with companion cascade)");
     println!("  -S github:owner/project      Install a reviewed direct upstream release (--channel alpha)");
@@ -321,6 +329,11 @@ fn main() {
     } else if let Some(pos) = args.iter().position(|a| a == "--sudo") {
         args.remove(pos);
         cli_privilege_override = Some("sudo".to_string());
+    }
+
+    match runtime::parse(&mut args) {
+        Ok(policy) => scratch::initialize(policy),
+        Err(error) => { eprintln!("Error: {error}"); exit(2); }
     }
 
     if is_clean_invocation(&args) && unsafe { libc::geteuid() } == 0 {

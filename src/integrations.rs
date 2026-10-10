@@ -63,6 +63,10 @@ pub trait IntegrationProvider: Send + Sync {
     }
     fn prefetch(&self, _updates: &[ExternalUpdate]) {}
     fn supports_prefetch(&self) -> bool { false }
+    fn supports_aur_failure_continuation(&self) -> bool { false }
+    fn execute_after_aur_failure(&self, _update: &ExternalUpdate, _permit: &mut crate::pm::AurBuildFailurePermit) -> Result<bool, std::io::Error> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "This integration does not support continuation after AUR failure"))
+    }
 }
 
 pub struct FlatpakProvider;
@@ -501,6 +505,36 @@ impl IntegrationsManager {
         providers.iter().any(|p| p.supports_prefetch() && updates.iter().any(|u| u.runner == p.name()))
     }
 
+    pub fn execute_after_aur_failure(
+        providers: &[Arc<dyn IntegrationProvider>], updates: &[ExternalUpdate], permit: &mut crate::pm::AurBuildFailurePermit,
+    ) -> Vec<(String, bool)> {
+        let mut outcomes = Vec::new();
+        let mut stopped = false;
+        for update in updates {
+            let provider = providers.iter().find(|p| p.name() == update.runner && p.supports_aur_failure_continuation());
+            let Some(provider) = provider else {
+                println!(":: {}: skipped {} after AUR failure (continuation unsupported).", update.runner, update.name); continue;
+            };
+            if stopped { println!(":: Sources: skipped {} because safe continuation could not be re-established.", update.name); continue; }
+            if let Err(reason) = permit.validate() {
+                eprintln!(":: Sources: skipped {}: {reason}", update.name); stopped = true; continue;
+            }
+            println!(":: Checking independent Sources update: {}", update.name);
+            let success = match provider.execute_after_aur_failure(update, permit) {
+                Ok(true) => { println!("✔ Sources: {} updated successfully.", update.name); true },
+                Ok(false) => { eprintln!(":: Sources: {} failed.", update.name); false },
+                Err(error) => { eprintln!(":: Sources: {} was not completed: {error}", update.name); false },
+            };
+            outcomes.push((provider.upgrade_command_str(std::slice::from_ref(update)), success));
+            if !success && permit.validate().is_err() { stopped = true; }
+        }
+        let source_count = updates.iter().filter(|u| u.runner == "Sources").count();
+        let completed = outcomes.iter().filter(|(_, success)| *success).count();
+        if source_count != 0 && completed == source_count { crate::progress::completed(crate::progress::Manager::Sources); }
+        if source_count != 0 { println!(":: Sources after AUR failure: {completed} completed, {} not completed.", source_count.saturating_sub(completed)); }
+        outcomes
+    }
+
     pub fn execute_upgrades(
         providers: &[Arc<dyn IntegrationProvider>],
         external_updates: &[ExternalUpdate],
@@ -639,6 +673,10 @@ mod tests {
         assert!(flatpak.supports_clean());
         assert!(nix.supports_clean());
         assert!(!pipx.supports_clean());
+        assert!(!flatpak.supports_aur_failure_continuation());
+        assert!(!nix.supports_aur_failure_continuation());
+        assert!(!pipx.supports_aur_failure_continuation());
+        assert!(crate::sources::SourceProvider::new(&Config::default()).supports_aur_failure_continuation());
     }
 
     #[cfg(unix)]

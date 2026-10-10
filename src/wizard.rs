@@ -302,6 +302,7 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
     let enable_integrations = enable_flatpak || enable_nix || enable_pipx;
 
     let config = Config {
+        hooks: existing_cfg.as_ref().map(|cfg| cfg.hooks.clone()).unwrap_or_default(),
         sources: existing_cfg.as_ref().map(|cfg| cfg.sources.clone()).unwrap_or_default(),
         features: Features {
             pinning: enable_pinning,
