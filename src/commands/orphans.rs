@@ -35,6 +35,7 @@ pub fn cmd_orphans(config: &crate::config::Config, clean: bool, noconfirm: bool)
 
     let orphans = manager.get_orphans(&[]);
     if orphans.is_empty() {
+        if clean && !OrphanManager::finish_review(&[]) { exit(1); }
         println!(
             "\n{}",
             "✔ No orphaned packages found on your system.".green()
@@ -54,6 +55,10 @@ pub fn cmd_orphans(config: &crate::config::Config, clean: bool, noconfirm: bool)
                 .map(|o| o.name.clone())
                 .collect()
         };
+        if let Err(error) = OrphanManager::record_selection(&selected) {
+            eprintln!(":: {error}; cleanup aborted before removal.");
+            exit(1);
+        }
         let removed = if !selected.is_empty() {
             check_pacman_lock();
             OrphanManager::execute_removal(&selected, &config.options.privilege_tool)
@@ -64,7 +69,8 @@ pub fn cmd_orphans(config: &crate::config::Config, clean: bool, noconfirm: bool)
             .cloned()
             .collect();
         OrphanManager::save_known(&remaining);
-        if !selected.is_empty() && !removed { exit(1); }
+        let recorded = OrphanManager::finish_review(&remaining);
+        if (!selected.is_empty() && !removed) || !recorded { exit(1); }
     } else {
         OrphanManager::save_known(&orphans);
         println!(

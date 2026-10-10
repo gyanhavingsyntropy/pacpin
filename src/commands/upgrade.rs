@@ -215,7 +215,7 @@ pub fn cmd_upgrade(
     }
     let updates = res_view.updates.clone();
     let orphan_list_changed = if scope.includes_native() && config.features.smart_orphans {
-        OrphanManager::has_changed(&orphans)
+        OrphanManager::needs_review(&orphans)
     } else {
         false
     };
@@ -247,6 +247,12 @@ pub fn cmd_upgrade(
                 noconfirm_orphan_selection(&orphans, autoremove)
             };
 
+            if !noconfirm || !selected_orphans.is_empty() {
+                if let Err(error) = OrphanManager::record_selection(&selected_orphans) {
+                    eprintln!(":: {error}; cleanup aborted before removal.");
+                    exit(1);
+                }
+            }
             let removed = OrphanManager::execute_removal(&selected_orphans, &config.options.privilege_tool);
             let remaining: Vec<OrphanPackage> = orphans
                 .iter()
@@ -254,6 +260,8 @@ pub fn cmd_upgrade(
                 .cloned()
                 .collect();
             OrphanManager::save_known(&remaining);
+            let recorded = OrphanManager::finish_review(&remaining);
+            if !removed || !recorded { exit(1); }
         } else if scope.includes_native() && !dry_run && OrphanManager::load_known().is_none() {
             OrphanManager::save_known(&orphans);
         }
@@ -587,6 +595,15 @@ pub fn cmd_upgrade(
         selected_orphans = noconfirm_orphan_selection(&orphans, autoremove);
     }
 
+    if (review_orphans && !noconfirm) || !selected_orphans.is_empty() {
+        if let Err(error) = OrphanManager::record_selection(&selected_orphans) {
+            eprintln!(":: {error}; upgrade aborted before installation.");
+            // Let any native download finish and release its lock before exiting.
+            if let Some(child) = prefetch.take() { let _ = child.wait(); }
+            exit(1);
+        }
+    }
+
     // Wait until native downloads finish, so sources do not compete for the
     // connection. Sources-only transactions download in the foreground.
     let can_prefetch = !dry_run && IntegrationsManager::has_prefetch(&ext_providers, &external_updates)
@@ -880,9 +897,12 @@ pub fn cmd_upgrade(
                     .filter(|o| !removed || !safe_selection.contains(&o.name))
                     .collect();
                 OrphanManager::save_known(&remaining);
+                all_success &= OrphanManager::finish_review(&remaining);
             }
             Err(e) => eprintln!("{}", format!(":: Cannot recheck orphans after upgrade; skipping cleanup: {e}").yellow()),
         }
+    } else if !all_success && !selected_orphans.is_empty() {
+        println!("\n:: Orphan cleanup skipped because the upgrade failed; pending cleanup will be offered again on the next full upgrade.");
     }
 
     let aur_cleanup = match (if !aur_targets.is_empty() && (native_ok || pacman_targets.is_empty()) { Some(aur_ok) } else { None }, hook_outcome.aur) {

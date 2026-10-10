@@ -51,6 +51,91 @@ pub struct KnownOrphan {
 pub struct OrphanManager;
 
 impl OrphanManager {
+    fn pending_file() -> Result<PathBuf, String> {
+        Ok(TransactionJournal::state_dir()?.join("pending_orphan_cleanup.json"))
+    }
+
+    fn read_pending(path: &std::path::Path) -> Result<Option<Vec<String>>, String> {
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("Cannot read pending orphan cleanup: {error}")),
+        };
+        let selected: Vec<String> = serde_json::from_str(&content)
+            .map_err(|error| format!("Invalid pending orphan cleanup: {error}"))?;
+        if selected.iter().any(|name| !crate::utils::is_safe_pkg_name(name)) {
+            return Err("Invalid package name in pending orphan cleanup".into());
+        }
+        Ok(Some(selected))
+    }
+
+    fn write_pending(path: &std::path::Path, selected: &[String]) -> Result<(), String> {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let write = || -> Result<(), std::io::Error> {
+            let data = serde_json::to_vec(selected).map_err(std::io::Error::other)?;
+            let parent = path.parent().ok_or_else(|| std::io::Error::other("Missing state directory"))?;
+            fs::create_dir_all(parent)?;
+            let mut template = parent.join(".pending-orphans-XXXXXX").as_os_str().as_bytes().to_vec();
+            template.push(0);
+            let fd = unsafe { libc::mkstemp(template.as_mut_ptr().cast()) };
+            if fd < 0 { return Err(std::io::Error::last_os_error()); }
+            let temp_path = PathBuf::from(std::ffi::OsStr::from_bytes(&template[..template.len() - 1]));
+            let mut file = unsafe { fs::File::from_raw_fd(fd) };
+            let result = file.write_all(&data).and_then(|()| file.sync_all());
+            drop(file);
+            if let Err(error) = result.and_then(|()| fs::rename(&temp_path, path)) {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error);
+            }
+            fs::File::open(parent)?.sync_all()
+        };
+        write().map_err(|error| format!("Cannot save pending orphan cleanup: {error}"))
+    }
+
+    fn pending_needs_review(current: &[OrphanPackage], pending: Option<&[String]>) -> bool {
+        // Older versions remembered inventory but not unfinished cleanup. Offer
+        // one fresh review when introducing the separate completion record.
+        match pending {
+            None => !current.is_empty(),
+            Some(pending) => current.iter().any(|o| pending.contains(&o.name)),
+        }
+    }
+
+    pub fn needs_review(current: &[OrphanPackage]) -> bool {
+        let pending = match Self::pending_file().and_then(|path| Self::read_pending(&path)) {
+            Ok(pending) => pending,
+            Err(error) => {
+                eprintln!(":: {error}; orphan cleanup needs a fresh review.");
+                None
+            }
+        };
+        Self::has_changed(current) || Self::pending_needs_review(current, pending.as_deref())
+    }
+
+    pub fn record_selection(selected: &[String]) -> Result<(), String> {
+        if selected.iter().any(|name| !crate::utils::is_safe_pkg_name(name)) {
+            return Err("Refusing unsafe pending orphan selection".into());
+        }
+        Self::write_pending(&Self::pending_file()?, selected)
+    }
+
+    fn finish_pending(path: &std::path::Path, remaining: &[OrphanPackage]) -> Result<(), String> {
+        if let Some(mut pending) = Self::read_pending(path)? {
+            pending.retain(|name| remaining.iter().any(|o| o.name == *name));
+            Self::write_pending(path, &pending)?;
+        }
+        Ok(())
+    }
+
+    pub fn finish_review(remaining: &[OrphanPackage]) -> bool {
+        match Self::pending_file().and_then(|path| Self::finish_pending(&path, remaining)) {
+            Ok(()) => true,
+            Err(error) => { eprintln!(":: {error}"); false }
+        }
+    }
+
     pub fn state_file() -> Option<PathBuf> {
         TransactionJournal::state_dir().ok().map(|d| d.join("known_orphans.json"))
     }
@@ -474,6 +559,59 @@ mod tests {
         assert!(!OrphanManager::has_changed_from_known(&[plugin.clone()], Some(&known)));
         plugin.optional_for.push("parent-c".into());
         assert!(OrphanManager::has_changed_from_known(&[plugin], Some(&known)));
+    }
+
+    fn retry_orphan(name: &str) -> OrphanPackage {
+        OrphanPackage {
+            name: name.into(), version: "1".into(), isize: 1, desc: String::new(),
+            is_projected: false, dropped_by: Vec::new(), optional_for: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pending_cleanup_requires_review_even_when_inventory_is_known() {
+        let orphan = retry_orphan("meson");
+        let known = HashMap::from([("meson".into(), KnownOrphan { is_pure: true, optional_for: Vec::new() })]);
+        assert!(!OrphanManager::has_changed_from_known(std::slice::from_ref(&orphan), Some(&known)));
+        assert!(OrphanManager::pending_needs_review(&[orphan], Some(&["meson".into()])));
+    }
+
+    #[test]
+    fn legacy_inventory_gets_one_fresh_review() {
+        assert!(OrphanManager::pending_needs_review(&[retry_orphan("meson")], None));
+        assert!(!OrphanManager::pending_needs_review(&[], None));
+    }
+
+    #[test]
+    fn explicit_decline_does_not_repeat_unchanged_review() {
+        assert!(!OrphanManager::pending_needs_review(&[retry_orphan("meson")], Some(&[])));
+    }
+
+    #[test]
+    fn stale_pending_names_do_not_prompt_or_authorize_removal() {
+        assert!(!OrphanManager::pending_needs_review(&[retry_orphan("meson")], Some(&["no-longer-orphan".into()])));
+    }
+
+    #[test]
+    fn pending_cleanup_is_atomic_and_kept_after_failed_removal() {
+        let root = std::env::temp_dir().join(format!("pacpin-pending-orphans-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("pending.json");
+        OrphanManager::write_pending(&path, &["meson".into(), "ninja".into()]).unwrap();
+        let unchanged = [retry_orphan("meson"), retry_orphan("ninja")];
+        OrphanManager::finish_pending(&path, &unchanged).unwrap();
+        assert_eq!(OrphanManager::read_pending(&path).unwrap().unwrap(), ["meson", "ninja"]);
+        OrphanManager::finish_pending(&path, &[retry_orphan("meson")]).unwrap();
+        assert_eq!(OrphanManager::read_pending(&path).unwrap().unwrap(), ["meson"]);
+        OrphanManager::finish_pending(&path, &[]).unwrap();
+        assert_eq!(OrphanManager::read_pending(&path).unwrap(), Some(Vec::new()));
+        assert!(OrphanManager::write_pending(&root, &["meson".into()]).is_err());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1, "failed writes must clean their temporary file");
+        fs::write(&path, "[\"../bad\"]").unwrap();
+        assert!(OrphanManager::read_pending(&path).is_err());
+        fs::write(&path, "truncated").unwrap();
+        assert!(OrphanManager::read_pending(&path).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

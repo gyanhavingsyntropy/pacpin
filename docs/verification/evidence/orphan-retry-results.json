@@ -1,0 +1,474 @@
+{
+  "pacpin-orphan-retry-verified": [
+    {
+      "case": "known-orphan-selected-before-aur-failure",
+      "status": 1,
+      "failures": [],
+      "frames": 19,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "hello 0.0.0-1",
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-orphan 1-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "noninteractive-run-preserves-pending",
+      "status": 0,
+      "failures": [],
+      "frames": 5,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-orphan 1-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "sources-scope-preserves-pending",
+      "status": 0,
+      "failures": [],
+      "frames": 1,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-orphan 1-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "pending-cleanup-no-updates-retry",
+      "status": 0,
+      "failures": [],
+      "frames": 12,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "completed-cleanup-does-not-repeat",
+      "status": 0,
+      "failures": [],
+      "frames": 2,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "orphan-removal-failure-retains-pending",
+      "status": 1,
+      "failures": [],
+      "frames": 6,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-orphan 1-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "orphan-removal-failure-retry",
+      "status": 0,
+      "failures": [],
+      "frames": 10,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "pending-cleanup-explicit-decline",
+      "status": 0,
+      "failures": [],
+      "frames": 10,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-orphan 1-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "declined-cleanup-does-not-repeat",
+      "status": 0,
+      "failures": [],
+      "frames": 4,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-orphan 1-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "legacy-known-inventory-fresh-review",
+      "status": 0,
+      "failures": [],
+      "frames": 9,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-orphan 1-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "pending-state-write-failure-stops-removal",
+      "status": 1,
+      "failures": [],
+      "frames": 11,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-orphan 1-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "direct-cleanup-resolves-pending",
+      "status": 0,
+      "failures": [],
+      "frames": 6,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    }
+  ],
+  "pacpin-orphan-retry-audit": [
+    {
+      "case": "restart-advisory-80",
+      "status": 0,
+      "failures": [],
+      "frames": 1,
+      "resized": false,
+      "cancelled": false,
+      "installed": []
+    },
+    {
+      "case": "restart-advisory-40",
+      "status": 0,
+      "failures": [],
+      "frames": 1,
+      "resized": false,
+      "cancelled": false,
+      "installed": []
+    },
+    {
+      "case": "restart-advisory-32",
+      "status": 0,
+      "failures": [],
+      "frames": 1,
+      "resized": false,
+      "cancelled": false,
+      "installed": []
+    },
+    {
+      "case": "cleanup-before-restart-advisory",
+      "status": 0,
+      "failures": [],
+      "frames": 29,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 2.0.0-1"
+      ]
+    },
+    {
+      "case": "native-dependency-summary",
+      "status": 0,
+      "failures": [],
+      "frames": 29,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-dep-a 1-1",
+        "pacpin-ui-dep-b 1-1",
+        "pacpin-ui-native 2.0.0-1"
+      ]
+    },
+    {
+      "case": "native-no-cache",
+      "status": 0,
+      "failures": [],
+      "frames": 27,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 2.0.0-1"
+      ]
+    },
+    {
+      "case": "native-cache-cleanup-failure",
+      "status": 1,
+      "failures": [],
+      "frames": 30,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 2.0.0-1"
+      ]
+    },
+    {
+      "case": "native-storage-refusal",
+      "status": 1,
+      "failures": [],
+      "frames": 2,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1"
+      ]
+    },
+    {
+      "case": "repository-menu-narrow-cancel",
+      "status": 0,
+      "failures": [],
+      "frames": 2,
+      "resized": false,
+      "cancelled": true,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1"
+      ]
+    },
+    {
+      "case": "orphan-selection-download-and-enter",
+      "status": 0,
+      "failures": [],
+      "frames": 107,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 2.0.0-1",
+        "pacpin-ui-orphan-00 1-1",
+        "pacpin-ui-orphan-01 1-1",
+        "pacpin-ui-orphan-02 1-1",
+        "pacpin-ui-orphan-03 1-1",
+        "pacpin-ui-orphan-04 1-1",
+        "pacpin-ui-orphan-05 1-1",
+        "pacpin-ui-orphan-06 1-1",
+        "pacpin-ui-orphan-07 1-1",
+        "pacpin-ui-orphan-08 1-1",
+        "pacpin-ui-orphan-09 1-1",
+        "pacpin-ui-orphan-10 1-1",
+        "pacpin-ui-orphan-11 1-1",
+        "pacpin-ui-orphan-12 1-1",
+        "pacpin-ui-orphan-13 1-1",
+        "pacpin-ui-orphan-14 1-1",
+        "pacpin-ui-orphan-15 1-1",
+        "pacpin-ui-orphan-16 1-1",
+        "pacpin-ui-orphan-17 1-1",
+        "pacpin-ui-orphan-18 1-1",
+        "pacpin-ui-orphan-19 1-1",
+        "pacpin-ui-orphan-20 1-1",
+        "pacpin-ui-orphan-21 1-1",
+        "pacpin-ui-orphan-22 1-1",
+        "pacpin-ui-orphan-23 1-1",
+        "pacpin-ui-orphan-24 1-1",
+        "pacpin-ui-source 2.0.0-1"
+      ]
+    },
+    {
+      "case": "orphan-selection-download-already-finished",
+      "status": 0,
+      "failures": [],
+      "frames": 70,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 2.0.0-1",
+        "pacpin-ui-orphan-00 1-1",
+        "pacpin-ui-orphan-01 1-1",
+        "pacpin-ui-orphan-02 1-1",
+        "pacpin-ui-orphan-03 1-1",
+        "pacpin-ui-orphan-04 1-1",
+        "pacpin-ui-orphan-05 1-1",
+        "pacpin-ui-orphan-06 1-1",
+        "pacpin-ui-orphan-07 1-1",
+        "pacpin-ui-orphan-08 1-1",
+        "pacpin-ui-orphan-09 1-1",
+        "pacpin-ui-orphan-10 1-1",
+        "pacpin-ui-orphan-11 1-1",
+        "pacpin-ui-orphan-12 1-1",
+        "pacpin-ui-orphan-13 1-1",
+        "pacpin-ui-orphan-14 1-1",
+        "pacpin-ui-orphan-15 1-1",
+        "pacpin-ui-orphan-16 1-1",
+        "pacpin-ui-orphan-17 1-1",
+        "pacpin-ui-orphan-18 1-1",
+        "pacpin-ui-orphan-19 1-1",
+        "pacpin-ui-orphan-20 1-1",
+        "pacpin-ui-orphan-21 1-1",
+        "pacpin-ui-orphan-22 1-1",
+        "pacpin-ui-orphan-23 1-1",
+        "pacpin-ui-orphan-24 1-1",
+        "pacpin-ui-source 2.0.0-1"
+      ]
+    },
+    {
+      "case": "orphan-selection-wait-interrupted",
+      "status": 130,
+      "failures": [],
+      "frames": 11,
+      "resized": false,
+      "cancelled": true,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-orphan-00 1-1",
+        "pacpin-ui-orphan-01 1-1",
+        "pacpin-ui-orphan-02 1-1",
+        "pacpin-ui-orphan-03 1-1",
+        "pacpin-ui-orphan-04 1-1",
+        "pacpin-ui-orphan-05 1-1",
+        "pacpin-ui-orphan-06 1-1",
+        "pacpin-ui-orphan-07 1-1",
+        "pacpin-ui-orphan-08 1-1",
+        "pacpin-ui-orphan-09 1-1",
+        "pacpin-ui-orphan-10 1-1",
+        "pacpin-ui-orphan-11 1-1",
+        "pacpin-ui-orphan-12 1-1",
+        "pacpin-ui-orphan-13 1-1",
+        "pacpin-ui-orphan-14 1-1",
+        "pacpin-ui-orphan-15 1-1",
+        "pacpin-ui-orphan-16 1-1",
+        "pacpin-ui-orphan-17 1-1",
+        "pacpin-ui-orphan-18 1-1",
+        "pacpin-ui-orphan-19 1-1",
+        "pacpin-ui-orphan-20 1-1",
+        "pacpin-ui-orphan-21 1-1",
+        "pacpin-ui-orphan-22 1-1",
+        "pacpin-ui-orphan-23 1-1",
+        "pacpin-ui-orphan-24 1-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "orphan-selection-interrupted",
+      "status": 130,
+      "failures": [],
+      "frames": 9,
+      "resized": false,
+      "cancelled": true,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-orphan-00 1-1",
+        "pacpin-ui-orphan-01 1-1",
+        "pacpin-ui-orphan-02 1-1",
+        "pacpin-ui-orphan-03 1-1",
+        "pacpin-ui-orphan-04 1-1",
+        "pacpin-ui-orphan-05 1-1",
+        "pacpin-ui-orphan-06 1-1",
+        "pacpin-ui-orphan-07 1-1",
+        "pacpin-ui-orphan-08 1-1",
+        "pacpin-ui-orphan-09 1-1",
+        "pacpin-ui-orphan-10 1-1",
+        "pacpin-ui-orphan-11 1-1",
+        "pacpin-ui-orphan-12 1-1",
+        "pacpin-ui-orphan-13 1-1",
+        "pacpin-ui-orphan-14 1-1",
+        "pacpin-ui-orphan-15 1-1",
+        "pacpin-ui-orphan-16 1-1",
+        "pacpin-ui-orphan-17 1-1",
+        "pacpin-ui-orphan-18 1-1",
+        "pacpin-ui-orphan-19 1-1",
+        "pacpin-ui-orphan-20 1-1",
+        "pacpin-ui-orphan-21 1-1",
+        "pacpin-ui-orphan-22 1-1",
+        "pacpin-ui-orphan-23 1-1",
+        "pacpin-ui-orphan-24 1-1",
+        "pacpin-ui-orphan-cancel 1-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "native-real-extraction-failure",
+      "status": 1,
+      "failures": [],
+      "frames": 49,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 2.0.0-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "native-commit-failure-no-cache",
+      "status": 23,
+      "failures": [],
+      "frames": 56,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "ephemeral-flatpak-signal-failure",
+      "status": 1,
+      "failures": [],
+      "frames": 1,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "ephemeral-pipx-signal-failure",
+      "status": 1,
+      "failures": [],
+      "frames": 1,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "ephemeral-nix-signal-failure",
+      "status": 1,
+      "failures": [],
+      "frames": 1,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-native 1.0.0-1",
+        "pacpin-ui-source 1.0.0-1"
+      ]
+    },
+    {
+      "case": "orphan-removal-failure",
+      "status": 1,
+      "failures": [],
+      "frames": 1,
+      "resized": false,
+      "cancelled": false,
+      "installed": [
+        "pacpin-ui-orphan-failure 1-1"
+      ]
+    }
+  ]
+}

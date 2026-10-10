@@ -222,7 +222,7 @@ package() {{
                 path.unlink()
         run("sudo", "-n", "pacman", "-Sy", "--noconfirm")
 
-    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello"):
+    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello", orphan_choice=None, expect_no_orphan_prompt=False):
         result = self.root / f"{name}.status"
         result.unlink(missing_ok=True)
         raw = self.root / f"{name}.raw.txt"
@@ -270,6 +270,12 @@ package() {{
             if confirm and not confirmed and "Proceed with installation?" in screen:
                 self.rc("send-text", "--stdin", input="y\n")
                 confirmed = True
+            if orphan_choice is not None and selection_started is None and "Showing " in screen and "Enter confirms" in screen:
+                self.rc("send-text", "--stdin", input=orphan_choice)
+                selection_started = time.monotonic()
+            if orphan_choice is not None and selection_started and not selection_enter and time.monotonic() - selection_started > 0.3:
+                self.rc("send-key", "enter")
+                selection_enter = True
             if selection and selection_started is None and "Showing " in screen and "Enter confirms" in screen:
                 self.rc("send-text", "--stdin", input="n")
                 self.rc("send-key", "end")
@@ -343,6 +349,10 @@ package() {{
             failures.append("menu cancellation not exercised")
         if selection and not selection_enter:
             failures.append("single Enter confirmation not exercised")
+        if orphan_choice is not None and not selection_enter:
+            failures.append("pending orphan cleanup was not offered for fresh confirmation")
+        if expect_no_orphan_prompt and any("Enter confirms" in frame for frame in snapshots):
+            failures.append("orphan cleanup unexpectedly prompted after explicit decline/completion")
         if selection_wait and not any("Waiting for repository downloads to finish..." in " ".join(frame.split()) and re.search(r"(?:^|\n)Pacman:.*(?:Downloading|Verifying)", frame) for frame in snapshots):
             failures.append("repository download footer missing after Enter while downloads remain active")
         raw_text = transcript(raw)
