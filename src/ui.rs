@@ -425,6 +425,13 @@ pub fn prompt_orphan_selection(
     if orphans.is_empty() {
         return Vec::new();
     }
+    crate::progress::selection_operation(|| orphan_selection_inner(orphans, is_after_upgrade))
+}
+
+fn orphan_selection_inner(
+    orphans: &[crate::db::OrphanPackage],
+    is_after_upgrade: bool,
+) -> Vec<String> {
 
     if io::stdin().is_terminal() {
         let title = if is_after_upgrade {

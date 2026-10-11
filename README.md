@@ -102,6 +102,8 @@ Confirmed orphan cleanup is recorded separately from the known-package inventory
 
 Removal checks the entire selection against the installed dependency graph. Dependencies needed by a retained package, including an unchecked optional orphan, are kept with an explanation. Removal is limited to the confirmed targets; unchecked dependencies remain installed. Orphan removal and cache cleanup appear as separate footer steps; completed upgrades remain checked while cleanup runs. `--keep-going` does not enable orphan removal after an upgrade failure.
 
+The shared footer also describes repository refresh, update/dependency/space checks, plan approval, orphan review, source extraction, saved records, hook rebuilds and restart inspection. Orphan review has its own row even without downloads; concurrent repository downloads remain visible alongside it. Failed managers stay marked during continuation. Short terminals prioritize active work and recent failures over older completed rows.
+
 The final plan summary follows dependency and removal details. Its native counts and sizes include the prepared transaction's additional packages: for example, `41 upgrades + 7 new dependencies`, with no `+ 0` when there are none. Sources and other managers retain unknown sizes rather than appearing to add zero bytes.
 
 `--no-cache` cleans only the native/AUR caches involved in successful manager transactions. Sources remove their temporary workspaces separately. Cleanup reports completion, failure, or a reason for skipping; failed-manager archives remain available for recovery. A requested cleanup failure makes the command fail even when package installation succeeded. Cleanup finishes before restart advice.

@@ -61,6 +61,10 @@ package() {{ install -Dm644 /etc/os-release "$pkgdir/opt/{name}/app"; }}
         (parent / "desc").write_text("%NAME%\npacpin-ui-retained-host\n\n%VERSION%\n1-1\n\n%REASON%\n0\n\n%SIZE%\n1\n\n%OPTDEPENDS%\npacpin-ui-viewer: Document viewer\n\n")
         (parent / "files").write_text("%FILES%\n\n")
         try:
+            self.case("orphan-review-without-downloads", ["orphans", "-c"], orphan_choice="n", orphans=False, cache=False, width=40)
+            frames = json.loads((self.root / "orphan-review-without-downloads.frames.json").read_text())
+            assert any("Review: Choosing orphan cleanup" in frame for frame in frames)
+            assert not any("Pacman:" in frame for frame in frames)
             self.case("retained-viewer-keeps-transitive-dependencies", ["orphans", "-c", "--noconfirm"], orphans=True, cache=False, width=40)
             text = transcript(self.root / "retained-viewer-keeps-transitive-dependencies.raw.txt")
             assert "Keeping pacpin-ui-spell" in text and "Keeping pacpin-ui-backend" in text
@@ -100,6 +104,9 @@ package() {{ install -Dm644 /etc/os-release "$pkgdir/opt/{name}/app"; }}
         assert not any((self.root / "cache").iterdir())
         frames = json.loads((self.root / "native-source-orphans-cache-ordered-footer.frames.json").read_text())
         assert any("Sources: ✔" in frame and "Orphans:" in frame for frame in frames)
+        text = transcript(self.root / "native-source-orphans-cache-ordered-footer.raw.txt")
+        for phase in ["Checks:", "Records:", "Restart:", "Extracting source archive", "Releasing build scratch"]:
+            assert phase in text, f"missing invocation phase: {phase}"
         assert not (self.root / "db/db.lck").exists()
 
         cache = self.root / "cache"
@@ -180,6 +187,8 @@ package() {{ install -Dm644 /etc/os-release "$pkgdir/opt/{name}/app"; }}
         try:
             self.cfg.write_text(original_cfg.replace('helper = "paru"', f'helper = "{paru}"').replace('[pins]', '[pins]\nhello = "aur"'))
             self.case("keep-going-source-success-skips-orphans-after-aur-failure", ["-Su", "--keep-going", "--autoremove", "--noconfirm"], aur=True, source=True, source_completed=True, success=False, expected_error="Orphan cleanup is skipped", orphans=False, cache=False)
+            frames = json.loads((self.root / "keep-going-source-success-skips-orphans-after-aur-failure.frames.json").read_text())
+            assert any("AUR: ✗ Operation failed" in frame and "Sources:" in frame for frame in frames)
             assert run("pacman", "-Q", "pacpin-ui-unused").strip() == "pacpin-ui-unused 1-1"
             assert json.loads(pending.read_text()) == ["pacpin-ui-unused"]
         finally:

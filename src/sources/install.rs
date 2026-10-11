@@ -452,7 +452,7 @@ fn build(plan: &Plan, work: &Path, artifact: &Path) -> Result<PathBuf, String> {
     fs::create_dir(&payload).map_err(|e| e.to_string())?;
     fs::set_permissions(&payload, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
     if plan.recipe.format == Format::Archive {
-        crate::download::extract_archive(artifact, &payload)?;
+        crate::progress::operation(crate::progress::Manager::Sources, "Extracting source archive", || crate::download::extract_archive(artifact, &payload))?;
     } else {
         verify_elf(artifact, true)?;
         fs::copy(artifact, payload.join("artifact")).map_err(|e| e.to_string())?;
@@ -518,12 +518,15 @@ fn build(plan: &Plan, work: &Path, artifact: &Path) -> Result<PathBuf, String> {
     }
     // Only the package archive is needed by pacman. Release the unpacked tree
     // before root installation, rather than retaining another full payload.
-    for directory in ["pkg", "src", "payload"] {
-        let path = work.join(directory);
-        if path.exists() {
-            fs::remove_dir_all(&path).map_err(|e| format!("Cannot release source build tree {}: {e}", path.display()))?;
+    crate::progress::operation(crate::progress::Manager::Sources, "Releasing build scratch", || -> Result<(), String> {
+        for directory in ["pkg", "src", "payload"] {
+            let path = work.join(directory);
+            if path.exists() {
+                fs::remove_dir_all(&path).map_err(|e| format!("Cannot release source build tree {}: {e}", path.display()))?;
+            }
         }
-    }
+        Ok(())
+    })?;
     Ok(packages[0].clone())
 }
 
@@ -564,7 +567,7 @@ fn execute_inner(config: &mut Config, plan: &Plan, needed: bool, permit: Option<
     let package = if plan.recipe.format == Format::Native {
         artifact
     } else {
-        let artifact = prepare_build(plan, &mut work)?;
+        let artifact = crate::progress::operation(crate::progress::Manager::Sources, "Checking source build space", || prepare_build(plan, &mut work))?;
         build(plan, &work.0, &artifact)?
     };
     let manager =

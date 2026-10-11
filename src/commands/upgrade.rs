@@ -61,7 +61,7 @@ pub fn cmd_upgrade(
     let mut provider_config = config.clone();
     if scope != crate::runtime::UpgradeScope::All { provider_config.features.integrations = false; }
     if scope == crate::runtime::UpgradeScope::Aur { provider_config.sources.clear(); }
-    let ext_providers = IntegrationsManager::get_active_providers(&provider_config)
+    let ext_providers = crate::progress::operation(crate::progress::Manager::Checks, "Detecting package managers", || IntegrationsManager::get_active_providers(&provider_config))
         .into_iter().filter(|p| scope.includes_runner(p.name())).collect::<Vec<_>>();
     if !scope.includes_native() && refresh {
         println!(":: Scoped upgrade: native repository databases are not refreshed. AUR builds may still require native build dependencies.");
@@ -73,16 +73,16 @@ pub fn cmd_upgrade(
             config.options.privilege_tool
         );
 
-        let ext_refresh_providers = ext_providers.clone();
+        let ext_refresh_providers = ext_providers.iter().filter(|provider| provider.supports_refresh()).cloned().collect::<Vec<_>>();
         let ext_refresh_handle = if !ext_refresh_providers.is_empty() {
             Some(thread::spawn(move || {
-                IntegrationsManager::refresh_all_parallel(&ext_refresh_providers);
+                crate::progress::context(crate::progress::Manager::Metadata, "Refreshing external metadata", || IntegrationsManager::refresh_all_parallel(&ext_refresh_providers));
             }))
         } else {
             None
         };
 
-        let status = crate::privilege::command(&config.options.privilege_tool).args(["pacman", "-Sy"]).status();
+        let status = pm::refresh_databases(config);
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => {
@@ -103,7 +103,7 @@ pub fn cmd_upgrade(
         }
 
         if let Some(h) = ext_refresh_handle {
-            let _ = h.join();
+            crate::progress::operation(crate::progress::Manager::Metadata, "Refreshing external metadata", || { let _ = h.join(); });
         }
     }
 
@@ -112,7 +112,7 @@ pub fn cmd_upgrade(
         IntegrationsManager::check_updates_parallel(&ext_providers_for_check)
     });
 
-    let mut manager = match AlpmManager::with_repo_order(&config.repo_order) {
+    let mut manager = match crate::progress::operation(crate::progress::Manager::Checks, "Reading package databases", || AlpmManager::with_repo_order(&config.repo_order)) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{}", format!("Error initializing ALPM: {}", e).red());
@@ -125,7 +125,7 @@ pub fn cmd_upgrade(
     let resolver = ResolverEngine::new(&manager);
     let mut res = if scope == crate::runtime::UpgradeScope::Sources {
         ResolveResult { installed_count: manager.handle().localdb().pkgs().len(), repos: Vec::new(), packages: std::collections::HashMap::new(), updates: Vec::new(), held_packages: Vec::new(), unresolved_pins: Vec::new() }
-    } else { resolver.resolve_all(config) };
+    } else { crate::progress::operation(crate::progress::Manager::Checks, "Checking package updates", || resolver.resolve_all(config)) };
     res.updates.retain(|p| if p.candidate.as_ref().is_some_and(|c| c.is_aur) { scope.includes_aur() } else { scope.includes_native() });
     if !scope.includes_native() {
         res.held_packages.retain(|p| scope.includes_aur() && p.candidate.as_ref().is_some_and(|c| c.is_aur));
@@ -159,11 +159,11 @@ pub fn cmd_upgrade(
             .retain(|held| !ignored.contains(&held.name));
     }
     let orphans = if scope.includes_native() && (config.features.smart_orphans || autoremove) {
-        manager.get_orphans(&res.updates)
+        crate::progress::operation(crate::progress::Manager::Checks, "Checking orphan candidates", || manager.get_orphans(&res.updates))
     } else {
         Vec::new()
     };
-    let mut external_updates = ext_handle.join().unwrap_or_default();
+    let mut external_updates = crate::progress::operation(crate::progress::Manager::Checks, "Checking external updates", || ext_handle.join().unwrap_or_default());
     external_updates.retain(|update| update.runner != "Sources" || !crate::sources::ignored(&update.name, extra_flags));
 
     // Explicitly requested targets (`pin -Syu <pkg...>`) join the upgrade in
@@ -314,7 +314,7 @@ pub fn cmd_upgrade(
     // Prepare the real native transaction (lock-free, no download, no
     // install) so solver-pulled dependencies, removals, and replacements are
     // approved explicitly instead of surfacing mid-transaction.
-    let preview = match prepare_native_preview(&mut manager, &pacman_targets) {
+    let preview = match crate::progress::operation(crate::progress::Manager::Checks, "Resolving transaction dependencies", || prepare_native_preview(&mut manager, &pacman_targets)) {
         Ok(preview) => preview,
         Err(error) => {
             eprintln!("{}", format!("Error: {error}").red());
@@ -472,7 +472,7 @@ pub fn cmd_upgrade(
     let full_cmd = command_strs.join(" && ");
 
     if !pacman_targets.is_empty() {
-        if let Err(error) = crate::preview::check_native_capacity(&preview) {
+        if let Err(error) = crate::progress::operation(crate::progress::Manager::Checks, "Checking installation space", || crate::preview::check_native_capacity(&preview)) {
             if dry_run {
                 eprintln!(":: Dry-run storage check: {error}");
             } else {
@@ -558,10 +558,12 @@ pub fn cmd_upgrade(
             );
             exit(1);
         }
-        print!("{}", "Proceed with installation? [Y/n] ".bold());
-        io::stdout().flush().unwrap();
         let mut resp = String::new();
-        if io::stdin().read_line(&mut resp).is_err() {
+        if crate::progress::operation(crate::progress::Manager::Review, "Awaiting plan approval", || {
+            print!("{}", "Proceed with installation? [Y/n] ".bold());
+            io::stdout().flush()?;
+            io::stdin().read_line(&mut resp)
+        }).is_err() {
             println!("\nAborted.");
             return;
         }
@@ -576,7 +578,7 @@ pub fn cmd_upgrade(
                 // Acquire credentials before the TUI takes over the terminal.
                 // The child then runs without terminal input or output while
                 // the user reviews the projected orphan list.
-                match crate::privilege::command(&config.options.privilege_tool).arg("-v").status() {
+                match pm::authorize_downloads(config) {
                     Ok(status) if status.success() => {
                         match crate::progress::start_background(&mut repo_prefetch_command(&pacman_targets, &forwarded_pacman_flags)) {
                             Ok(child) => {
@@ -638,11 +640,11 @@ pub fn cmd_upgrade(
     // Re-prepare immediately before executing: if the sync databases moved
     // between approval and execution, refuse to run a plan that was not approved.
     if !pacman_targets.is_empty() {
-        if let Err(error) = crate::preview::check_native_capacity(&preview) {
+        if let Err(error) = crate::progress::operation(crate::progress::Manager::Checks, "Rechecking installation space", || crate::preview::check_native_capacity(&preview)) {
             eprintln!("Error: {error}");
             exit(1);
         }
-        match prepare_native_preview(&mut manager, &pacman_targets) {
+        match crate::progress::operation(crate::progress::Manager::Checks, "Revalidating approved transaction", || prepare_native_preview(&mut manager, &pacman_targets)) {
             Ok(fresh) if fresh.signature() == preview.signature() => {}
             Ok(_) => {
                 eprintln!("{}", "Error: The native transaction changed after approval (sync databases moved); re-run to review the new plan.".red());
@@ -696,7 +698,7 @@ pub fn cmd_upgrade(
                 let dependencies: Vec<_> = crate::preview::partition_new_dependencies(&preview, &explicit_names).into_iter().map(|p| p.name.as_str()).collect();
                 if !dependencies.is_empty() {
                     println!(":: Recording newly installed packages as dependencies...");
-                    match crate::privilege::command(&config.options.privilege_tool).args(["pacman", "-D", "--asdeps", "--"]).args(&dependencies).status() {
+                    match pm::mark_dependencies(config, &dependencies) {
                         Ok(status) if status.success() => {}
                         _ => eprintln!(":: Warning: Packages installed, but dependency install reasons could not be updated. Review them with pacman -Qi."),
                     }
@@ -875,7 +877,7 @@ pub fn cmd_upgrade(
         } else {
             executed_commands.join(" && ")
         };
-        let _ = TransactionJournal::record_transaction("upgrade", tx_packages, &cmd_to_record);
+        let _ = crate::progress::operation(crate::progress::Manager::Record, "Saving upgrade history", || TransactionJournal::record_transaction("upgrade", tx_packages, &cmd_to_record));
 
     }
 
@@ -887,7 +889,7 @@ pub fn cmd_upgrade(
         // after the real transaction.
         match AlpmManager::with_repo_order(&config.repo_order) {
             Ok(fresh_manager) => {
-                let actual_orphans = fresh_manager.get_orphans(&[]);
+                let actual_orphans = crate::progress::operation(crate::progress::Manager::Checks, "Rechecking orphan dependencies", || fresh_manager.get_orphans(&[]));
                 let safe_selection = revalidate_orphan_selection(&selected_orphans, &actual_orphans, noconfirm);
                 if safe_selection.len() != selected_orphans.len() {
                     eprintln!("{}", ":: Some projected orphans are still required or were already removed; skipping those selections.".yellow());

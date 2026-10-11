@@ -251,7 +251,7 @@ impl Plan {
             outcome.success = false;
             return outcome;
         }
-        let after = match AlpmManager::with_repo_order(&config.repo_order) {
+        let after = match crate::progress::operation(crate::progress::Manager::Checks, "Verifying hook conditions", || AlpmManager::with_repo_order(&config.repo_order)) {
             Ok(manager) => versions(&manager),
             Err(error) => {
                 eprintln!(":: Cannot verify updates for hooks: {error}");
@@ -272,6 +272,7 @@ impl Plan {
             .filter(|(p, v)| self.before.contains_key(*p) && self.before.get(*p) != Some(*v))
             .map(|(p, _)| p.clone())
             .collect();
+        let mut ran = false;
         for (name, hook, matched) in &self.entries {
             let changed = verified_changes(&self.before, &self.expected, &after, matched);
             if changed.is_empty() || !hook.matches(&verified, &actual) {
@@ -282,6 +283,7 @@ impl Plan {
                 "\n:: Running post-update hook: {name} ({})",
                 changed.join(", ")
             );
+            ran = true;
             let result = match &hook.action {
                 Action::Script { command } => {
                     let mut child = Command::new(&command[0]);
@@ -305,7 +307,7 @@ impl Plan {
                     .map_err(|e| e.to_string())
                 }
                 Action::RebuildAur { packages } => {
-                    let report = crate::pm::rebuild_aur(config, packages, noconfirm);
+                    let report = crate::progress::context(crate::progress::Manager::Hooks, "Rebuilding triggered packages", || crate::pm::rebuild_aur(config, packages, noconfirm));
                     if let Some(success) = report.cache {
                         outcome.aur = Some(outcome.aur.unwrap_or(true) && success);
                     }
@@ -332,6 +334,10 @@ impl Plan {
                 println!(":: Remaining post-update hooks skipped after hook failure.");
                 break;
             }
+        }
+        if ran {
+            if outcome.success { crate::progress::completed(crate::progress::Manager::Hooks); }
+            else { crate::progress::failed(crate::progress::Manager::Hooks); }
         }
         outcome
     }

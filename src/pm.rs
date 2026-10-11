@@ -16,6 +16,35 @@ pub use orphans::remove_orphans;
 pub use rebuild::{validate_rebuild, rebuild_aur};
 pub use continuation::{execute_aur, ensure_independent, continuation_archive_check, AurBuildFailurePermit, AurOperation};
 
+pub fn refresh_databases(config: &Config) -> io::Result<std::process::ExitStatus> {
+    check_lock().map_err(io::Error::other)?;
+    crate::progress::run(
+        crate::privilege::command(&config.options.privilege_tool).args(["pacman", "-Sy"]),
+        crate::progress::Manager::Refresh, "Refreshing repositories", || {},
+    )
+}
+
+pub fn authorize_downloads(config: &Config) -> io::Result<std::process::ExitStatus> {
+    if config.options.privilege_tool != "sudo" {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "Background repository downloads require sudo authorization"));
+    }
+    crate::progress::run(
+        crate::privilege::command("sudo").arg("-v"),
+        crate::progress::Manager::Review, "Authorizing repository downloads", || {},
+    )
+}
+
+pub fn mark_dependencies(config: &Config, names: &[&str]) -> io::Result<std::process::ExitStatus> {
+    check_lock().map_err(io::Error::other)?;
+    if names.is_empty() || names.iter().any(|name| !crate::utils::is_safe_pkg_name(name)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid dependency targets"));
+    }
+    crate::progress::run(
+        crate::privilege::command(&config.options.privilege_tool).args(["pacman", "-D", "--asdeps", "--"]).args(names),
+        crate::progress::Manager::Record, "Recording dependency reasons", || {},
+    )
+}
+
 pub fn validate_aur_scratch(config: &Config, flags: &[String]) -> Result<(), String> {
     workspace::validate(&config.options.helper, crate::scratch::policy(), flags)
 }
@@ -849,7 +878,8 @@ pub fn clean_scoped(
             .map_err(|error| format!("Could not prepare cache-clean answers: {error}"))?;
         Stdio::from(std::os::fd::OwnedFd::from(input))
     } else { Stdio::inherit() };
-    let status = crate::progress::run_with_stdin(&mut cmd, crate::progress::Manager::Cache, "Cleaning package cache", input);
+    let label = if is_aur_only { "Cleaning AUR build cache" } else if force_native_only || cache_scope(extra_args)? == CacheScope::Native { "Cleaning native package cache" } else { "Cleaning package caches" };
+    let status = crate::progress::run_with_stdin(&mut cmd, crate::progress::Manager::Cache, label, input);
     match status {
         Ok(s) => {
             if s.success() { crate::progress::completed(crate::progress::Manager::Cache); }
@@ -989,7 +1019,7 @@ fn prune_download_directories(config: &Config, full: bool) -> Result<(), String>
             command.args(["/usr/bin/rm", "-rf", "--one-file-system", "--preserve-root=all"]);
         } else { command.arg("/usr/bin/rmdir"); }
         command.arg("--").args(paths);
-        let status = crate::progress::run(&mut command, crate::progress::Manager::Cache, "Clearing download directories", || {})
+        let status = crate::progress::run(&mut command, crate::progress::Manager::Cache, "Clearing native download directories", || {})
             .map_err(|error| format!("Download directory cleanup failed: {error}"))?;
         if !status.success() { return Err(format!("Download directory cleanup exited with {status}; recent or non-empty directories were preserved where removal was unsafe")); }
         for path in paths {

@@ -267,8 +267,10 @@ impl RestartInspector {
         updated_pkgs: &[crate::resolver::ResolvedPackage],
         privilege_tool: &str,
     ) {
-        let kernel_update = Self::check_kernel_update(updated_pkgs);
-        let services = Self::check_deleted_libraries();
+        let (kernel_update, services) = crate::progress::operation(
+            crate::progress::Manager::Restart, "Checking restart requirements",
+            || (Self::check_kernel_update(updated_pkgs), Self::check_deleted_libraries()),
+        );
 
         // Zero-noise guarantee: if nothing requires attention, print nothing
         if kernel_update.is_none() && services.is_empty() {

@@ -403,7 +403,7 @@ impl OrphanManager {
         }
 
         let manager = crate::db::AlpmManager::new().map_err(|error| format!("Cannot recheck orphan dependencies: {error}"))?;
-        let selected = Self::safe_selection(manager.handle(), selected)?;
+        let selected = crate::progress::operation(crate::progress::Manager::Checks, "Checking removal dependencies", || Self::safe_selection(manager.handle(), selected))?;
         Self::record_selection(&selected)?;
         if selected.is_empty() {
             println!(":: No selected orphans can be removed without removing a retained package.");

@@ -53,6 +53,7 @@ pub trait IntegrationProvider: Send + Sync {
     fn name(&self) -> &'static str;
     fn is_available(&self) -> bool;
     fn refresh_metadata(&self) -> Result<(), std::io::Error>;
+    fn supports_refresh(&self) -> bool { false }
     fn check_updates(&self) -> Vec<ExternalUpdate>;
     fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String;
     fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> Result<bool, std::io::Error>;
@@ -72,6 +73,7 @@ pub trait IntegrationProvider: Send + Sync {
 pub struct FlatpakProvider;
 
 impl IntegrationProvider for FlatpakProvider {
+    fn supports_refresh(&self) -> bool { true }
     fn supports_clean(&self) -> bool { true }
     fn name(&self) -> &'static str {
         "Flatpak"
@@ -186,6 +188,7 @@ impl IntegrationProvider for FlatpakProvider {
 pub struct NixProvider;
 
 impl IntegrationProvider for NixProvider {
+    fn supports_refresh(&self) -> bool { true }
     fn supports_clean(&self) -> bool { true }
     fn name(&self) -> &'static str {
         "Nix"
@@ -433,6 +436,7 @@ impl IntegrationsManager {
     }
 
     pub fn refresh_all_parallel(providers: &[Arc<dyn IntegrationProvider>]) {
+        let providers: Vec<_> = providers.iter().filter(|p| p.supports_refresh()).collect();
         if providers.is_empty() {
             return;
         }
@@ -531,6 +535,7 @@ impl IntegrationsManager {
         let source_count = updates.iter().filter(|u| u.runner == "Sources").count();
         let completed = outcomes.iter().filter(|(_, success)| *success).count();
         if source_count != 0 && completed == source_count { crate::progress::completed(crate::progress::Manager::Sources); }
+        else if source_count != 0 { crate::progress::failed(crate::progress::Manager::Sources); }
         if source_count != 0 { println!(":: Sources after AUR failure: {completed} completed, {} not completed.", source_count.saturating_sub(completed)); }
         outcomes
     }
@@ -559,20 +564,21 @@ impl IntegrationsManager {
                 p_updates.len(),
                 cmd_str.dimmed()
             );
-            match p.execute_upgrade(&p_updates) {
-                Ok(true) => {
-                    let manager = match p.name() {
+            let manager = match p.name() {
                         "Sources" => Some(crate::progress::Manager::Sources),
                         "Flatpak" => Some(crate::progress::Manager::Flatpak),
                         "Nix" => Some(crate::progress::Manager::Nix),
                         "Pipx" => Some(crate::progress::Manager::Pipx),
                         _ => None,
-                    };
+            };
+            match p.execute_upgrade(&p_updates) {
+                Ok(true) => {
                     if let Some(manager) = manager { crate::progress::completed(manager); }
                     println!("✔ {} upgrade completed successfully.", p.name().green());
                     outcomes.push((p.name().to_string(), cmd_str, true));
                 }
                 Ok(false) => {
+                    if let Some(manager) = manager { crate::progress::failed(manager); }
                     eprintln!(
                         "{}",
                         format!("Warning: {} upgrade exited with errors.", p.name()).yellow()
@@ -580,6 +586,7 @@ impl IntegrationsManager {
                     outcomes.push((p.name().to_string(), cmd_str, false));
                 }
                 Err(e) => {
+                    if let Some(manager) = manager { crate::progress::failed(manager); }
                     eprintln!(
                         "{}",
                         format!("Failed to run {} upgrade: {}", p.name(), e).red()
@@ -729,6 +736,18 @@ mod tests {
         let selected = IntegrationsManager::filter_available_parallel(providers);
         assert_eq!(selected.iter().map(|p| p.name()).collect::<Vec<_>>(), vec!["one", "three"]);
         assert!(peak.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn metadata_refresh_requires_an_explicit_capability() {
+        assert!(FlatpakProvider.supports_refresh());
+        assert!(NixProvider.supports_refresh());
+        assert!(!PipxProvider.supports_refresh());
+        assert!(!crate::sources::SourceProvider::new(&Config::default()).supports_refresh());
+        let provider = MockProvider { label: "future", available: true,
+            active: Arc::new(AtomicUsize::new(0)), peak: Arc::new(AtomicUsize::new(0)) };
+        assert!(!provider.supports_refresh());
+        IntegrationsManager::refresh_all_parallel(&[Arc::new(provider)]);
     }
 
     #[test]

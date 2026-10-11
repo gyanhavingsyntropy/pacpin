@@ -27,15 +27,67 @@ thread_local! { static BACKGROUND: Cell<bool> = const { Cell::new(false) }; }
 thread_local! { static SOURCE_DISPLAY: RefCell<Option<Footer>> = const { RefCell::new(None) }; }
 static TERMINAL: Mutex<Option<(libc::termios, u16)>> = Mutex::new(None);
 static COMPLETED: Mutex<Vec<Manager>> = Mutex::new(Vec::new());
+static FAILED: Mutex<Vec<Manager>> = Mutex::new(Vec::new());
 static NATIVE_BACKGROUND: Mutex<Option<String>> = Mutex::new(None);
+static CONTEXT: Mutex<Option<(Manager, String)>> = Mutex::new(None);
 thread_local! { static SELECTION_DISPLAY: RefCell<Option<Footer>> = const { RefCell::new(None) }; }
 
 pub fn begin_transaction() {
     COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    FAILED.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 pub fn completed(manager: Manager) {
+    FAILED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&m| m != manager);
     let mut completed = COMPLETED.lock().unwrap_or_else(|e| e.into_inner());
     if !completed.contains(&manager) { completed.push(manager); }
+}
+
+pub fn failed(manager: Manager) {
+    COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&m| m != manager);
+    let mut failed = FAILED.lock().unwrap_or_else(|e| e.into_inner());
+    if !failed.contains(&manager) { failed.push(manager); }
+}
+
+/// An outer operation may own work performed by another manager (an AUR
+/// rebuild triggered by a hook). Add its actual context without another footer.
+pub fn context<T>(manager: Manager, label: &str, work: impl FnOnce() -> T) -> T {
+    struct Reset(Option<(Manager, String)>);
+    impl Drop for Reset {
+        fn drop(&mut self) { *CONTEXT.lock().unwrap_or_else(|e| e.into_inner()) = self.0.take(); }
+    }
+    let _reset = Reset(CONTEXT.lock().unwrap_or_else(|e| e.into_inner()).replace((manager, label.into())));
+    work()
+}
+
+/// Display a phase owned by pacpin itself. Child processes use `run` instead;
+/// nesting a phase must never replace the terminal restoration owner.
+pub fn operation<T>(manager: Manager, label: &str, work: impl FnOnce() -> T) -> T {
+    crate::sandbox::init_signal_handlers();
+    struct Display {
+        stop: std::sync::mpsc::Sender<()>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Display {
+        fn drop(&mut self) {
+            let _ = self.stop.send(());
+            if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        }
+    }
+    let footer = if interactive() && TERMINAL.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        Footer::new(manager, false).ok()
+    } else { None };
+    let _display = footer.map(|mut footer| {
+        let _ = footer.draw(label);
+        let label = label.to_owned();
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            while matches!(stopped.recv_timeout(std::time::Duration::from_millis(100)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                if footer.resize().and_then(|_| footer.draw(&label)).is_err() { break; }
+            }
+        });
+        Display { stop, worker: Some(worker) }
+    });
+    work()
 }
 
 pub fn register_input_restore(saved: libc::termios) -> bool {
@@ -58,6 +110,12 @@ pub enum Manager {
     Hooks,
     Orphans,
     Cache,
+    Refresh,
+    Metadata,
+    Checks,
+    Review,
+    Record,
+    Restart,
 }
 impl Manager {
     fn label(self) -> &'static str {
@@ -71,6 +129,12 @@ impl Manager {
             Self::Hooks => "Hooks",
             Self::Orphans => "Orphans",
             Self::Cache => "Cache",
+            Self::Refresh => "Repositories",
+            Self::Metadata => "Metadata",
+            Self::Checks => "Checks",
+            Self::Review => "Review",
+            Self::Record => "Records",
+            Self::Restart => "Restart",
         }
     }
 
@@ -79,6 +143,12 @@ impl Manager {
             Self::Orphans => "Removal complete",
             Self::Cache => "Cleanup complete",
             Self::Hooks => "Hooks complete",
+            Self::Refresh => "Refresh complete",
+            Self::Metadata => "Metadata refreshed",
+            Self::Checks => "Checks complete",
+            Self::Review => "Review complete",
+            Self::Record => "Records saved",
+            Self::Restart => "Restart check complete",
             _ => "Upgrade complete",
         }
     }
@@ -107,6 +177,7 @@ pub fn source_operation<T>(work: impl FnOnce() -> T) -> T {
         // No child PTY owns input during a foreground download. Retain ISIG
         // so Ctrl-C reaches our cleanup handler instead of becoming unread data.
         *display.borrow_mut() = Footer::new(Manager::Sources, false).ok();
+        if let Some(footer) = display.borrow().as_ref() { let _ = footer.draw("Preparing source download"); }
     });
     work()
 }
@@ -253,6 +324,8 @@ fn phase_text(manager: Manager, text: &str, previous: &str) -> String {
     if lower.contains("[y/n]") || lower.contains("[y/n") || lower.contains("proceed with") { return "Awaiting confirmation".into(); }
     if lower.starts_with("error:") || lower.contains("failed") { return "Operation failed".into(); }
     let stage = |phase: &str| phase_with_metrics(manager, &clean, phase);
+    if manager == Manager::Refresh { return stage("Refreshing repositories"); }
+    if manager == Manager::Record { return previous.into(); }
     if manager == Manager::Orphans {
         if lower.contains("checking dependencies") { return "Checking dependencies".into(); }
         if lower.contains("removing") || lower.contains("processing package changes") { return stage("Removing packages"); }
@@ -292,6 +365,14 @@ fn phase_with_metrics(manager: Manager, text: &str, phase: &str) -> String {
         metrics.push(percent);
     }
     if metrics.is_empty() { phase.into() } else { format!("{phase} ({})", metrics.join(", ")) }
+}
+
+fn scoped_phase(manager: Manager, label: &str, phase: &str) -> String {
+    if manager == Manager::Cache {
+        let scope = if label.contains("native") { "Native" } else if label.contains("AUR") { "AUR" } else { return phase.into(); };
+        return format!("{scope}: {phase}");
+    }
+    phase.into()
 }
 
 pub fn queued_sources() {
@@ -355,17 +436,11 @@ impl Footer {
         if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        let sources = matches!(manager, Manager::Native | Manager::Aur)
-            && !SOURCE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .text
-                .is_empty();
         let mut footer = Self {
             rows: 0,
             cols: 0,
             manager,
-            height: 2 + u16::from(sources) + COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&m| m != manager).count() as u16,
+            height: 0,
         };
         *TERMINAL.lock().unwrap_or_else(|e| e.into_inner()) = Some((saved, footer.height));
         footer.resize()?;
@@ -374,12 +449,19 @@ impl Footer {
 
     fn resize(&mut self) -> io::Result<bool> {
         let size = terminal_size();
-        if (self.rows, self.cols) == (size.ws_row, size.ws_col) {
+        let height = 1 + self.lines("", size.ws_row, size.ws_col).len() as u16;
+        if (self.rows, self.cols, self.height) == (size.ws_row, size.ws_col, height) {
             return Ok(false);
+        }
+        if self.height != 0 {
+            let old_bottom = size.ws_row.saturating_sub(self.height).max(1);
+            write!(io::stdout(), "\x1b7\x1b[{};1H\x1b[J\x1b[r\x1b8", old_bottom + 1)?;
         }
         self.rows = size.ws_row;
         self.cols = size.ws_col;
-        // Reserve only rows for the manager actually running and active sources.
+        self.height = height;
+        if let Some((_, saved_height)) = TERMINAL.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { *saved_height = height; }
+        // Always retain room for normal output and the active stages.
         let bottom = self.rows.saturating_sub(self.height).max(1);
         write!(
             io::stdout(),
@@ -389,9 +471,9 @@ impl Footer {
         Ok(true)
     }
 
-    fn draw(&self, native: &str) -> io::Result<()> {
+    fn lines(&self, native: &str, rows: u16, cols: u16) -> Vec<String> {
         let state = SOURCE.lock().unwrap_or_else(|e| e.into_inner());
-        let width = self.cols.saturating_sub(1) as usize;
+        let width = cols.saturating_sub(1) as usize;
         let source = if state.text.is_empty() {
             String::new()
         } else if state.total.is_some() || state.downloaded != 0 {
@@ -404,9 +486,6 @@ impl Footer {
         } else {
             phase_text(Manager::Sources, &state.text, "Preparing download")
         };
-        let row = self.rows.saturating_sub(self.height).saturating_add(1);
-        let mut out = io::stdout().lock();
-        // DEC save/restore does not change the package manager's output cursor.
         let label = self.manager.label();
         let current = if native.is_empty() {
             source.as_str()
@@ -418,29 +497,45 @@ impl Footer {
         } else {
             native_footer(current, width.saturating_sub(label.len() + 2))
         };
-        write!(out, "\x1b7\x1b[{row};1H\x1b[0m\x1b[2K{}", "─".repeat(width))?;
-        let mut current_row = row + 1;
-        for manager in COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&m| m != self.manager) {
-            let text = format!("{}: ✔ {}", manager.label(), manager.completion());
-            write!(out, "\x1b[{current_row};1H\x1b[2K{}", crate::ui::truncate_str(&text, width))?;
-            current_row += 1;
+        let mut history: Vec<String> = COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&m| m != self.manager)
+            .map(|manager| format!("{}: ✔ {}", manager.label(), manager.completion())).collect();
+        history.extend(FAILED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&m| m != self.manager)
+            .map(|manager| format!("{}: ✗ Operation failed", manager.label())));
+        let mut active = vec![format!("{label}: {current}")];
+        if let Some((manager, phase)) = CONTEXT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if *manager != self.manager { active.push(format!("{}: {phase}", manager.label())); }
         }
-        write!(
-            out,
-            "\x1b[{current_row};1H\x1b[2K{label}: {}",
-            current
-        )?;
+        if self.manager != Manager::Native {
+            if let Some(phase) = NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                active.push(format!("Pacman: {phase}"));
+            }
+        }
         if matches!(self.manager, Manager::Native | Manager::Aur) && !state.text.is_empty() {
-            write!(
-                out,
-                "\x1b[{};1H\x1b[2KSources: {}",
-                current_row + 1,
-                crate::ui::truncate_str(&clean_text(&source), width.saturating_sub(9))
-            )?;
+            active.push(format!("Sources: {source}"));
+        }
+        fit_rows(history, active, rows.saturating_sub(5) as usize).into_iter()
+            .map(|line| crate::ui::truncate_str(&clean_text(&line), width)).collect()
+    }
+
+    fn draw(&self, native: &str) -> io::Result<()> {
+        let row = self.rows.saturating_sub(self.height).saturating_add(1);
+        let lines = self.lines(native, self.rows, self.cols);
+        let mut out = io::stdout().lock();
+        // DEC save/restore does not change the package manager's output cursor.
+        write!(out, "\x1b7\x1b[{row};1H\x1b[0m\x1b[2K{}", "─".repeat(self.cols.saturating_sub(1) as usize))?;
+        for (index, line) in lines.iter().enumerate() {
+            write!(out, "\x1b[{};1H\x1b[2K{line}", row + 1 + index as u16)?;
         }
         write!(out, "\x1b8")?;
         out.flush()
     }
+}
+
+fn fit_rows(history: Vec<String>, active: Vec<String>, capacity: usize) -> Vec<String> {
+    let capacity = capacity.max(active.len());
+    let keep = capacity.saturating_sub(active.len());
+    let start = history.len().saturating_sub(keep);
+    history.into_iter().skip(start).chain(active).collect()
 }
 impl Drop for Footer {
     fn drop(&mut self) {
@@ -602,13 +697,17 @@ pub fn run_observed(
     on_ready: impl FnMut(),
     on_line: impl FnMut(&str),
 ) -> io::Result<ExitStatus> {
-    run_observed_with_stdin(command, manager, label, on_ready, on_line, None)
+    let result = run_observed_with_stdin(command, manager, label, on_ready, on_line, None);
+    if !result.as_ref().is_ok_and(|status| status.success()) { failed(manager); }
+    result
 }
 
 /// Preserve explicitly prepared input (e.g. approved cache-clean answers)
 /// while sharing terminal ownership, output relay and child tracking.
 pub fn run_with_stdin(command: &mut Command, manager: Manager, label: &str, stdin: Stdio) -> io::Result<ExitStatus> {
-    run_observed_with_stdin(command, manager, label, || {}, |_| {}, Some(stdin))
+    let result = run_observed_with_stdin(command, manager, label, || {}, |_| {}, Some(stdin));
+    if !result.as_ref().is_ok_and(|status| status.success()) { failed(manager); }
+    result
 }
 
 fn run_observed_with_stdin(
@@ -624,6 +723,7 @@ fn run_observed_with_stdin(
     // A later operation for the same manager is pending again (e.g. an ABI
     // rebuild hook after an AUR upgrade). Retain only other completed managers.
     COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&done| done != manager);
+    FAILED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&done| done != manager);
     let interactive = interactive();
     let preset_input = stdin.is_some();
     if let Some(stdin) = stdin { command.stdin(stdin); }
@@ -720,14 +820,14 @@ fn run_observed_with_stdin(
                 }
             }
             phase = phase_text(manager, &observer.display(), &phase);
-            footer.draw(&phase)?;
+            footer.draw(&scoped_phase(manager, label, &phase))?;
         }
         if rc == 0 && child.0.try_wait()?.is_some() {
             break;
         }
     }
     let status = child.0.wait()?;
-    if observer.interrupted && matches!(manager, Manager::Native | Manager::Aur | Manager::Sources | Manager::Orphans | Manager::Cache) {
+    if observer.interrupted && matches!(manager, Manager::Native | Manager::Aur | Manager::Sources | Manager::Orphans | Manager::Cache | Manager::Refresh | Manager::Record) {
         crate::sandbox::interrupt();
     }
     ensure_not_terminating()?;
@@ -857,11 +957,12 @@ pub fn start_background(command: &mut Command) -> io::Result<BackgroundCommand> 
     Ok(BackgroundCommand { child, reader: Some(thread) })
 }
 pub fn selection_operation<T>(work: impl FnOnce() -> T) -> T {
+    if SELECTION_DISPLAY.with(|d| d.borrow().is_some()) { return work(); }
     struct Reset;
     impl Drop for Reset { fn drop(&mut self) { SELECTION_DISPLAY.with(|d| { d.borrow_mut().take(); }); } }
     let _reset = Reset;
-    if interactive() && NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
-        SELECTION_DISPLAY.with(|d| { *d.borrow_mut() = Footer::new(Manager::Native, false).ok(); });
+    if interactive() {
+        SELECTION_DISPLAY.with(|d| { *d.borrow_mut() = Footer::new(Manager::Review, false).ok(); });
     }
     work()
 }
@@ -872,8 +973,7 @@ pub fn draw_selection() {
     SELECTION_DISPLAY.with(|d| {
         if let Some(footer) = d.borrow_mut().as_mut() {
             let _ = footer.resize();
-            let state = NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = footer.draw(state.as_deref().unwrap_or("Waiting for download result"));
+            let _ = footer.draw("Choosing orphan cleanup");
         }
     });
 }
@@ -917,6 +1017,17 @@ pub fn wait_for_sources(handle: &std::thread::JoinHandle<()>) {
 mod tests {
     use super::*;
     #[test]
+    fn short_footer_keeps_active_steps_and_recent_failures() {
+        let history = vec!["Pacman: ✔ Upgrade complete".into(), "Sources: ✔ Upgrade complete".into(), "AUR: ✗ Operation failed".into()];
+        let active = vec!["Review: Choosing orphan cleanup".into(), "Pacman: Downloading packages".into()];
+        let lines = fit_rows(history, active, 3);
+        assert_eq!(lines, ["AUR: ✗ Operation failed", "Review: Choosing orphan cleanup", "Pacman: Downloading packages"]);
+        assert_eq!(Manager::Refresh.label(), "Repositories");
+        assert_eq!(Manager::Restart.label(), "Restart");
+        assert_eq!(phase_text(Manager::Record, "arbitrary output", "Recording dependency reasons"), "Recording dependency reasons");
+    }
+
+    #[test]
     fn native_interruption_marker_is_exact_and_survives_fragmented_output() {
         let mut observer = Observer::default();
         observer.feed(b"hook says: Interrupt signal received\n", &mut || {});
@@ -935,6 +1046,8 @@ mod tests {
         assert_eq!(phase_text(Manager::Cache, "error: could not remove directory", "Starting"), "Operation failed");
         assert_eq!(Manager::Orphans.completion(), "Removal complete");
         assert_eq!(Manager::Cache.completion(), "Cleanup complete");
+        assert_eq!(scoped_phase(Manager::Cache, "Cleaning native package cache", "Awaiting confirmation"), "Native: Awaiting confirmation");
+        assert_eq!(scoped_phase(Manager::Cache, "Cleaning AUR build cache", "Cleaning package cache"), "AUR: Cleaning package cache");
     }
 
     #[test]
@@ -1073,6 +1186,28 @@ mod tests {
             assert_eq!(unsafe { libc::tcgetattr(0, &mut before) }, 0);
             let session = unsafe { libc::getsid(0) }.to_string();
             let tty = std::fs::read_link("/proc/self/fd/0").unwrap();
+            begin_transaction();
+            completed(Manager::Native);
+            failed(Manager::Aur);
+            for (manager, label) in [
+                (Manager::Checks, "Checking update candidates"),
+                (Manager::Review, "Awaiting plan approval"),
+                (Manager::Record, "Saving upgrade history"),
+                (Manager::Restart, "Checking restart requirements"),
+            ] {
+                operation(manager, label, || {
+                    operation(Manager::Checks, "Nested check", || {});
+                    std::thread::sleep(std::time::Duration::from_millis(110));
+                });
+                assert!(TERMINAL.lock().unwrap().is_none());
+            }
+            context(Manager::Hooks, "Rebuilding triggered packages", || {
+                operation(Manager::Aur, "Building triggered packages", || {
+                    std::thread::sleep(std::time::Duration::from_millis(110));
+                });
+            });
+            assert!(CONTEXT.lock().unwrap().is_none());
+            begin_transaction();
             queued_sources();
             let status = run(Command::new("sh").args(["-c",
                 "test -t 0 && test -t 1 || exit 2; test \"$(ps -o sid= -p $$ | tr -d ' ')\" = \"$PACPIN_TEST_SESSION\" || exit 4; test \"$(readlink /proc/$$/fd/0)\" = \"$PACPIN_TEST_TTY\" || exit 5; printf 'checking keys in keyring\\n'; printf 'Answer: '; read -r answer; test \"$answer\" = yes || exit 3; printf 'native output retained\\n'; printf 'stderr retained\\n' >&2"])
@@ -1228,6 +1363,14 @@ mod tests {
         }
         assert!(normal_output.contains("raw output line one\r\nraw output line two\r\n"), "newline processing lost: {output}");
         for text in [
+            "Checks: Checking update candidates",
+            "Review: Awaiting plan approval",
+            "Records: Saving upgrade history",
+            "Restart: Checking restart requirements",
+            "AUR: ✗ Operation failed",
+            "Pacman: ✔ Upgrade complete",
+            "Review: Choosing orphan cleanup",
+            "Hooks: Rebuilding triggered packages",
             "Pacman:",
             "Sources:",
             "50%",
