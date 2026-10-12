@@ -89,6 +89,8 @@ kitty +runpy 'import runpy, sys; sys.argv = ["scripts/verify_footer_screen.py", 
 Build logs and supplemental screens are in
 `target/maintenance/prompt-20261012/`. Compact engine results and screens are
 retained alongside this report.
+Committed screen excerpts trim trailing whitespace and empty final rows; the
+complete screen captures and raw stream remain in the local evidence directory.
 
 The release was atomically synced to `$HOME/.local/bin/pacpin`, checked with
 `cmp`, and the `pin -> pacpin` symlink preserved.
