@@ -16,6 +16,26 @@ pub use orphans::remove_orphans;
 pub use rebuild::{validate_rebuild, rebuild_aur};
 pub use continuation::{execute_aur, ensure_independent, continuation_archive_check, AurBuildFailurePermit, AurOperation};
 
+/// Keep filesystem/cache inspection in the native boundary. Only archives
+/// actually missing from the selected cache contribute to download progress.
+pub fn with_download_progress<T>(preview: &crate::preview::TransactionPreview, flags: &[&str], work: impl FnOnce() -> T) -> T {
+    let mut caches = Vec::new();
+    let mut args = flags.iter();
+    while let Some(flag) = args.next() {
+        if *flag == "--cachedir" {
+            if let Some(path) = args.next() { caches.push(std::path::PathBuf::from(path)); }
+        } else if let Some(path) = flag.strip_prefix("--cachedir=") { caches.push(path.into()); }
+    }
+    if caches.is_empty() { caches = TransactionJournal::get_cache_dirs(); }
+    crate::progress::native_downloads(download_targets(preview, &caches), work)
+}
+
+fn download_targets(preview: &crate::preview::TransactionPreview, caches: &[std::path::PathBuf]) -> Vec<(String, u64)> {
+    preview.adds.iter().filter(|p| p.download_size > 0 && !p.filename.is_empty())
+        .filter(|p| !caches.iter().any(|dir| std::fs::metadata(dir.join(&p.filename)).is_ok_and(|m| m.is_file() && m.len() == p.download_size as u64)))
+        .map(|p| (p.filename.split(".pkg.tar").next().unwrap_or(&p.filename).to_string(), p.download_size as u64)).collect()
+}
+
 pub fn refresh_databases(config: &Config) -> io::Result<std::process::ExitStatus> {
     check_lock().map_err(io::Error::other)?;
     crate::progress::run(
@@ -513,10 +533,11 @@ pub fn install(
         return Ok(targets.to_vec());
     }
 
-    if !pacman_targets.is_empty() && !sysupgrade {
+    let native_preview = if !pacman_targets.is_empty() && !sysupgrade {
         let preview = crate::preview::prepare_native_preview(&mut manager, &pacman_targets)?;
         crate::preview::check_native_capacity(&preview)?;
-    }
+        Some(preview)
+    } else { None };
     println!("\n{} {}", ":: Executing:".cyan(), full_cmd.bold());
     let mut installed_targets: Vec<String> = Vec::new();
     let mut executed_commands: Vec<String> = Vec::new();
@@ -539,12 +560,14 @@ pub fn install(
         }
         args.push("--");
         args.extend(pacman_targets.iter().map(|s| s.as_str()));
-        let status = crate::progress::run(
+        let run = || crate::progress::run(
             crate::privilege::command(&config.options.privilege_tool).args(&args),
             crate::progress::Manager::Native,
             "Resolving / installing repository packages",
             || {},
         );
+        let flags: Vec<&str> = options.forwarded_flags.iter().map(String::as_str).collect();
+        let status = if let Some(preview) = &native_preview { with_download_progress(preview, &flags, run) } else { run() };
         match status {
             Ok(s) if s.success() => {
                 native_ok = true;
@@ -1704,6 +1727,21 @@ fn check_single_pkg_delay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_progress_excludes_complete_cached_archives() {
+        let cache = std::env::temp_dir().join(format!("pacpin-download-progress-test-{}", std::process::id()));
+        std::fs::create_dir(&cache).unwrap();
+        let package = |name: &str, size| crate::preview::PreviewPackage {
+            name: name.into(), version: "2-1".into(), repo: "fixture".into(), old_version: Some("1-1".into()),
+            new_isize: 0, old_isize: 0, download_size: size, filename: format!("{name}-2-1-x86_64.pkg.tar.zst"),
+        };
+        let preview = crate::preview::TransactionPreview { adds: vec![package("cached", 10), package("partial", 20), package("missing", 30)], ..Default::default() };
+        std::fs::write(cache.join(&preview.adds[0].filename), [0; 10]).unwrap();
+        std::fs::write(cache.join(&preview.adds[1].filename), [0; 5]).unwrap();
+        assert_eq!(download_targets(&preview, std::slice::from_ref(&cache)), [("partial-2-1-x86_64".into(), 20), ("missing-2-1-x86_64".into(), 30)]);
+        std::fs::remove_dir_all(cache).unwrap();
+    }
 
     #[test]
     fn test_install_options_default() {

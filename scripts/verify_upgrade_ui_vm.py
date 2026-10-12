@@ -222,7 +222,7 @@ package() {{
                 path.unlink()
         run("sudo", "-n", "pacman", "-Sy", "--noconfirm")
 
-    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello", orphan_choice=None, expect_no_orphan_prompt=False, orphans=None, cache=None, cancel_manager=None, completed_before_cache=None, cancel_marker=None):
+    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello", orphan_choice=None, expect_no_orphan_prompt=False, orphans=None, cache=None, cancel_manager=None, completed_before_cache=None, cancel_marker=None, password_prompt="PACPIN_AUTH_PASSWORD:", resize_password=False):
         result = self.root / f"{name}.status"
         result.unlink(missing_ok=True)
         raw = self.root / f"{name}.raw.txt"
@@ -232,7 +232,7 @@ package() {{
         if password:
             # Consecutive runs share script's controlling tty and sudo ticket.
             # pacpin itself must require fresh authentication for the next run.
-            command = "export SUDO_PROMPT='PACPIN_AUTH_PASSWORD: '; " + " && ".join([command] * repeat)
+            command = "export SUDO_PROMPT=" + shlex.quote(password_prompt + " ") + "; " + " && ".join([command] * repeat)
         scratch_before = {str(path) for base in ["/tmp", "/var/tmp"] for path in Path(base).glob("pacpin-source-*")}
         shell = self.root / f"{name}.sh"
         shell.write_text(f"#!/bin/bash\nprintf '\\033[2J\\033[3J\\033[H'\nprintf 'PACPIN_BEFORE_TRANSACTION\\n'\nstty -g > {shlex.quote(str(self.root / (name + '.term-before')))}\nscript -qef -c {shlex.quote(command)} {shlex.quote(str(raw))}\nstatus=$?\nstty -g > {shlex.quote(str(self.root / (name + '.term-after')))}\nprintf 'PACPIN_AFTER_TRANSACTION\\n'\nprintf '%s' \"$status\" > {shlex.quote(str(result))}\n")
@@ -248,6 +248,8 @@ package() {{
         self.rc("send-text", "--stdin", input=f"bash {shlex.quote(str(shell))}\n")
         snapshots, resized, confirmed, cancelled = [], False, False, False
         answered_passwords = 0
+        pending_password_since = None
+        password_visibility_failures = []
         selection_started, selection_enter = None, False
         deadline = time.monotonic() + (timeout or (180 if aur else 60))
         while not result.exists():
@@ -256,15 +258,27 @@ package() {{
                 raise AssertionError(f"{name} timed out")
             screen = self.rc("get-text", "--extent", "screen")
             snapshots.append(screen)
-            prompts = transcript(raw).count("PACPIN_AUTH_PASSWORD:") if password and raw.exists() else 0
+            prompts = transcript(raw).count(password_prompt) if password and raw.exists() else 0
             if password and prompts > answered_passwords and prompts <= repeat:
+                if pending_password_since is None:
+                    pending_password_since = time.monotonic()
+                if resize_password and not resized and time.monotonic() - pending_password_since > .5:
+                    self.rc("resize-os-window", "--width", "40", "--height", "18", "--unit", "cells")
+                    resized = True
+                if time.monotonic() - pending_password_since < 2:
+                    time.sleep(.08)
+                    continue
+                if password_prompt not in screen:
+                    password_visibility_failures.append(f"password prompt {prompts} not visible before input")
+                (self.root / f"{name}-password-{prompts}.screen.txt").write_text(screen)
                 # Disposable live account only. Never request/store a host password.
                 self.rc("send-text", "--stdin", input="garuda\n")
                 answered_passwords += 1
+                pending_password_since = None
             if password and prompts > repeat:
                 (self.root / f"{name}.screen.txt").write_text(self.rc("get-text", "--extent", "all"))
                 (self.root / f"{name}.frames.json").write_text(json.dumps(snapshots))
-                self.results.append({"case": name, "status": None, "failures": ["sudo requested authentication again in the same transaction"], "password_prompts": transcript(raw).count("PACPIN_AUTH_PASSWORD:")})
+                self.results.append({"case": name, "status": None, "failures": ["sudo requested authentication again in the same transaction"], "password_prompts": transcript(raw).count(password_prompt)})
                 self.rc("send-key", "ctrl+c")
                 raise AssertionError(f"{name}: sudo requested authentication again in the same transaction")
             if confirm and not confirmed and "Proceed with installation?" in screen:
@@ -326,6 +340,7 @@ package() {{
             # only the explicit RAM guard, never an arbitrary build failure.
             success = False
         failures = []
+        failures.extend(password_visibility_failures)
         if (status == 0) != success:
             failures.append(f"exit status {status}")
         if "PACPIN_BEFORE_TRANSACTION" not in all_text or "PACPIN_AFTER_TRANSACTION" not in all_text:
@@ -384,9 +399,9 @@ package() {{
         # Initial plan boxes must fit even though COLUMNS is deliberately 120.
         if any(len(line) > width for line in plain.splitlines() if line.startswith("  ┌") or line.startswith("  └")):
             failures.append("plan border exceeds the measured terminal width")
-        if password and (answered_passwords != repeat or raw_text.count("PACPIN_AUTH_PASSWORD:") != repeat):
+        if password and (answered_passwords != repeat or raw_text.count(password_prompt) != repeat):
             failures.append(f"expected exactly one sudo password prompt per run ({repeat} runs)")
-        if password and re.search(r"PACPIN_AUTH_PASSWORD: *garuda", raw_text):
+        if password and re.search(re.escape(password_prompt) + r" *garuda", raw_text):
             failures.append("sudo password echoed into the transcript")
         if source and args[0] == "-Su" and not self.baseline and "Unknown" not in raw_text and "+ unknown" not in raw_text:
             failures.append("unknown source sizes shown as a complete total")
@@ -416,7 +431,7 @@ package() {{
             failures.append(f"AUR fixture {aur_package} was not installed")
         self.results.append({"case": name, "status": status, "failures": failures, "frames": len(snapshots), "resized": resized, "cancelled": cancelled, "installed": versions})
         if password:
-            self.results[-1]["password_prompts"] = raw_text.count("PACPIN_AUTH_PASSWORD:")
+            self.results[-1]["password_prompts"] = raw_text.count(password_prompt)
             self.results[-1]["runs"] = repeat
         print(json.dumps(self.results[-1]), flush=True)
 
@@ -811,7 +826,7 @@ exec /usr/bin/sudo "$@"
                 if probe.returncode == 0:
                     raise AssertionError("sudo validation created credentials without authentication; test invalid")
                 args = ["-Syu", "--noconfirm"] + (["--no-cache"] if name.endswith("no-cache") else [])
-                self.case(name, args, native=native, source=source, password=True, resize=True, repeat=2 if name == "auth-native-and-sources" else 1, timeout=150 if renewal else None)
+                self.case(name, args, native=native, source=source, password=True, resize=True, repeat=2 if name == "auth-native-and-sources" else 1, timeout=150 if renewal else None, password_prompt="[sudo] password for garuda:" if name == "auth-native-only" else "PACPIN_AUTH_PASSWORD:", resize_password=name == "auth-native-only")
                 if name.endswith("no-cache"):
                     assert "Native cache cleaned successfully" in transcript(self.root / f"{name}.raw.txt")
             finally:

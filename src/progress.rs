@@ -31,6 +31,58 @@ static FAILED: Mutex<Vec<Manager>> = Mutex::new(Vec::new());
 static NATIVE_BACKGROUND: Mutex<Option<String>> = Mutex::new(None);
 static CONTEXT: Mutex<Option<(Manager, String)>> = Mutex::new(None);
 thread_local! { static SELECTION_DISPLAY: RefCell<Option<Footer>> = const { RefCell::new(None) }; }
+thread_local! { static NATIVE_DOWNLOADS: RefCell<Vec<(String, u64)>> = const { RefCell::new(Vec::new()) }; }
+
+/// The native boundary supplies uncached archive sizes from the approved plan.
+/// A scoped value also reaches a background reader without global cross-talk.
+pub fn native_downloads<T>(targets: Vec<(String, u64)>, work: impl FnOnce() -> T) -> T {
+    struct Reset(Vec<(String, u64)>);
+    impl Drop for Reset {
+        fn drop(&mut self) { NATIVE_DOWNLOADS.with(|d| { d.replace(std::mem::take(&mut self.0)); }); }
+    }
+    let _reset = Reset(NATIVE_DOWNLOADS.with(|d| d.replace(targets)));
+    work()
+}
+
+#[derive(Default)]
+struct NativeDownloads {
+    packages: Vec<(String, u64, u8)>,
+    ambiguous: bool,
+    aggregate: Option<u8>,
+    observed: bool,
+}
+impl NativeDownloads {
+    fn current() -> Self {
+        Self { packages: NATIVE_DOWNLOADS.with(|d| d.borrow().iter().map(|(name, size)| (name.clone(), *size, 0)).collect()), ..Default::default() }
+    }
+    fn observe(&mut self, line: &str) {
+        let Some(percent) = line_percent(line) else { return; };
+        let Some(label) = line.split_whitespace().next() else { return; };
+        if label == "Total" || label.starts_with("Total(") { self.aggregate = Some(percent); return; }
+        if label.starts_with('(') { return; }
+        let matching: Vec<_> = self.packages.iter_mut().filter(|(name, _, _)| {
+            label == name.as_str() || label.strip_suffix("...").is_some_and(|prefix| !prefix.is_empty() && name.starts_with(prefix))
+        }).collect();
+        if matching.len() == 1 {
+            matching.into_iter().next().unwrap().2 = percent;
+            self.observed = true;
+        } else { self.ambiguous = true; }
+    }
+    fn phase(&mut self, manager: Manager, line: &str, previous: &str) -> String {
+        self.observe(line);
+        let phase = phase_text(manager, line, previous);
+        if manager != Manager::Native || !phase.starts_with("Downloading packages") || line.trim_start().starts_with("Total") { return phase; }
+        if let Some(percent) = self.aggregate { return format!("Downloading packages ({percent}%)"); }
+        let total: u128 = self.packages.iter().map(|(_, size, _)| u128::from(*size)).sum();
+        if total == 0 || self.ambiguous || !self.observed { return phase; }
+        let percent = self.packages.iter().map(|(_, size, progress)| u128::from(*size) * u128::from(*progress)).sum::<u128>() / total;
+        format!("Downloading packages ({percent}%)")
+    }
+}
+
+fn line_percent(text: &str) -> Option<u8> {
+    text.split_whitespace().find_map(|word| word.strip_suffix('%').and_then(|number| number.parse::<u8>().ok()).filter(|&value| value <= 100))
+}
 
 pub fn begin_transaction() {
     COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -289,6 +341,16 @@ fn footer_download(name: &str, downloaded: u64, total: Option<u64>, width: usize
 
 fn native_footer(text: &str, width: usize) -> String {
     let clean = clean_text(text);
+    if let Some((phase, metrics)) = clean.split_once(" (").filter(|(_, metrics)| metrics.ends_with(')') && metrics.contains('%')) {
+        let suffix = format!(" ({metrics}");
+        if crate::ui::str_width(&suffix) + 2 <= width {
+            return format!("{}{suffix}", crate::ui::truncate_str(phase, width - crate::ui::str_width(&suffix)));
+        }
+        if let Some(percent) = metrics.split(',').next().filter(|percent| percent.trim_end_matches(')').ends_with('%')) {
+            let suffix = format!(" ({})", percent.trim_end_matches(')'));
+            return format!("{}{suffix}", crate::ui::truncate_str(phase, width.saturating_sub(crate::ui::str_width(&suffix))));
+        }
+    }
     let words: Vec<_> = clean
         .split_whitespace()
         .filter(|word| {
@@ -355,16 +417,20 @@ fn phase_text(manager: Manager, text: &str, previous: &str) -> String {
 
 fn phase_with_metrics(manager: Manager, text: &str, phase: &str) -> String {
     if !matches!(manager, Manager::Native | Manager::Aur | Manager::Orphans) { return phase.into(); }
-    let mut metrics = Vec::new();
     if let Some(counter) = text.trim_start().strip_prefix('(').and_then(|line| line.split_once(')').map(|(counter, _)| counter.trim())) {
-        if counter.split_once('/').is_some_and(|(done, total)| done.trim().parse::<u64>().is_ok() && total.trim().parse::<u64>().is_ok()) {
-            metrics.push(counter);
+        if let Some((done, total)) = counter.split_once('/').and_then(|(done, total)| Some((done.trim().parse::<u64>().ok()?, total.trim().parse::<u64>().ok()?))).filter(|(_, total)| *total != 0) {
+            let done = done.min(total);
+            let progress = line_percent(text).map(|percent| u128::from(done.saturating_sub(1)) * 100 + u128::from(percent)).unwrap_or(u128::from(done) * 100);
+            let percent = (progress / u128::from(total)).min(100);
+            return format!("{phase} ({percent}%, {done}/{total})");
         }
     }
-    if let Some(percent) = text.split_whitespace().find(|word| word.strip_suffix('%').is_some_and(|number| number.parse::<u8>().is_ok_and(|value| value <= 100))) {
-        metrics.push(percent);
+    // Individual download bars are not a transaction percentage. Prefer
+    // pacman's aggregate Total bar; planned downloads are weighted separately.
+    if text.trim_start().strip_prefix("Total").is_some_and(|rest| rest.starts_with(char::is_whitespace) || rest.starts_with('(')) {
+        if let Some(percent) = line_percent(text) { return format!("{phase} ({percent}%)"); }
     }
-    if metrics.is_empty() { phase.into() } else { format!("{phase} ({})", metrics.join(", ")) }
+    phase.into()
 }
 
 fn scoped_phase(manager: Manager, label: &str, phase: &str) -> String {
@@ -409,7 +475,7 @@ pub fn restore_terminal() {
             // Resetting the scroll region homes the cursor. Preserve it so
             // subsequent source logs cannot overwrite earlier pacman text.
             // Signal exit skips Footer::drop. Clear its reserved rows here too.
-            let reset = if height == 0 { "\x1b[0m\x1b[?25h\r\n".into() } else { format!("\x1b7\x1b[{};1H\x1b[J\x1b[r\x1b8\x1b[0m\x1b[?25h\r\n", bottom + 1) };
+            let reset = if height == 0 { "\x1b[0m\x1b[?25h".into() } else { format!("\x1b7\x1b[{};1H\x1b[J\x1b[r\x1b8\x1b[0m\x1b[?25h", bottom + 1) };
             libc::write(libc::STDOUT_FILENO, reset.as_ptr().cast(), reset.len());
         }
     }
@@ -420,9 +486,18 @@ struct Footer {
     cols: u16,
     manager: Manager,
     height: u16,
+    input_echo: bool,
 }
 impl Footer {
     fn new(manager: Manager, raw_input: bool) -> io::Result<Self> {
+        Self::create(manager, raw_input, true)
+    }
+
+    fn pending(manager: Manager) -> io::Result<Self> {
+        Self::create(manager, false, false)
+    }
+
+    fn create(manager: Manager, raw_input: bool, display: bool) -> io::Result<Self> {
         let mut saved: libc::termios = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(0, &mut saved) } != 0 {
             return Err(io::Error::last_os_error());
@@ -441,10 +516,22 @@ impl Footer {
             cols: 0,
             manager,
             height: 0,
+            input_echo: saved.c_lflag & libc::ECHO != 0,
         };
         *TERMINAL.lock().unwrap_or_else(|e| e.into_inner()) = Some((saved, footer.height));
-        footer.resize()?;
+        if display { footer.resize()?; }
         Ok(footer)
+    }
+
+    fn suspend(&mut self) -> io::Result<()> {
+        if self.height == 0 { return Ok(()); }
+        let bottom = self.rows.saturating_sub(self.height).max(1);
+        let mut out = io::stdout().lock();
+        write!(out, "\x1b7\x1b[{};1H\x1b[J\x1b[r\x1b8", bottom + 1)?;
+        out.flush()?;
+        self.height = 0;
+        if let Some((_, height)) = TERMINAL.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { *height = 0; }
+        Ok(())
     }
 
     fn resize(&mut self) -> io::Result<bool> {
@@ -453,22 +540,33 @@ impl Footer {
         if (self.rows, self.cols, self.height) == (size.ws_row, size.ws_col, height) {
             return Ok(false);
         }
-        if self.height != 0 {
-            let old_bottom = size.ws_row.saturating_sub(self.height).max(1);
-            write!(io::stdout(), "\x1b7\x1b[{};1H\x1b[J\x1b[r\x1b8", old_bottom + 1)?;
+        let mut out = io::stdout().lock();
+        // Complete terminal setup before spawning a child: sudo writes its
+        // prompt directly to /dev/tty, outside our buffered output relay.
+        write!(out, "\x1b7\x1b[r\x1b8")?;
+        if self.height != 0 && self.rows == size.ws_row && self.cols == size.ws_col {
+            let old_bottom = self.rows.saturating_sub(self.height).max(1);
+            write!(out, "\x1b7\x1b[{};1H\x1b[J\x1b8", old_bottom + 1)?;
         }
+        // Move existing text into scrollback and keep its cursor in place
+        // relative to that text. Never pad each phase with newline characters
+        // or jump the main cursor to the bottom of an otherwise empty screen.
+        let reserve = if (self.rows, self.cols) != (size.ws_row, size.ws_col) { height } else { height.saturating_sub(self.height) };
+        if reserve != 0 { write!(out, "\x1b[{reserve}S\x1b[{reserve}A")?; }
         self.rows = size.ws_row;
         self.cols = size.ws_col;
         self.height = height;
         if let Some((_, saved_height)) = TERMINAL.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { *saved_height = height; }
         // Always retain room for normal output and the active stages.
         let bottom = self.rows.saturating_sub(self.height).max(1);
-        write!(
-            io::stdout(),
-            "\x1b7\x1b[r\x1b8{}\x1b[1;{bottom}r\x1b[{bottom};1H",
-            "\r\n".repeat(self.height as usize)
-        )?;
+        write!(out, "\x1b7\x1b[1;{bottom}r\x1b8")?;
+        out.flush()?;
         Ok(true)
+    }
+
+    fn authentication_input(&self) -> bool {
+        let mut current: libc::termios = unsafe { std::mem::zeroed() };
+        self.input_echo && unsafe { libc::tcgetattr(0, &mut current) } == 0 && current.c_lflag & libc::ECHO == 0
     }
 
     fn lines(&self, native: &str, rows: u16, cols: u16) -> Vec<String> {
@@ -539,9 +637,11 @@ fn fit_rows(history: Vec<String>, active: Vec<String>, capacity: usize) -> Vec<S
 }
 impl Drop for Footer {
     fn drop(&mut self) {
-        let bottom = self.rows.saturating_sub(self.height).max(1);
-        let _ = write!(io::stdout(), "\x1b7\x1b[{};1H\x1b[J\x1b[r\x1b8", bottom + 1);
-        let _ = io::stdout().flush();
+        if self.height != 0 {
+            let bottom = self.rows.saturating_sub(self.height).max(1);
+            let _ = write!(io::stdout(), "\x1b7\x1b[{};1H\x1b[J\x1b[r\x1b8", bottom + 1);
+            let _ = io::stdout().flush();
+        }
         restore_terminal();
     }
 }
@@ -556,6 +656,15 @@ fn terminal_size() -> libc::winsize {
         size.ws_col = 80;
     }
     size
+}
+
+fn output_pty(size: &libc::winsize) -> io::Result<(File, File)> {
+    let (mut master, mut slave) = (-1, -1);
+    if unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), size) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openpty returned two fresh, owned descriptors.
+    Ok(unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) })
 }
 
 #[derive(Default)]
@@ -725,6 +834,7 @@ fn run_observed_with_stdin(
     COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&done| done != manager);
     FAILED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&done| done != manager);
     let interactive = interactive();
+    let mut phase = if matches!(command.get_program().to_str(), Some("sudo" | "pkexec" | "doas")) { "Authorizing package operation".to_string() } else { label.to_string() };
     let preset_input = stdin.is_some();
     if let Some(stdin) = stdin { command.stdin(stdin); }
     // Pacman's stage names are observed to avoid competing with its downloads.
@@ -733,27 +843,17 @@ fn run_observed_with_stdin(
     let mut input: Box<dyn Read>;
     let read_fd;
     if interactive {
-        let (mut master, mut slave) = (-1, -1);
         let mut size = terminal_size();
         // Keep stdin and the controlling terminal inherited. A separate input
         // session would invalidate sudo's per-terminal authentication cache.
         // The child reads prompts directly; the parent only relays output.
-        let display = Footer::new(manager, false)?;
+        // Bottom-anchored text can push an unanswered tty prompt into
+        // scrollback when a window shrinks. Defer reservation until the
+        // privileged child produces operation output after authentication.
+        let display = if phase == "Authorizing package operation" || phase == "Awaiting authorization" { Footer::pending(manager)? } else { Footer::new(manager, false)? };
+        if display.height != 0 { display.draw(&scoped_phase(manager, label, &phase))?; }
         size.ws_row = size.ws_row.saturating_sub(display.height);
-        if unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let master = unsafe { File::from_raw_fd(master) };
-        let slave = unsafe { File::from_raw_fd(slave) };
+        let (master, slave) = output_pty(&size)?;
         // Keep PTY newline processing: sudo can temporarily put the inherited
         // terminal in raw mode, so relayed output must already contain CRLF.
         if !preset_input { command.stdin(Stdio::inherit()); }
@@ -778,11 +878,8 @@ fn run_observed_with_stdin(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let mut phase = if !matches!(manager, Manager::Orphans | Manager::Cache) && matches!(command.get_program().to_str(), Some("sudo" | "pkexec" | "doas")) { "Authorizing package operation".to_string() } else { label.to_string() };
-    let mut observer = Observer {
-        latest: label.into(),
-        ..Default::default()
-    };
+    let mut observer = Observer::default();
+    let mut downloads = NativeDownloads::current();
     let mut buf = [0u8; 8192];
     loop {
         let mut fd = libc::pollfd {
@@ -804,14 +901,24 @@ fn run_observed_with_stdin(
                 Ok(n) => {
                     io::stdout().write_all(&buf[..n])?;
                     io::stdout().flush()?;
-                    observer.feed_observed(&buf[..n], &mut on_ready, &mut on_line);
+                    observer.feed_observed(&buf[..n], &mut on_ready, &mut |line| { downloads.observe(line); on_line(line); });
                 }
                 Err(error) if interactive && error.raw_os_error() == Some(libc::EIO) => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
             }
         }
+        let display = observer.display();
+        if !display.is_empty() { phase = downloads.phase(manager, &display, &phase); }
+        // sudo writes authentication prompts on the inherited tty. Leave that
+        // cursor alone while authorization awaits echo-free input. Once its
+        // child produces package output, keep rendering even if sudo retains
+        // raw mode for the rest of its own PTY relay. Never read a password.
+        let authorizing = phase == "Authorizing package operation" || phase == "Awaiting authorization";
         if let Some(footer) = &mut footer {
+            if authorizing && (footer.height == 0 || footer.authentication_input()) {
+                footer.suspend()?;
+            } else {
             if footer.resize()? {
                 let mut size = terminal_size();
                 size.ws_row = size.ws_row.saturating_sub(footer.height);
@@ -819,8 +926,8 @@ fn run_observed_with_stdin(
                     libc::ioctl(read_fd, libc::TIOCSWINSZ, &size);
                 }
             }
-            phase = phase_text(manager, &observer.display(), &phase);
             footer.draw(&scoped_phase(manager, label, &phase))?;
+            }
         }
         if rc == 0 && child.0.try_wait()?.is_some() {
             break;
@@ -934,22 +1041,36 @@ impl Drop for BackgroundCommand {
 }
 pub fn start_background(command: &mut Command) -> io::Result<BackgroundCommand> {
     ensure_not_terminating()?;
-    let (mut reader, writer) = UnixStream::pair()?;
-    command.env("LC_ALL", "C").stdin(Stdio::null())
-        .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer.try_clone()?)))
-        .stderr(Stdio::from(std::os::fd::OwnedFd::from(writer)));
+    let mut reader: Box<dyn Read + Send>;
+    if interactive() {
+        // Pacman suppresses download bars when stdout is a pipe. Give its
+        // background output a private PTY without taking selector input or
+        // changing the controlling terminal used for the sudo ticket.
+        let mut size = terminal_size();
+        size.ws_col = size.ws_col.max(200); // Unambiguous archive labels; never displayed directly.
+        let (master, slave) = output_pty(&size)?;
+        command.stdout(Stdio::from(slave.try_clone()?)).stderr(Stdio::from(slave));
+        reader = Box::new(master);
+    } else {
+        let (input, writer) = UnixStream::pair()?;
+        command.stdout(Stdio::from(std::os::fd::OwnedFd::from(writer.try_clone()?)))
+            .stderr(Stdio::from(std::os::fd::OwnedFd::from(writer)));
+        reader = Box::new(input);
+    }
+    command.env("LC_ALL", "C").stdin(Stdio::null());
     let child = ChildGuard(command.spawn()?);
     crate::sandbox::register_child(child.0.id());
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     *NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()) = Some("Downloading repository packages".into());
+    let mut downloads = NativeDownloads::current();
     let thread = std::thread::spawn(move || {
         let mut observer = Observer::default();
         let mut phase = "Downloading repository packages".to_string();
         let mut buf = [0; 8192];
         while let Ok(size) = reader.read(&mut buf) {
             if size == 0 { break; }
-            observer.feed(&buf[..size], &mut || {});
-            phase = phase_text(Manager::Native, &observer.display(), &phase);
+            observer.feed_observed(&buf[..size], &mut || {}, &mut |line| downloads.observe(line));
+            phase = downloads.phase(Manager::Native, &observer.display(), &phase);
             *NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()) = Some(phase.clone());
         }
         *NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()) = Some("Download process ended; awaiting status".into());
@@ -1017,6 +1138,41 @@ pub fn wait_for_sources(handle: &std::thread::JoinHandle<()>) {
 mod tests {
     use super::*;
     #[test]
+    fn native_totals_weight_all_archives_and_ignore_individual_bars() {
+        native_downloads(vec![("small-1-x86_64".into(), 10), ("large-1-x86_64".into(), 90)], || {
+            let mut downloads = NativeDownloads::current();
+            downloads.observe("small-1-x86_64 1 KiB [###] 100%");
+            assert_eq!(downloads.phase(Manager::Native, "large-1-x86_64 1 KiB [###] 50%", "Downloading packages"), "Downloading packages (55%)");
+            assert_eq!(downloads.phase(Manager::Native, "large-1... [###] 50%", "Downloading packages"), "Downloading packages (55%)");
+            assert_eq!(downloads.phase(Manager::Native, "large-1-x86_64-other [###] 100%", "Downloading packages"), "Downloading packages");
+            assert_eq!(downloads.phase(Manager::Native, "Total (2/2) 1 KiB [###] 63%", "Downloading packages"), "Downloading packages (63%)");
+            assert_eq!(downloads.phase(Manager::Native, "(1/2) upgrading small [###] 100%", "Downloading packages"), "Installing packages (50%, 1/2)");
+        });
+        assert!(NativeDownloads::current().packages.is_empty());
+        assert_eq!(phase_text(Manager::Native, "(1/2) installing small 0%", "Starting"), "Installing packages (0%, 1/2)");
+        assert_eq!(phase_text(Manager::Native, "(0/0) installing small 100%", "Starting"), "Installing packages");
+    }
+
+    #[test]
+    fn native_totals_handle_parallel_lines_and_large_sizes() {
+        let mut downloads = NativeDownloads { packages: vec![("one".into(), u64::MAX, 0), ("two".into(), u64::MAX, 0)], ..Default::default() };
+        let mut observer = Observer::default();
+        observer.feed_observed(b"one 100%\r\x1b[1Atwo 50%\r", &mut || {}, &mut |line| downloads.observe(line));
+        assert_eq!(downloads.phase(Manager::Native, "two 50%", "Downloading packages"), "Downloading packages (75%)");
+    }
+    #[test]
+    fn ambiguous_truncated_names_do_not_invent_download_totals() {
+        let mut downloads = NativeDownloads { packages: vec![("same-one".into(), 10, 0), ("same-two".into(), 90, 0)], ..Default::default() };
+        assert_eq!(downloads.phase(Manager::Native, "same... 100%", "Downloading packages"), "Downloading packages");
+        assert_eq!(downloads.phase(Manager::Native, "Total (2/2) 60%", "Downloading packages"), "Downloading packages (60%)");
+        assert_eq!(downloads.phase(Manager::Native, "same... 100%", "Downloading packages"), "Downloading packages (60%)");
+        for width in [18, 24, 32] {
+            let text = native_footer("Installing packages (59%, 29/49)", width);
+            assert!(text.contains("59%"));
+            assert!(crate::ui::str_width(&text) <= width);
+        }
+    }
+    #[test]
     fn short_footer_keeps_active_steps_and_recent_failures() {
         let history = vec!["Pacman: ✔ Upgrade complete".into(), "Sources: ✔ Upgrade complete".into(), "AUR: ✗ Operation failed".into()];
         let active = vec!["Review: Choosing orphan cleanup".into(), "Pacman: Downloading packages".into()];
@@ -1039,7 +1195,7 @@ mod tests {
     #[test]
     fn housekeeping_phases_and_completion_describe_actual_operations() {
         assert_eq!(phase_text(Manager::Orphans, "checking dependencies...", "Starting"), "Checking dependencies");
-        assert_eq!(phase_text(Manager::Orphans, "(2/6) removing ninja [###] 100%", "Starting"), "Removing packages (2/6, 100%)");
+        assert_eq!(phase_text(Manager::Orphans, "(2/6) removing ninja [###] 100%", "Starting"), "Removing packages (33%, 2/6)");
         assert_eq!(phase_text(Manager::Orphans, "[sudo] password for user:", "Starting"), "Awaiting authorization");
         assert_eq!(phase_text(Manager::Cache, "Do you want to remove ALL files from cache? [y/N]", "Starting"), "Awaiting confirmation");
         assert_eq!(phase_text(Manager::Cache, "removing all files from cache...", "Starting"), "Cleaning package cache");
@@ -1082,9 +1238,9 @@ mod tests {
         assert_eq!(phase_text(Manager::Native, "Proceed with installation? [Y/n]", "Starting"), "Awaiting confirmation");
         assert_eq!(phase_text(Manager::Native, "PACPIN_NATIVE_HISTORY_01", "Running hooks"), "Running hooks");
         assert_eq!(phase_text(Manager::Sources, ":: Packaging verified source", "Preparing"), "Packaging source");
-        assert_eq!(phase_text(Manager::Native, "(29/49) upgrading webkitgtk-6.0 [####] 100%", "Preparing"), "Installing packages (29/49, 100%)");
-        assert_eq!(phase_text(Manager::Native, "package-very-long-name [####] 80%", "Downloading packages (75%)"), "Downloading packages (80%)");
-        assert_eq!(phase_text(Manager::Native, "( 7/10) Install DKMS modules", "Preparing"), "Building kernel modules (7/10)");
+        assert_eq!(phase_text(Manager::Native, "(29/49) upgrading webkitgtk-6.0 [####] 100%", "Preparing"), "Installing packages (59%, 29/49)");
+        assert_eq!(phase_text(Manager::Native, "package-very-long-name [####] 80%", "Downloading packages (75%)"), "Downloading packages");
+        assert_eq!(phase_text(Manager::Native, "( 7/10) Install DKMS modules", "Preparing"), "Building kernel modules (70%, 7/10)");
     }
     #[test]
     fn download_progress_handles_unknown_zero_and_overflowing_totals() {
@@ -1189,6 +1345,7 @@ mod tests {
             begin_transaction();
             completed(Manager::Native);
             failed(Manager::Aur);
+            println!("PHASE_PADDING_START");
             for (manager, label) in [
                 (Manager::Checks, "Checking update candidates"),
                 (Manager::Review, "Awaiting plan approval"),
@@ -1201,12 +1358,17 @@ mod tests {
                 });
                 assert!(TERMINAL.lock().unwrap().is_none());
             }
+            println!("PHASE_PADDING_END");
             context(Manager::Hooks, "Rebuilding triggered packages", || {
                 operation(Manager::Aur, "Building triggered packages", || {
                     std::thread::sleep(std::time::Duration::from_millis(110));
                 });
             });
             assert!(CONTEXT.lock().unwrap().is_none());
+            let status = run(Command::new("sh").args(["-c",
+                "stty -echo; printf 'AUTH_WAIT_PROMPT: ' >/dev/tty; read -r answer; test \"$answer\" = fixture-secret || exit 8; printf '\\nresolving dependencies...\\n'; sleep .3; stty echo; printf 'AUTH_WAIT_COMPLETE\\n'",
+            ]), Manager::Refresh, "Awaiting authorization", || {}).unwrap();
+            assert!(status.success());
             begin_transaction();
             queued_sources();
             let status = run(Command::new("sh").args(["-c",
@@ -1229,7 +1391,7 @@ mod tests {
             clear_sources();
             queued_sources();
             let download = start_background(Command::new("sh").args(["-c",
-                "printf 'Downloading fixture.pkg.tar.zst 25%%\\r'; sleep 1; printf 'Downloading fixture.pkg.tar.zst 75%%\\r'; sleep 1; exit 7",
+                "test -t 1 || exit 9; printf 'Downloading fixture.pkg.tar.zst 25%%\\r'; sleep 1; printf 'Downloading fixture.pkg.tar.zst 75%%\\r'; sleep 1; exit 7",
             ])).unwrap();
             let selected = selection_operation(|| crate::ui::prompt_orphan_selection(&[
                 crate::db::OrphanPackage {
@@ -1305,7 +1467,16 @@ mod tests {
         let mut output = Vec::new();
         let mut answered = false;
         let mut selection_confirmed = false;
+        let mut auth_started = None;
+        let mut auth_answered = false;
         loop {
+            if !auth_answered && auth_started.is_some_and(|started: std::time::Instant| started.elapsed() >= std::time::Duration::from_millis(750)) {
+                let text = String::from_utf8_lossy(&output);
+                let waiting = text.split("AUTH_WAIT_PROMPT: ").nth(1).unwrap();
+                assert!(!waiting.contains("\x1b7"), "footer moved the authentication cursor: {waiting}");
+                master.write_all(b"fixture-secret\n").unwrap();
+                auth_answered = true;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
                 "PTY relay hung: {}",
@@ -1339,6 +1510,11 @@ mod tests {
                     0
                 );
             }
+            if auth_started.is_none() && String::from_utf8_lossy(&output).contains("AUTH_WAIT_PROMPT: ") {
+                auth_started = Some(std::time::Instant::now());
+                let resized = libc::winsize { ws_row: 18, ws_col: 40, ..size };
+                assert_eq!(unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &resized) }, 0);
+            }
             if !selection_confirmed && String::from_utf8_lossy(&output).contains("Enter confirms") {
                 master.write_all(b"\r").unwrap();
                 selection_confirmed = true;
@@ -1350,6 +1526,10 @@ mod tests {
             String::from_utf8_lossy(&output)
         );
         let output = String::from_utf8_lossy(&output);
+        assert!(auth_answered && output.contains("AUTH_WAIT_COMPLETE"));
+        assert!(!output.contains("fixture-secret"), "authentication input was echoed");
+        let phases = output.split("PHASE_PADDING_START\r\n").nth(1).unwrap().split("PHASE_PADDING_END").next().unwrap();
+        assert!(!phases.contains('\n'), "footer phases inserted blank lines: {phases}");
         let finished_wait = output.split("FINISHED_PREFETCH_BEFORE").nth(1).unwrap().split("FINISHED_PREFETCH_AFTER").next().unwrap();
         assert!(!finished_wait.contains("Waiting for repository downloads"), "already-finished download displayed a wait: {output}");
         assert!(!finished_wait.contains("Pacman:"), "already-finished download displayed an active footer: {output}");
@@ -1379,7 +1559,7 @@ mod tests {
             "source terminal retained",
             "Orphan review confirmed: 1 package selected",
             "Waiting for repository downloads to finish...",
-            "Downloading packages (75%)",
+            "Downloading packages",
             "BACKGROUND_WAIT_FINISHED",
         ] {
             assert!(output.contains(text), "missing {text}: {output}");

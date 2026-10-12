@@ -580,7 +580,7 @@ pub fn cmd_upgrade(
                 // the user reviews the projected orphan list.
                 match pm::authorize_downloads(config) {
                     Ok(status) if status.success() => {
-                        match crate::progress::start_background(&mut repo_prefetch_command(&pacman_targets, &forwarded_pacman_flags)) {
+                        match pm::with_download_progress(&preview, &forwarded_pacman_flags, || crate::progress::start_background(&mut repo_prefetch_command(&pacman_targets, &forwarded_pacman_flags))) {
                             Ok(child) => {
                                 println!("{}", ":: Downloading repository packages while you review orphans...".cyan());
                                 prefetch = Some(child);
@@ -663,7 +663,7 @@ pub fn cmd_upgrade(
         args.extend(forwarded_pacman_flags.iter().cloned());
         args.push("--");
         args.extend(pacman_targets.iter().map(|s| s.as_str()));
-        let status = crate::progress::run(
+        let status = pm::with_download_progress(&preview, &forwarded_pacman_flags, || crate::progress::run(
             crate::privilege::command(&config.options.privilege_tool).args(&args),
             crate::progress::Manager::Native,
             "Resolving / downloading repository packages",
@@ -672,7 +672,7 @@ pub fn cmd_upgrade(
                     ext_prefetch_handle = IntegrationsManager::spawn_prefetch(&ext_providers, &external_updates);
                 }
             },
-        );
+        ));
         match status {
             Ok(s) if s.success() => {
                 for u in &updates {
