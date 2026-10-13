@@ -95,7 +95,11 @@ complete screen captures and raw stream remain in the local evidence directory.
 The release was atomically synced to `$HOME/.local/bin/pacpin`, checked with
 `cmp`, and the `pin -> pacpin` symlink preserved.
 
-## Pending VM verification
+## Pending VM verification at the earlier interruption
+
+The subsequent VM run is recorded in
+[the follow-up report](2026-10-13-garuda-footer-follow-up.md). The paragraphs
+below preserve the status of the interrupted earlier attempt.
 
 The fixed release was transferred and its authentication suite started. The
 host subsequently restarted and the VM storage server is offline again. Those follow-up guest

@@ -220,7 +220,7 @@ package() {{
         for path in (self.root / "cache").iterdir():
             if path.is_file():
                 path.unlink()
-        run("sudo", "-n", "pacman", "-Sy", "--noconfirm")
+        run("sudo", "-n", "pacman", "-Syy", "--noconfirm")
 
     def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello", orphan_choice=None, expect_no_orphan_prompt=False, orphans=None, cache=None, cancel_manager=None, completed_before_cache=None, cancel_marker=None, password_prompt="PACPIN_AUTH_PASSWORD:", resize_password=False):
         result = self.root / f"{name}.status"
@@ -395,6 +395,8 @@ package() {{
         if selection_wait and not any("Waiting for repository downloads to finish..." in " ".join(frame.split()) and re.search(r"(?:^|\n)Pacman:.*(?:Downloading|Verifying)", frame) for frame in snapshots):
             failures.append("repository download footer missing after Enter while downloads remain active")
         raw_text = transcript(raw)
+        if native and success and "PACPIN_NATIVE_HOOK_1" in raw_text and not any("Pacman: Running post-install hooks" in frame for frame in snapshots):
+            failures.append("native hook output did not update the footer phase")
         plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", raw_text)
         # Initial plan boxes must fit even though COLUMNS is deliberately 120.
         if any(len(line) > width for line in plain.splitlines() if line.startswith("  ┌") or line.startswith("  └")):
@@ -436,6 +438,9 @@ package() {{
         print(json.dumps(self.results[-1]), flush=True)
 
     def suite(self):
+        if self.section == "progress":
+            self.progress_cases()
+            return
         if self.section == "audit":
             helpers = self.root / "helpers"
             helpers.mkdir()
@@ -538,6 +543,82 @@ package() {{
         self.audit_cases(helpers)
         self.auxiliary_failure_cases(helpers)
 
+    def progress_cases(self):
+        # Unequal real archives make individual and aggregate percentages
+        # visibly different. Both foreground and orphan-review downloads use
+        # real pacman, not a simulated progress producer.
+        large = self.root / "progress-large"
+        large.mkdir()
+        (large / "padding").write_bytes(os.urandom(3 * 1024 * 1024))
+        (large / "fixture.install").write_text("post_install() { echo PACPIN_PROGRESS_FIRST_PACKAGE_COMPLETED; sleep 1; }\n")
+        (large / "PKGBUILD").write_text('''pkgname=pacpin-ui-progress-large
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+options=('!strip' '!debug')
+install=fixture.install
+package() { install -Dm644 "$startdir/padding" "$pkgdir/opt/pacpin-ui-progress-large/padding"; }
+''')
+        run("makepkg", "--nodeps", "--noconfirm", "--nocolor", cwd=large)
+        build = self.root / "progress-native"
+        build.mkdir()
+        for filename in ["PKGBUILD", "fixture.install", "padding"]:
+            shutil.copyfile(self.root / "native-2" / filename, build / filename)
+        with (build / "PKGBUILD").open("a") as stream:
+            stream.write("\ndepends=('pacpin-ui-progress-large')\n")
+        run("makepkg", "--nodeps", "--noconfirm", "--nocolor", cwd=build)
+        artifacts = [next(large.glob("*.pkg.tar.zst")), next(build.glob("*.pkg.tar.zst"))]
+        original_cfg = self.cfg.read_text()
+        original_delay = SlowRepository.download_delay
+        try:
+            SlowRepository.download_delay = .16
+            for background in [False, True]:
+                self.seed(source=background)
+                subprocess.run(["sudo", "-n", "pacman", "-R", "--noconfirm", "pacpin-ui-progress-large"], capture_output=True)
+                # Other suites use a fresh isolated ALPM database in the same
+                # live root. Remove only this fixture's unowned padding file.
+                padding = Path("/opt/pacpin-ui-progress-large/padding")
+                if padding.exists():
+                    run("sudo", "-n", "rm", "--", str(padding))
+                    run("sudo", "-n", "rmdir", "--", str(padding.parent))
+                self.publish(2)
+                self.catalog(2)
+                for archive in artifacts:
+                    shutil.copyfile(archive, self.repo / archive.name)
+                run("repo-add", str(self.repo / "pacpin-ui.db.tar.gz"), *[str(self.repo / archive.name) for archive in artifacts])
+                run("sudo", "-n", "pacman", "-Syy", "--noconfirm")
+                name = "native-aggregate-background" if background else "native-aggregate-foreground"
+                if background:
+                    orphan = self.root / "db/local/pacpin-ui-orphan-progress-1-1"
+                    orphan.mkdir()
+                    (orphan / "desc").write_text("%NAME%\npacpin-ui-orphan-progress\n\n%VERSION%\n1-1\n\n%DESC%\nAggregate download review fixture\n\n%REASON%\n1\n\n%SIZE%\n1\n\n")
+                    (orphan / "files").write_text("%FILES%\n\n")
+                    self.cfg.write_text(original_cfg.replace("smart_orphans = false", "smart_orphans = true"))
+                self.case(name, ["-Su"] if background else ["-Su", "--noconfirm"], native=True, source=background, confirm=background, selection=background, selection_wait=background, width=80)
+                frames = json.loads((self.root / f"{name}.frames.json").read_text())
+                observed = []
+                for frame in frames:
+                    match = re.search(r"(?:^|\n)Pacman: Downloading packages \((\d+)%\)", frame)
+                    if match:
+                        observed.append(int(match[1]))
+                if not any(0 < percent < 100 for percent in observed):
+                    self.results[-1]["failures"].append("aggregate native download percentage not observed")
+                self.results[-1]["aggregate_download_percentages"] = sorted(set(observed))
+                # At least one completed package must coexist with an
+                # aggregate installation percent below 100 in a two-pkg plan.
+                installed = next((frame for frame in frames if "Pacman: Installing packages (50%, 1/2)" in frame), None)
+                if installed is None:
+                    self.results[-1]["failures"].append("aggregate installation counter not observed")
+                else:
+                    (self.root / f"{name}.installation.screen.txt").write_text(installed)
+                download = next((frame for frame in frames if re.search(r"Pacman: Downloading packages \([1-9]\d?%\)", frame)), None)
+                if download:
+                    (self.root / f"{name}.download.screen.txt").write_text(download)
+                print(json.dumps(self.results[-1]), flush=True)
+        finally:
+            self.cfg.write_text(original_cfg)
+            SlowRepository.download_delay = original_delay
+
     def audit_cases(self, helpers):
         # Native solver expansion uses real small packages, including two new
         # dependencies; verify full-plan counts and the final summary position.
@@ -561,7 +642,7 @@ package() {{
         for artifact in artifacts:
             shutil.copyfile(artifact, self.repo / artifact.name)
         run("repo-add", str(self.repo / "pacpin-ui.db.tar.gz"), *[str(self.repo / p.name) for p in artifacts])
-        run("sudo", "-n", "pacman", "-Sy", "--noconfirm")
+        run("sudo", "-n", "pacman", "-Syy", "--noconfirm")
         self.case("native-dependency-summary", ["-Su", "--noconfirm"], native=True)
         raw = transcript(self.root / "native-dependency-summary.raw.txt")
         assert "1 upgrades + 2 new dependencies" in raw
@@ -1019,7 +1100,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--aur", action="store_true", help="Also build the small real AUR hello package using paru (requires Internet)")
-    parser.add_argument("--section", choices=["all", "remaining", "auth", "audit"], default="all", help="Run all, remaining, real sudo authentication, or transaction audit checks")
+    parser.add_argument("--section", choices=["all", "remaining", "auth", "audit", "progress"], default="all", help="Run all, remaining, real sudo authentication, transaction audit, or aggregate progress checks")
     args = parser.parse_args()
     if os.environ.get("PACPIN_DISPOSABLE_VM") != "1" or 'ID=garuda' not in Path("/etc/os-release").read_text() or run("findmnt", "-n", "-o", "FSTYPE", "/").strip() != "overlay" or run("systemd-detect-virt").strip() != "oracle":
         raise SystemExit("This verifier requires PACPIN_DISPOSABLE_VM=1 inside the disposable Garuda VM")

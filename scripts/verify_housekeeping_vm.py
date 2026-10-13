@@ -152,7 +152,7 @@ package() {{ install -Dm644 /etc/os-release "$pkgdir/opt/{name}/app"; }}
 
         install_unused()
         pending = Path(self.env["XDG_STATE_HOME"]) / "pacpin/pending_orphan_cleanup.json"
-        sudo.write_text('#!/bin/sh\nif [ "$1:$2" = pacman:-Rn ]; then echo INJECTED_REMOVAL_FAILURE >&2; sleep .5; exit 7; fi\nexec /usr/bin/sudo "$@"\n')
+        sudo.write_text('#!/bin/sh\nif [ "$1:$2" = pacman:-Rn ]; then echo "error: INJECTED_REMOVAL_FAILURE" >&2; sleep .5; exit 7; fi\nexec /usr/bin/sudo "$@"\n')
         self.case("failed-orphans-have-no-completion", ["orphans", "-c", "--noconfirm"], orphans=True, success=False, expected_error="INJECTED_REMOVAL_FAILURE")
         assert json.loads(pending.read_text()) == ["pacpin-ui-unused"]
         assert "Orphans: ✔" not in (self.root / "failed-orphans-have-no-completion.raw.txt").read_text()

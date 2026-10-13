@@ -69,6 +69,17 @@ fn renewal_command() -> Command {
     command
 }
 
+/// A noninteractive validation can show a phase immediately when no password
+/// is needed. Unknown privilege tools retain the deferred-prompt display.
+pub fn authenticated(tool: &std::ffi::OsStr) -> bool {
+    tool == "sudo" && crate::sandbox::run_tracked_command(
+        renewal_command()
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    ).is_ok_and(|status| status.success())
+}
+
 pub fn command(tool: &str) -> Command {
     prepared_command(tool, prepare(tool))
 }

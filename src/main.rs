@@ -306,6 +306,7 @@ fn is_clean_invocation(args: &[String]) -> bool {
 }
 
 fn main() {
+    let _progress_view = progress::session_view();
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);

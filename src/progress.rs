@@ -26,6 +26,24 @@ static SOURCE: Mutex<SourceState> = Mutex::new(SourceState {
 thread_local! { static BACKGROUND: Cell<bool> = const { Cell::new(false) }; }
 thread_local! { static SOURCE_DISPLAY: RefCell<Option<Footer>> = const { RefCell::new(None) }; }
 static TERMINAL: Mutex<Option<(libc::termios, u16)>> = Mutex::new(None);
+static VIEW: Mutex<Option<(u16, u16, u16)>> = Mutex::new(None);
+static SESSION_VIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep one output region across an invocation's successive footer phases.
+pub struct SessionView;
+pub fn session_view() -> SessionView {
+    SESSION_VIEW.store(true, std::sync::atomic::Ordering::Relaxed);
+    extern "C" fn restore_at_exit() { restore_terminal(); }
+    // process::exit bypasses Rust destructors in several command handlers.
+    unsafe { libc::atexit(restore_at_exit); }
+    SessionView
+}
+impl Drop for SessionView {
+    fn drop(&mut self) {
+        SESSION_VIEW.store(false, std::sync::atomic::Ordering::Relaxed);
+        restore_terminal();
+    }
+}
 static COMPLETED: Mutex<Vec<Manager>> = Mutex::new(Vec::new());
 static FAILED: Mutex<Vec<Manager>> = Mutex::new(Vec::new());
 static NATIVE_BACKGROUND: Mutex<Option<String>> = Mutex::new(None);
@@ -421,7 +439,12 @@ fn phase_with_metrics(manager: Manager, text: &str, phase: &str) -> String {
         if let Some((done, total)) = counter.split_once('/').and_then(|(done, total)| Some((done.trim().parse::<u64>().ok()?, total.trim().parse::<u64>().ok()?))).filter(|(_, total)| *total != 0) {
             let done = done.min(total);
             let progress = line_percent(text).map(|percent| u128::from(done.saturating_sub(1)) * 100 + u128::from(percent)).unwrap_or(u128::from(done) * 100);
-            let percent = (progress / u128::from(total)).min(100);
+            // ALPM's keyring/integrity/loading/conflict/space bars already
+            // describe the full verification action. Package installation
+            // and removal bars describe the current package instead.
+            let percent = if phase == "Verifying packages" {
+                line_percent(text).map(u128::from).unwrap_or(u128::from(done) * 100 / u128::from(total))
+            } else { (progress / u128::from(total)).min(100) };
             return format!("{phase} ({percent}%, {done}/{total})");
         }
     }
@@ -467,11 +490,14 @@ pub fn clear_sources() {
 /// Also called by the signal handler, which exits without running Drop.
 pub fn restore_terminal() {
     let saved = TERMINAL.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if let Some((saved, height)) = saved {
+    let view = VIEW.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let height = saved.as_ref().map(|(_, height)| *height).filter(|height| *height != 0)
+        .or_else(|| view.map(|(_, _, height)| height)).unwrap_or(0);
+    if saved.is_some() || height != 0 {
         let bottom = terminal_size().ws_row.saturating_sub(height).max(1);
         // SAFETY: saved was returned by tcgetattr for this process's stdin.
         unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved);
+            if let Some((saved, _)) = saved { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved); }
             // Resetting the scroll region homes the cursor. Preserve it so
             // subsequent source logs cannot overwrite earlier pacman text.
             // Signal exit skips Footer::drop. Clear its reserved rows here too.
@@ -519,6 +545,14 @@ impl Footer {
             input_echo: saved.c_lflag & libc::ECHO != 0,
         };
         *TERMINAL.lock().unwrap_or_else(|e| e.into_inner()) = Some((saved, footer.height));
+        if let Some((rows, cols, height)) = VIEW.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            footer.rows = rows;
+            footer.cols = cols;
+            footer.height = height;
+            if let Some((_, saved_height)) = TERMINAL.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { *saved_height = height; }
+        }
+        // Release an earlier region before a fresh password prompt can appear.
+        if !display { footer.suspend()?; }
         if display { footer.resize()?; }
         Ok(footer)
     }
@@ -639,8 +673,16 @@ impl Drop for Footer {
     fn drop(&mut self) {
         if self.height != 0 {
             let bottom = self.rows.saturating_sub(self.height).max(1);
-            let _ = write!(io::stdout(), "\x1b7\x1b[{};1H\x1b[J\x1b[r\x1b8", bottom + 1);
+            let reset = if SESSION_VIEW.load(std::sync::atomic::Ordering::Relaxed) { "" } else { "\x1b[r" };
+            let _ = write!(io::stdout(), "\x1b7\x1b[{};1H\x1b[J{reset}\x1b8", bottom + 1);
             let _ = io::stdout().flush();
+        }
+        if self.height != 0 && SESSION_VIEW.load(std::sync::atomic::Ordering::Relaxed) {
+            *VIEW.lock().unwrap_or_else(|e| e.into_inner()) = Some((self.rows, self.cols, self.height));
+            if let Some((saved, _)) = TERMINAL.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                unsafe { libc::tcsetattr(0, libc::TCSANOW, &saved); }
+            }
+            return;
         }
         restore_terminal();
     }
@@ -834,7 +876,7 @@ fn run_observed_with_stdin(
     COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&done| done != manager);
     FAILED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&done| done != manager);
     let interactive = interactive();
-    let mut phase = if matches!(command.get_program().to_str(), Some("sudo" | "pkexec" | "doas")) { "Authorizing package operation".to_string() } else { label.to_string() };
+    let mut phase = if matches!(command.get_program().to_str(), Some("sudo" | "pkexec" | "doas")) && !(interactive && crate::privilege::authenticated(command.get_program())) { "Authorizing package operation".to_string() } else { label.to_string() };
     let preset_input = stdin.is_some();
     if let Some(stdin) = stdin { command.stdin(stdin); }
     // Pacman's stage names are observed to avoid competing with its downloads.
@@ -901,7 +943,10 @@ fn run_observed_with_stdin(
                 Ok(n) => {
                     io::stdout().write_all(&buf[..n])?;
                     io::stdout().flush()?;
-                    observer.feed_observed(&buf[..n], &mut on_ready, &mut |line| { downloads.observe(line); on_line(line); });
+                    // A read can contain a heading followed by many hook/log
+                    // lines. Observe every phase before those lines replace
+                    // the latest display text.
+                    observer.feed_observed(&buf[..n], &mut on_ready, &mut |line| { phase = downloads.phase(manager, line, &phase); on_line(line); });
                 }
                 Err(error) if interactive && error.raw_os_error() == Some(libc::EIO) => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -1234,6 +1279,13 @@ mod tests {
     }
     #[test]
     fn footer_describes_phases_without_echoing_prompts_or_hook_logs() {
+        assert_eq!(phase_text(Manager::Native, "(1/2) checking package integrity [###] 73%", "Installing packages"), "Verifying packages (73%, 1/2)");
+        assert_eq!(phase_text(Manager::Native, "(1/2) loading package files [###] 73%", "Verifying packages"), "Verifying packages (73%, 1/2)");
+        let mut observer = Observer::default();
+        let mut downloads = NativeDownloads::default();
+        let mut phase = "Installing packages".to_string();
+        observer.feed_observed(b":: Running post-transaction hooks...\n(1/1) pacpin UI test hook\nPACPIN_NATIVE_HOOK_1\n", &mut || {}, &mut |line| { phase = downloads.phase(Manager::Native, line, &phase); });
+        assert_eq!(phase, "Running post-install hooks");
         assert_eq!(phase_text(Manager::Native, "[sudo] password for user:", "Starting"), "Awaiting authorization");
         assert_eq!(phase_text(Manager::Native, "Proceed with installation? [Y/n]", "Starting"), "Awaiting confirmation");
         assert_eq!(phase_text(Manager::Native, "PACPIN_NATIVE_HISTORY_01", "Running hooks"), "Running hooks");
@@ -1345,6 +1397,8 @@ mod tests {
             begin_transaction();
             completed(Manager::Native);
             failed(Manager::Aur);
+            let view = session_view();
+            for _ in 0..5 { println!("PHASE_ANCHOR_PADDING"); }
             println!("PHASE_PADDING_START");
             for (manager, label) in [
                 (Manager::Checks, "Checking update candidates"),
@@ -1359,6 +1413,8 @@ mod tests {
                 assert!(TERMINAL.lock().unwrap().is_none());
             }
             println!("PHASE_PADDING_END");
+            drop(view);
+            assert!(VIEW.lock().unwrap().is_none());
             context(Manager::Hooks, "Rebuilding triggered packages", || {
                 operation(Manager::Aur, "Building triggered packages", || {
                     std::thread::sleep(std::time::Duration::from_millis(110));

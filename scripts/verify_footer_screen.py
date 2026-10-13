@@ -91,6 +91,15 @@ try:
     for marker in ['PHASE_PADDING_START', 'PHASE_PADDING_END', 'AUTH_WAIT_COMPLETE', 'native output retained', 'stderr retained', 'source terminal retained', 'raw output line one', 'raw output line two', 'BACKGROUND_WAIT_FINISHED']:
         require(marker in final, f'lost screen/scrollback: {marker}')
     require('fixture-secret' not in final, 'secret echoed')
+    anchors = []
+    observed_phases = set()
+    for frame in frames:
+        phases = {phase for phase in ['Checks:', 'Review:', 'Records:', 'Restart:'] if phase in frame}
+        if 'PHASE_PADDING_END' not in frame and 'PHASE_PADDING_START' in frame and phases:
+            observed_phases.update(phases)
+            anchors.append(next(i for i, row in enumerate(frame.splitlines()) if 'PHASE_PADDING_START' in row))
+    require(len(observed_phases) == 4 and len(set(anchors)) == 1, 'successive footer phases scrolled the main output')
+    result['phase_anchor_stable'] = True
     require(secret_sent and answer_sent and selection_sent, 'fixture input incomplete')
     result.update(passed=True, frames=len(frames), prompt_after_resize=True, scrollback_retained=True)
     print(json.dumps(result))
