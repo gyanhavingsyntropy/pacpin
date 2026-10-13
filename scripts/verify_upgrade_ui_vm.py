@@ -68,6 +68,8 @@ class Checks:
         self.test_aur = aur
         self.section = section
         self.results = []
+        binary_bytes = self.binary.read_bytes()
+        (root / "binary.json").write_text(json.dumps({"sha256": hashlib.sha256(binary_bytes).hexdigest(), "bytes": len(binary_bytes)}, indent=2))
         self.env = dict(os.environ, XDG_CONFIG_HOME=str(root / "config"), XDG_STATE_HOME=str(root / "state"))
         self.repo = root / "repo"
         self.repo.mkdir()
@@ -143,7 +145,7 @@ binaries = {{ pacpin-ui-source = "bin/app" }}
         for hook in Path("/usr/share/libalpm/hooks").glob("*.hook"):
             (root / "hooks" / hook.name).symlink_to("/dev/null")
         hook_script = root / "fixture-hook.sh"
-        hook_script.write_text("#!/bin/bash\nfor i in $(seq 1 5); do printf 'PACPIN_NATIVE_HOOK_%s\\n' \"$i\"; sleep 0.15; done\n")
+        hook_script.write_text("#!/bin/bash\nfor i in $(seq 1 5); do printf 'PACPIN_NATIVE_HOOK_%s\\n' \"$i\"; sleep 0.4; done\n")
         os.chmod(hook_script, 0o755)
         (root / "hooks/zz-pacpin-ui.hook").write_text(f"[Trigger]\nOperation = Upgrade\nType = Package\nTarget = pacpin-ui-native\n[Action]\nDescription = pacpin UI test hook\nWhen = PostTransaction\nExec = {hook_script}\n")
         (root / "db/local/ALPM_DB_VERSION").write_text("9\n")
@@ -222,20 +224,30 @@ package() {{
                 path.unlink()
         run("sudo", "-n", "pacman", "-Syy", "--noconfirm")
 
-    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello", orphan_choice=None, expect_no_orphan_prompt=False, orphans=None, cache=None, cancel_manager=None, completed_before_cache=None, cancel_marker=None, password_prompt="PACPIN_AUTH_PASSWORD:", resize_password=False):
+    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello", orphan_choice=None, expect_no_orphan_prompt=False, orphans=None, cache=None, cancel_manager=None, completed_before_cache=None, cancel_marker=None, password_prompt="PACPIN_AUTH_PASSWORD:", resize_password=False, cwd=None):
         result = self.root / f"{name}.status"
         result.unlink(missing_ok=True)
         raw = self.root / f"{name}.raw.txt"
         # Deliberately stale: live terminal dimensions must beat COLUMNS.
-        env_keys = ["HOME", "PATH", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "LD_PRELOAD", "PACPIN_UI_SLOW_ARTIFACT"] + (["TMPDIR"] if "TMPDIR" in self.env else [])
+        env_keys = ["HOME", "PATH", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "LD_PRELOAD", "PACPIN_UI_SLOW_ARTIFACT"] + [key for key in ["TMPDIR", "MAKEPKG_CONF", "XDG_DATA_HOME", "XDG_CACHE_HOME", "NIX_CONFIG", "NIX_REMOTE", "PIPX_HOME", "PIPX_BIN_DIR", "PIP_NO_INDEX", "PIP_FIND_LINKS", "PIPX_DEFAULT_BACKEND"] if key in self.env]
         command = shlex.join(["env", *[f"{key}={self.env[key]}" for key in env_keys], "COLUMNS=120", str(self.binary), *args])
+        if cwd is not None:
+            command = "cd " + shlex.quote(str(cwd)) + " && " + command
         if password:
             # Consecutive runs share script's controlling tty and sudo ticket.
             # pacpin itself must require fresh authentication for the next run.
             command = "export SUDO_PROMPT=" + shlex.quote(password_prompt + " ") + "; " + " && ".join([command] * repeat)
         scratch_before = {str(path) for base in ["/tmp", "/var/tmp"] for path in Path(base).glob("pacpin-source-*")}
         shell = self.root / f"{name}.sh"
-        shell.write_text(f"#!/bin/bash\nprintf '\\033[2J\\033[3J\\033[H'\nprintf 'PACPIN_BEFORE_TRANSACTION\\n'\nstty -g > {shlex.quote(str(self.root / (name + '.term-before')))}\nscript -qef -c {shlex.quote(command)} {shlex.quote(str(raw))}\nstatus=$?\nstty -g > {shlex.quote(str(self.root / (name + '.term-after')))}\nprintf 'PACPIN_AFTER_TRANSACTION\\n'\nprintf '%s' \"$status\" > {shlex.quote(str(result))}\n")
+        # Resize cases exercise Kitty's own tty. An extra script(1) PTY can
+        # delay forwarding its new dimensions while the display already shrank.
+        direct_terminal = getattr(self, "direct_terminal", resize and not password)
+        if direct_terminal:
+            assert not password, "Authentication checks need live raw prompt recording"
+            execution = f"{command}\nstatus=$?\nkitty @ --to {shlex.quote(self.socket)} get-text --extent all > {shlex.quote(str(raw))}"
+        else:
+            execution = f"script -qef -c {shlex.quote(command)} {shlex.quote(str(raw))}\nstatus=$?"
+        shell.write_text(f"#!/bin/bash\nprintf '\\033[2J\\033[3J\\033[H'\nprintf 'PACPIN_BEFORE_TRANSACTION\\n'\nstty -g > {shlex.quote(str(self.root / (name + '.term-before')))}\n{execution}\nstty -g > {shlex.quote(str(self.root / (name + '.term-after')))}\nprintf 'PACPIN_AFTER_TRANSACTION\\n'\nprintf '%s' \"$status\" > {shlex.quote(str(result))}\n")
         self.rc("resize-os-window", "--width", str(width), "--height", "30", "--unit", "cells")
         resize_deadline = time.monotonic() + 3
         while True:
@@ -251,7 +263,7 @@ package() {{
         pending_password_since = None
         password_visibility_failures = []
         selection_started, selection_enter = None, False
-        deadline = time.monotonic() + (timeout or (180 if aur else 60))
+        deadline = time.monotonic() + (timeout or (600 if aur else 60))
         while not result.exists():
             if time.monotonic() > deadline:
                 self.rc("send-key", "ctrl+c")
@@ -351,6 +363,8 @@ package() {{
                 failures.append(f"pacman history overwritten: {missing}")
             if any("PACPIN_NATIVE_HISTORY_" in line and not line.startswith("PACPIN_NATIVE_HISTORY_") for line in all_text.splitlines()):
                 failures.append("native output indented by missing carriage returns")
+            if any("PACPIN_NATIVE_HISTORY_" in line and not re.fullmatch(r"PACPIN_NATIVE_HISTORY_\d{2}", line) for line in all_text.splitlines()):
+                failures.append("native history contains leftover footer text")
         if any("Native/AUR:" in frame for frame in snapshots) or (not aur and any(re.search(r"(?:^|\n)AUR:", frame) for frame in snapshots)):
             failures.append("AUR shown although it was never invoked")
         if aur and not any(re.search(r"(?:^|\n)AUR:", frame) for frame in snapshots):
@@ -431,7 +445,7 @@ package() {{
             failures.append("native installed version is not 2.0.0-1")
         if aur and success and not any(line.startswith(f"{aur_package} 2.") for line in versions):
             failures.append(f"AUR fixture {aur_package} was not installed")
-        self.results.append({"case": name, "status": status, "failures": failures, "frames": len(snapshots), "resized": resized, "cancelled": cancelled, "installed": versions})
+        self.results.append({"case": name, "status": status, "failures": failures, "frames": len(snapshots), "resized": resized, "cancelled": cancelled, "installed": versions, "capture": "Kitty screen/scrollback" if direct_terminal else "script PTY plus Kitty"})
         if password:
             self.results[-1]["password_prompts"] = raw_text.count(password_prompt)
             self.results[-1]["runs"] = repeat
@@ -696,7 +710,7 @@ exec /usr/bin/sudo "$@"
         small_root.mkdir()
         run("sudo", "-n", "mount", "-t", "tmpfs", "-o", "size=16m", "tmpfs", str(small_root))
         pacman_conf = helpers / "pacman-conf"
-        pacman_conf.write_text(f'#!/bin/sh\nif [ "$1" = RootDir ]; then printf "%s\\n" {shlex.quote(str(small_root))}; else exec /usr/bin/pacman-conf "$@"; fi\n')
+        pacman_conf.write_text(f'#!/bin/sh\nif [ "$#" = 0 ]; then /usr/bin/pacman-conf | sed {shlex.quote("s|^RootDir = .*|RootDir = " + str(small_root) + "|")}; elif [ "$1" = RootDir ]; then printf "%s\\n" {shlex.quote(str(small_root))}; else exec /usr/bin/pacman-conf "$@"; fi\n')
         pacman_conf.chmod(0o755)
         self.env["PATH"] = f"{helpers}:{original_path}"
         try:
@@ -957,6 +971,12 @@ exec /usr/bin/sudo "$@"
         paru_dir.mkdir()
         (paru_dir / "paru.conf").write_text("[options]\nSkipReview\n")
         self.cfg.write_text(self.cfg.read_text().replace('[pins]', '[pins]\nhello = "aur"'))
+        # The live guest has little RAM. Exercise the real recipe/toolchain
+        # without expensive debug indexing/LTO unrelated to orchestration.
+        makepkg_config = self.root / "aur-makepkg.conf"
+        makepkg_config.write_text(Path("/etc/makepkg.conf").read_text() + "\nOPTIONS=(strip docs !libtool !staticlibs emptydirs zipman purge !debug !lto)\n")
+        original_makepkg = self.env.get("MAKEPKG_CONF")
+        self.env["MAKEPKG_CONF"] = str(makepkg_config)
         try:
             for name, native, source in [("aur-only", False, False), ("aur-and-sources", False, True), ("native-aur-and-sources", True, True), ("aur-install", False, False), ("aur-no-cache", False, False)]:
                 self.seed(source=source, native=native)
@@ -984,12 +1004,16 @@ exec /usr/bin/sudo "$@"
                         run("sudo", "-n", "rm", "--", str(policy))
         finally:
             subprocess.run(["sudo", "-n", "pacman", "-R", "--noconfirm", "hello"], capture_output=True)
+            if original_makepkg is None:
+                self.env.pop("MAKEPKG_CONF", None)
+            else:
+                self.env["MAKEPKG_CONF"] = original_makepkg
 
     def integration_cases(self, helpers):
         # Controlled provider fixture: exercise the real Flatpak adapter without
         # downloading applications. Explicitly records its simulated nature.
         flatpak = helpers / "flatpak"
-        flatpak.write_text('#!/bin/sh\ncase "$1" in\n--version) echo "Flatpak fixture";;\nremote-ls) if [ -f "' + str(self.root / 'flatpak-update') + '" ]; then printf "UI Fixture\\torg.pacpin.UiFixture\\t2\\tfixture\\n"; fi;;\nupdate) echo "PACPIN_FLATPAK_FIXTURE_UPDATED"; sleep 1;;\nesac\n')
+        flatpak.write_text('#!/bin/sh\ncase "$1" in\n--version) echo "Flatpak fixture";;\nlist) echo user;;\nremote-ls) if [ -f "' + str(self.root / 'flatpak-update') + '" ]; then printf "UI Fixture\\tapp/org.pacpin.UiFixture/x86_64/stable\\t2\\tfixture\\t' + 'a' * 12 + '\\n"; fi;;\ninfo|remote-info) echo "' + 'a' * 64 + '";;\nupdate) echo "PACPIN_FLATPAK_FIXTURE_UPDATED"; sleep 1;;\nesac\n')
         flatpak.chmod(0o755)
         original_cfg, original_env = self.cfg.read_text(), dict(self.env)
         self.cfg.write_text(original_cfg.replace("integrations = false", "integrations = true").replace("flatpak = false", "flatpak = true"))
@@ -1063,9 +1087,35 @@ exec /usr/bin/sudo "$@"
         nix = helpers / "nix"
         nix_env = helpers / "nix-env"
         pipx = helpers / "pipx"
-        nix.write_text('#!/bin/sh\nif [ "$1" = "--version" ]; then echo "nix fixture"; else echo "PACPIN_NIX_FIXTURE_UPDATED"; sleep 1; fi\n')
+        nix.write_text(f'''#!/usr/bin/python
+import json, sys, time
+from pathlib import Path
+state = Path({str(self.root / 'nix-updated')!r})
+args = sys.argv[1:]
+if args[:2] == ['profile', 'list']:
+    version = 'new' if state.exists() else 'old'
+    print(json.dumps({{'version':3, 'elements':{{'pacpin-ui-nix-fixture':{{'active':True, 'originalUrl':'fixture:source', 'url':'fixture:'+version, 'attrPath':'fixture', 'storePaths':['/nix/store/'+version]}}}}}}))
+elif args[:2] == ['flake', 'metadata']: print(json.dumps({{'url':'fixture:new'}}))
+elif args[:1] == ['eval']:
+    old = 'fixture:old#fixture' in args
+    print(json.dumps({{'version':'1' if old else '2', 'path':'/nix/store/old' if old else '/nix/store/new'}}))
+elif args[:2] == ['profile', 'upgrade']:
+    print('PACPIN_NIX_FIXTURE_UPDATED', flush=True); time.sleep(3); state.touch()
+else: sys.exit(91)
+''')
         nix_env.write_text('#!/bin/sh\necho "pacpin-ui-nix-fixture"\n')
-        pipx.write_text('#!/bin/sh\ncase "$1" in\n--version) echo "pipx fixture";;\nlist) printf \'{"venvs":{"pip":{"metadata":{"main_package":{"package_version":"0.0.0"}}}}}\\n\';;\nupgrade-all) echo "PACPIN_PIPX_FIXTURE_UPDATED"; sleep 1;;\nesac\n')
+        pipx.write_text(f'''#!/usr/bin/python
+import json, os, sys, time
+from pathlib import Path
+state = Path({str(self.root / 'pipx-version')!r})
+args = sys.argv[1:]
+if args[:1] == ['list']:
+    print(json.dumps({{'venvs':{{'pip':{{'metadata':{{'main_package':{{'package':'pip','package_version':state.read_text() if state.exists() else '0.0.0'}}}}}}}}}}))
+elif args[:1] == ['upgrade']:
+    print('PACPIN_PIPX_FIXTURE_UPDATED', flush=True); time.sleep(3)
+    state.write_text(Path(os.environ['PIP_CONSTRAINT']).read_text().strip().split('==')[1])
+else: sys.exit(91)
+''')
         for helper in [nix, nix_env, pipx]:
             helper.chmod(0o755)
         self.env["PATH"] = f"{helpers}:{self.env['PATH']}"

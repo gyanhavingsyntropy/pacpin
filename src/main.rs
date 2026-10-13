@@ -24,6 +24,8 @@ mod download;
 mod hooks;
 pub mod pm;
 mod integrations;
+mod manager_config;
+mod pacman_config;
 mod journal;
 mod orphans;
 mod preview;
@@ -190,6 +192,9 @@ pub(crate) fn check_and_prompt_smart_unpin(mut config: Config, removed_pkgs: &[S
 fn print_help() {
     print_banner();
     println!("\nUsage: pacpin <command> [options]");
+    println!("  config init                Create editable managers.toml / sources.toml / hooks.toml (preserves existing files)");
+    println!("  config validate            Validate all pacpin configuration files");
+    println!("  manager NAME --FLAG        Preview and run a configured manager action");
     println!();
     println!("{}", "Core Package Operations:".bold());
     println!("  check, -Qu                   Check pending updates & verify pin protections");
@@ -203,9 +208,11 @@ fn print_help() {
     println!("      --no-cache               Clean caches for successful native/AUR transactions");
     println!("      --sources-only           Upgrade configured Sources only");
     println!("      --aur-only               Upgrade AUR targets only (build dependencies may use pacman)");
+    println!("      --external-only          Upgrade enabled external managers only");
+    println!("      --MANAGER.FLAG           Apply a custom flag defined in managers.toml");
     println!("      --keep-going             Try independent Sources after a verified AUR build failure");
-    println!("      --use-ram                Use tmpfs for Sources / Paru temporary build files");
-    println!("      --use-storage            Use disk for Sources / Paru temporary build files");
+    println!("      --use-ram                Use tmpfs for Sources / Paru builds and native run/try files");
+    println!("      --use-storage            Use disk for Sources / Paru builds and native run/try files");
     println!("      --noconfirm              Bypass interactive confirmation prompt");
     println!("  -S [flags] [repo/]pkg        Install packages (auto-pins repo/pkg with companion cascade)");
     println!("  -S github:owner/project      Install a reviewed direct upstream release (--channel alpha)");
@@ -323,14 +330,10 @@ fn main() {
 
     let mut args: Vec<String> = env::args().skip(1).collect();
 
-    let mut cli_privilege_override = None;
-    if let Some(pos) = args.iter().position(|a| a == "--pkexec") {
-        args.remove(pos);
-        cli_privilege_override = Some("pkexec".to_string());
-    } else if let Some(pos) = args.iter().position(|a| a == "--sudo") {
-        args.remove(pos);
-        cli_privilege_override = Some("sudo".to_string());
-    }
+    let cli_privilege_override = match runtime::extract_privilege_override(&mut args) {
+        Ok(tool) => tool.map(str::to_string),
+        Err(error) => { eprintln!("Error: {error}"); exit(2); }
+    };
 
     match runtime::parse(&mut args) {
         Ok(policy) => scratch::initialize(policy),
@@ -384,8 +387,20 @@ fn main() {
         exit(0);
     }
 
-    // Auto-launch wizard if no config exists and running in an interactive terminal
-    let (mut config, just_initialized) = if !config::config_exists() && io::stdin().is_terminal() {
+    if args.as_slice() == ["config", "init"] {
+        let path = config::get_config_path();
+        match manager_config::initialize(path.parent().unwrap_or_else(|| Path::new("."))) {
+            Ok(created) => {
+                for path in &created { println!(":: Created {path}"); }
+                if created.is_empty() { println!(":: Configuration files already exist; preserved them."); }
+            }
+            Err(error) => { eprintln!("Error: {error}"); exit(1); }
+        }
+        exit(0);
+    }
+
+    // Explicit operations must not create configuration as an onboarding side effect.
+    let (mut config, just_initialized) = if args.is_empty() && !config::config_exists() && io::stdin().is_terminal() {
         if let Some(cfg) = wizard::run_first_launch_wizard(false, false) {
             (cfg, true)
         } else {
@@ -412,7 +427,27 @@ fn main() {
     }
 
     let cmd = &args[0];
-    if cmd == "repos" || cmd == "repo-order" || cmd == "priority" {
+    if args.as_slice() == ["config", "validate"] {
+        println!(":: Configuration valid: {} manager definitions, {} Sources recipes, {} hooks.", config.manager_file.managers.len(), config.sources.len(), config.hooks.len());
+    } else if cmd == "manager" {
+        let Some(name) = args.get(1) else { eprintln!("Usage: pin manager NAME --FLAG [--dry-run] [--noconfirm]"); exit(2); };
+        let flags: Vec<String> = args[2..].iter().filter(|arg| !matches!(arg.as_str(), "--dry-run" | "-n" | "--noconfirm")).cloned().collect();
+        let commands = match integrations::IntegrationsManager::configured_actions(&config, name, &flags, false) {
+            Ok(commands) => commands, Err(error) => { eprintln!("Error: {error}"); exit(2); }
+        };
+        for command in commands { println!(":: {name} action: {command}"); }
+        if args.iter().any(|arg| matches!(arg.as_str(), "--dry-run" | "-n")) { return; }
+        if !args.iter().any(|arg| arg == "--noconfirm") {
+            use std::io::Write;
+            if !io::stdin().is_terminal() { eprintln!("A terminal confirmation or --noconfirm is required"); exit(2); }
+            print!(":: Run these configured actions? [y/N] "); let _ = io::stdout().flush();
+            let mut answer = String::new();
+            if io::stdin().read_line(&mut answer).is_err() || !answer.trim().eq_ignore_ascii_case("y") { println!(":: Actions cancelled."); return; }
+        }
+        match integrations::IntegrationsManager::configured_actions(&config, name, &flags, true) {
+            Ok(_) => println!("✔ {name}: configured actions completed."), Err(error) => { eprintln!("Error: {error}"); exit(1); }
+        }
+    } else if cmd == "repos" || cmd == "repo-order" || cmd == "priority" {
         cmd_repos(config);
         exit(0);
     } else if cmd == "capture" {

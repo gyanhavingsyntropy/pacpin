@@ -104,6 +104,12 @@ remove trailing whitespace; the original exported recordings are unchanged.
 
 ## Remaining opportunities and limits
 
+These were the opportunities at the time of this review. The subsequent
+[manager configuration follow-up](2026-10-13-manager-config.md) implements typed
+integration/AUR upgrade-check errors, shared source HTTP agents, native config
+snapshots, bounded recent history reads and tracked integration/sandbox metadata.
+Its report records verification and remaining legacy exceptions separately.
+
 1. **Incomplete checks need typed outcomes.** Some integration/AUR/network
    errors still become an empty update list. The global up-to-date message can
    therefore be too strong. Rejected PyPI metadata now warns, but the wider

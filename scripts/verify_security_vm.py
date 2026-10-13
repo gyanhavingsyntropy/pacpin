@@ -58,7 +58,8 @@ class SecurityChecks(Checks):
         flatpak.write_text(f'''#!/bin/sh
 case "$1" in
   --version) echo 'Flatpak security fixture';;
-  remote-ls) echo checked >> '{calls}'; printf 'Fixture\\torg.pacpin.SecurityFixture\\t2.0\\tflathub\\n';;
+  list) echo user;;
+  remote-ls) echo checked >> '{calls}'; printf 'Fixture\\tapp/org.pacpin.SecurityFixture/x86_64/stable\\t2.0\\tflathub\\t{'b' * 64}\\n';;
   *) exit 91;;
 esac
 ''')
@@ -81,7 +82,7 @@ esac
             raise AssertionError("Cache write followed a symlink")
         if cache.stat().st_mode & 0o777 != 0o600:
             raise AssertionError("Cache is not private")
-        if json.loads(cache.read_text())[0]["id"] != "org.pacpin.SecurityFixture":
+        if json.loads(cache.read_text())[0]["id"] != "app/org.pacpin.SecurityFixture/x86_64/stable":
             raise AssertionError("Fresh discovery was not cached")
         self.case("flatpak-cache-hit", ["check"])
         if calls.read_text().splitlines() != ["checked"]:

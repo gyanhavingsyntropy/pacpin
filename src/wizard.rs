@@ -85,6 +85,10 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
     } else {
         None
     };
+    let supplemental = match crate::config::supplemental_defaults() {
+        Ok(config) => config, Err(error) => { eprintln!("Error: {error}"); return None; }
+    };
+    let preserved = existing_cfg.as_ref().unwrap_or(&supplemental);
 
     if reset && config_path.exists() {
         println!("{}", ":: Resetting configuration and launching setup from scratch...\n".yellow().bold());
@@ -302,8 +306,12 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
     let enable_integrations = enable_flatpak || enable_nix || enable_pipx;
 
     let config = Config {
-        hooks: existing_cfg.as_ref().map(|cfg| cfg.hooks.clone()).unwrap_or_default(),
-        sources: existing_cfg.as_ref().map(|cfg| cfg.sources.clone()).unwrap_or_default(),
+        manager_file: preserved.manager_file.clone(),
+        manager_base_options: preserved.manager_base_options.clone(),
+        external_sources: preserved.external_sources.clone(),
+        external_hooks: preserved.external_hooks.clone(),
+        hooks: preserved.hooks.clone(),
+        sources: preserved.sources.clone(),
         features: Features {
             pinning: enable_pinning,
             stability_delays: enable_delays,
@@ -328,11 +336,16 @@ pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
     let saved = if reset {
         save_config(&config).map_err(|e| e.to_string())
     } else {
-        save_config_if_unchanged(&existing_cfg.unwrap_or_default(), &config)
+        save_config_if_unchanged(existing_cfg.as_ref().unwrap_or(&supplemental), &config)
     };
     if let Err(e) = saved {
         eprintln!("{}", format!("Error saving configuration: {}", e).red());
         return None;
+    }
+    if let Some(directory) = crate::config::get_config_path().parent() {
+        if let Err(error) = crate::manager_config::initialize(directory) {
+            eprintln!("Warning: Could not create optional manager/recipe files: {error}");
+        }
     }
 
     if config.features.shell_aliases {

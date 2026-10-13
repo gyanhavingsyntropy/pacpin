@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::aur::{self, AurItem};
+use crate::aur;
 use crate::config::Config;
 use crate::db::AlpmManager;
 use alpm::vercmp;
@@ -107,6 +107,7 @@ pub struct ResolvedPackage {
 
 #[derive(Debug, Clone)]
 pub struct ResolveResult {
+    pub check_errors: Vec<String>,
     pub installed_count: usize,
     pub repos: Vec<String>,
     #[allow(dead_code)]
@@ -308,8 +309,8 @@ impl<'a> ResolverEngine<'a> {
         }
 
         let aur_handle = if !skip_aur && !foreign_pkgs.is_empty() {
-            Some(thread::spawn(move || -> HashMap<String, AurItem> {
-                aur::query_aur(&foreign_pkgs)
+            Some(thread::spawn(move || {
+                aur::query_aur_checked(&foreign_pkgs)
             }))
         } else {
             None
@@ -617,9 +618,12 @@ impl<'a> ResolverEngine<'a> {
         }
 
         // Join the concurrent AUR query thread
-        let aur_data = aur_handle
-            .map(|h| h.join().unwrap_or_default())
-            .unwrap_or_default();
+        let mut check_errors = Vec::new();
+        let aur_data = match aur_handle.map(|h| h.join()) {
+            None => HashMap::new(), Some(Ok(Ok(data))) => data,
+            Some(Ok(Err(error))) => { check_errors.push(error); HashMap::new() },
+            Some(Err(_)) => { check_errors.push("AUR update worker failed".into()); HashMap::new() },
+        };
 
         // Resolve pending packages requiring AUR inspection
         for p in pending_aur {
@@ -780,6 +784,7 @@ impl<'a> ResolverEngine<'a> {
         held_packages.sort_by(|a, b| a.name.cmp(&b.name));
 
         ResolveResult {
+            check_errors,
             installed_count,
             repos: repos.to_vec(),
             packages: resolved,

@@ -58,13 +58,31 @@ pub fn cmd_upgrade(
     if !scope.includes_native() && autoremove {
         eprintln!("Error: scoped upgrades cannot include orphan removal; use pin orphans -c separately"); exit(2);
     }
-    let mut provider_config = config.clone();
-    if scope != crate::runtime::UpgradeScope::All { provider_config.features.integrations = false; }
+    let mut provider_config = match crate::manager_config::select_flags(config, extra_flags) {
+        Ok(config) => config, Err(error) => { eprintln!("Error: {error}"); exit(2); }
+    };
+    for argument in crate::runtime::custom_flags(extra_flags) {
+        let key = argument.trim_start_matches("--").split('.').next().unwrap_or("");
+        if !scope.includes_runner(match key { "flatpak" => "Flatpak", "nix" => "Nix", "pipx" => "Pipx", _ => key }) {
+            eprintln!("Error: {argument} is outside the selected upgrade scope"); exit(2);
+        }
+    }
+    if matches!(scope, crate::runtime::UpgradeScope::Sources | crate::runtime::UpgradeScope::Aur) {
+        provider_config.features.integrations = false;
+        for definition in provider_config.manager_file.managers.values_mut() { definition.enabled = Some(false); }
+    }
     if scope == crate::runtime::UpgradeScope::Aur { provider_config.sources.clear(); }
     let ext_providers = crate::progress::operation(crate::progress::Manager::Checks, "Detecting package managers", || IntegrationsManager::get_active_providers(&provider_config))
         .into_iter().filter(|p| scope.includes_runner(p.name())).collect::<Vec<_>>();
     if !scope.includes_native() && refresh {
         println!(":: Scoped upgrade: native repository databases are not refreshed. AUR builds may still require native build dependencies.");
+    }
+
+    if refresh && !dry_run && scope == crate::runtime::UpgradeScope::External {
+        let refreshing = ext_providers.iter().filter(|p| p.supports_refresh()).cloned().collect::<Vec<_>>();
+        if let Err(error) = crate::progress::operation(crate::progress::Manager::Metadata, "Refreshing external metadata", || IntegrationsManager::refresh_all_parallel(&refreshing)) {
+            eprintln!("Error: External refresh failed: {error}"); exit(1);
+        }
     }
 
     if refresh && !dry_run && scope.includes_native() {
@@ -76,13 +94,23 @@ pub fn cmd_upgrade(
         let ext_refresh_providers = ext_providers.iter().filter(|provider| provider.supports_refresh()).cloned().collect::<Vec<_>>();
         let ext_refresh_handle = if !ext_refresh_providers.is_empty() {
             Some(thread::spawn(move || {
-                crate::progress::context(crate::progress::Manager::Metadata, "Refreshing external metadata", || IntegrationsManager::refresh_all_parallel(&ext_refresh_providers));
+                crate::progress::context(crate::progress::Manager::Metadata, "Refreshing external metadata", || IntegrationsManager::refresh_all_parallel(&ext_refresh_providers))
             }))
         } else {
             None
         };
 
         let status = pm::refresh_databases(config);
+        // Join bounded external work even when native refresh fails; exiting
+        // first can leave a configured refresh process running after pacpin.
+        let external_error = ext_refresh_handle.and_then(|h| {
+            match crate::progress::operation(crate::progress::Manager::Metadata, "Refreshing external metadata", || h.join()) {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("External refresh failed: {error}")),
+                Err(_) => Some("External refresh worker failed".into()),
+            }
+        });
+        if let Some(error) = &external_error { eprintln!("Error: {error}"); }
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => {
@@ -102,9 +130,7 @@ pub fn cmd_upgrade(
             }
         }
 
-        if let Some(h) = ext_refresh_handle {
-            crate::progress::operation(crate::progress::Manager::Metadata, "Refreshing external metadata", || { let _ = h.join(); });
-        }
+        if external_error.is_some() { exit(1); }
     }
 
     let ext_providers_for_check = ext_providers.clone();
@@ -119,13 +145,18 @@ pub fn cmd_upgrade(
             exit(1);
         }
     };
-    for warn in if scope == crate::runtime::UpgradeScope::Sources { Vec::new() } else { manager.verify_syncdbs() } {
+    for warn in if matches!(scope, crate::runtime::UpgradeScope::Sources | crate::runtime::UpgradeScope::External) { Vec::new() } else { manager.verify_syncdbs() } {
         eprintln!("{}", format!(":: Warning: {}", warn).yellow());
     }
     let resolver = ResolverEngine::new(&manager);
-    let mut res = if scope == crate::runtime::UpgradeScope::Sources {
-        ResolveResult { installed_count: manager.handle().localdb().pkgs().len(), repos: Vec::new(), packages: std::collections::HashMap::new(), updates: Vec::new(), held_packages: Vec::new(), unresolved_pins: Vec::new() }
+    let mut res = if matches!(scope, crate::runtime::UpgradeScope::Sources | crate::runtime::UpgradeScope::External) {
+        ResolveResult { check_errors: Vec::new(), installed_count: manager.handle().localdb().pkgs().len(), repos: Vec::new(), packages: std::collections::HashMap::new(), updates: Vec::new(), held_packages: Vec::new(), unresolved_pins: Vec::new() }
     } else { crate::progress::operation(crate::progress::Manager::Checks, "Checking package updates", || resolver.resolve_all(config)) };
+    if !res.check_errors.is_empty() {
+        eprintln!("Error: Update check incomplete: {}", res.check_errors.join("; "));
+        let _ = ext_handle.join();
+        exit(1);
+    }
     res.updates.retain(|p| if p.candidate.as_ref().is_some_and(|c| c.is_aur) { scope.includes_aur() } else { scope.includes_native() });
     if !scope.includes_native() {
         res.held_packages.retain(|p| scope.includes_aur() && p.candidate.as_ref().is_some_and(|c| c.is_aur));
@@ -163,8 +194,18 @@ pub fn cmd_upgrade(
     } else {
         Vec::new()
     };
-    let mut external_updates = crate::progress::operation(crate::progress::Manager::Checks, "Checking external updates", || ext_handle.join().unwrap_or_default());
+    let checked = crate::progress::operation(crate::progress::Manager::Checks, "Checking external updates", || ext_handle.join());
+    let mut external_updates = match checked {
+        Ok(Ok(updates)) => updates, Ok(Err(error)) => { eprintln!("Error: {error}"); exit(1); },
+        Err(_) => { eprintln!("Error: External update worker failed"); exit(1); },
+    };
     external_updates.retain(|update| update.runner != "Sources" || !crate::sources::ignored(&update.name, extra_flags));
+    for (key, definition) in &provider_config.manager_file.managers {
+        let name = match key.as_str() { "flatpak" => "Flatpak", "nix" => "Nix", "pipx" => "Pipx", _ => key };
+        if !definition.selected_flags.is_empty() && !external_updates.iter().any(|u| u.runner == name) {
+            println!(":: {name}: custom flags skipped because this manager has no approved updates.");
+        }
+    }
 
     // Explicitly requested targets (`pin -Syu <pkg...>`) join the upgrade in
     // their own box. Source-owned and direct upstream targets are rejected
@@ -198,6 +239,7 @@ pub fn cmd_upgrade(
         .map(|item| item.name.clone())
         .collect();
     let res_view = ResolveResult {
+        check_errors: res.check_errors.clone(),
         installed_count: res.installed_count,
         repos: res.repos.clone(),
         packages: std::collections::HashMap::new(),
@@ -397,6 +439,9 @@ pub fn cmd_upgrade(
 
     let no_cache = config.options.no_cache
         || extra_flags.iter().any(|f| f == "--no-cache" || f == "--clean-cache");
+    if let Err(error) = IntegrationsManager::validate_options(&ext_providers, &external_updates, no_cache) {
+        eprintln!("Error: {error}"); exit(2);
+    }
 
     let manager_flags = crate::runtime::manager_flags(extra_flags);
     if !aur_targets.is_empty() {
@@ -490,7 +535,8 @@ pub fn cmd_upgrade(
 
     if dry_run {
         if keep_going { println!("Dry-Run: --keep-going permits independent Sources only after a verified AUR build failure; the overall run still fails."); }
-        if let Some(description) = crate::scratch::describe_plan(external_updates.iter().any(|u| u.runner == "Sources"), !aur_targets.is_empty() || hook_plan.has_aur()) { println!("Dry-Run: {description}"); }
+        let external_scratch: Vec<_> = ext_providers.iter().filter(|p| p.name() != "Sources" && external_updates.iter().any(|u| u.runner == p.name())).map(|p| p.name()).collect();
+        if let Some(description) = crate::scratch::describe_managers(external_updates.iter().any(|u| u.runner == "Sources"), !aur_targets.is_empty() || hook_plan.has_aur(), &external_scratch) { println!("Dry-Run: {description}"); }
         println!("{}", "Dry-Run: Synthesized Upgrade Commands:".bold());
         println!("  ➔ {}\n", full_cmd.cyan());
         if no_cache {
@@ -504,7 +550,13 @@ pub fn cmd_upgrade(
             } else if has_aur {
                 println!("  ➔ Purge AUR build cache only ({} -Scc --aur); native pacman cache preserved\n", config.options.helper);
             } else {
-                println!("  ➔ No pacman or AUR caches to purge; sources clean their own temporary workspace\n");
+                println!("  ➔ No native or AUR cache cleanup in this plan");
+            }
+            for provider in &ext_providers {
+                if external_updates.iter().any(|u| u.runner == provider.name()) {
+                    if let Some(action) = provider.cache_command_str() { println!("  ➔ {}: {action}", provider.name()); }
+                    else if provider.name() == "Sources" { println!("  ➔ Sources remove their temporary workspaces"); }
+                }
             }
         }
         if (autoremove || orphan_list_changed) && !orphans.is_empty() {
@@ -798,9 +850,11 @@ pub fn cmd_upgrade(
         crate::progress::clear_sources();
     }
 
+    let mut external_outcomes = Vec::new();
     if all_success && !external_updates.is_empty() {
         let outcomes = IntegrationsManager::execute_upgrades(&ext_providers, &external_updates);
-        for (_p_name, cmd_str, success) in outcomes {
+        for (p_name, cmd_str, success) in outcomes {
+            external_outcomes.push((p_name, success));
             if success {
                 executed_commands.push(cmd_str);
             } else {
@@ -917,11 +971,12 @@ pub fn cmd_upgrade(
     let cleanup_ok = pm::transaction_cache_cleanup(config, no_cache,
         (!pacman_targets.is_empty()).then_some(native_ok),
         aur_cleanup);
+    let external_cleanup_ok = IntegrationsManager::transaction_cache_cleanup(&ext_providers, &external_outcomes, no_cache);
 
     if !applied_updates.is_empty() {
         restart::RestartInspector::print_restart_advisory(&applied_updates, &config.options.privilege_tool);
     }
-    all_success &= cleanup_ok;
+    all_success &= cleanup_ok && external_cleanup_ok;
     if !all_success {
         match exit_status {
             Ok(s) => exit(s.code().filter(|code| *code != 0).unwrap_or(1)),
@@ -1575,6 +1630,7 @@ mod tests {
         let fixture = AlpmFixture::new(&local[..], &[("extra", &sync[..])]);
         let config = Config::default();
         let res = ResolveResult {
+            check_errors: Vec::new(),
             installed_count: 0,
             repos: Vec::new(),
             packages: HashMap::new(),
@@ -1683,6 +1739,7 @@ mod tests {
 
     fn empty_resolve_result() -> ResolveResult {
         ResolveResult {
+            check_errors: Vec::new(),
             installed_count: 0,
             repos: Vec::new(),
             packages: std::collections::HashMap::new(),

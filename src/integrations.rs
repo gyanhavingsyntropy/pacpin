@@ -18,6 +18,7 @@ use crate::config::Config;
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
 
@@ -109,28 +110,42 @@ fn write_flatpak_cache(path: &std::path::Path, content: &[u8]) -> std::io::Resul
     result
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[path = "integrations/builtin.rs"]
+mod builtin;
+#[path = "integrations/configured.rs"]
+mod configured;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalUpdate {
-    pub runner: String,  // e.g. "Flatpak", "Nix"
-    pub id: String,      // e.g. "io.mrarm.mcpelauncher"
-    pub name: String,    // e.g. "Minecraft Bedrock Launcher"
-    pub repo: String,    // e.g. "flathub", "nixpkgs"
-    pub version: String, // e.g. "v1.8.5"
+    pub runner: String,
+    pub id: String,
+    pub name: String,
+    pub repo: String,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 pub trait IntegrationProvider: Send + Sync {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
     fn is_available(&self) -> bool;
     fn refresh_metadata(&self) -> Result<(), std::io::Error>;
     fn supports_refresh(&self) -> bool { false }
-    fn check_updates(&self) -> Vec<ExternalUpdate>;
+    fn check_updates(&self) -> std::io::Result<Vec<ExternalUpdate>>;
     fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String;
     fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> Result<bool, std::io::Error>;
+    fn validate_options(&self, _no_cache: bool) -> Result<(), String> { Ok(()) }
+    fn configure_no_cache(&self, _no_cache: bool) {}
+    fn cache_command_str(&self) -> Option<String> { None }
+    fn execute_cache_cleanup(&self) -> std::io::Result<bool> { Ok(true) }
     fn clean_command_str(&self) -> String;
     fn execute_clean(&self) -> Result<bool, std::io::Error>;
-    fn supports_clean(&self) -> bool {
-        false
-    }
+    fn supports_clean(&self) -> bool { false }
     fn prefetch(&self, _updates: &[ExternalUpdate]) {}
     fn supports_prefetch(&self) -> bool { false }
     fn supports_aur_failure_continuation(&self) -> bool { false }
@@ -139,341 +154,80 @@ pub trait IntegrationProvider: Send + Sync {
     }
 }
 
+// Wizard probes retain the same API and use shared, bounded process tracking.
 pub struct FlatpakProvider;
-
-impl IntegrationProvider for FlatpakProvider {
-    fn supports_refresh(&self) -> bool { true }
-    fn supports_clean(&self) -> bool { true }
-    fn name(&self) -> &'static str {
-        "Flatpak"
-    }
-
-    fn is_available(&self) -> bool {
-        Command::new("flatpak")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
-    fn refresh_metadata(&self) -> Result<(), std::io::Error> {
-        if let Some(cache_file) = flatpak_cache_file() {
-            let _ = std::fs::remove_file(cache_file);
-        }
-        let _ = Command::new("flatpak")
-            .args(["update", "--appstream"])
-            .output()?;
-        Ok(())
-    }
-
-    fn check_updates(&self) -> Vec<ExternalUpdate> {
-        let cache_file = flatpak_cache_file();
-        if let Some(path) = cache_file.as_ref() {
-            if let Some(cached) = read_flatpak_cache(path) {
-                return cached;
-            }
-        }
-
-        let output = Command::new("flatpak")
-            .args([
-                "remote-ls",
-                "--updates",
-                "--columns=name,application,version,origin",
-            ])
-            .output();
-
-        let Ok(out) = output else {
-            return Vec::new();
-        };
-        if !out.status.success() {
-            return Vec::new();
-        }
-        let mut results = Vec::new();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() >= 4 {
-                let name = crate::utils::sanitize_display_text(parts[0].trim());
-                let app_id = crate::utils::sanitize_display_text(parts[1].trim());
-                let ver = crate::utils::sanitize_display_text(parts[2].trim());
-                let origin = crate::utils::sanitize_display_text(parts[3].trim());
-
-                if !app_id.is_empty() {
-                    results.push(ExternalUpdate {
-                        runner: "Flatpak".to_string(),
-                        id: app_id.clone(),
-                        name: if name.is_empty() { app_id } else { name },
-                        repo: if origin.is_empty() { "flathub".to_string() } else { origin },
-                        version: if ver.is_empty() { "update".to_string() } else { ver },
-                    });
-                }
-            }
-        }
-        if let (Some(path), Ok(serialized)) = (cache_file, serde_json::to_string(&results)) {
-            let _ = write_flatpak_cache(&path, serialized.as_bytes());
-        }
-        results
-    }
-
-    fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String {
-        if updates.is_empty() {
-            "flatpak update -y".to_string()
-        } else {
-            let ids: Vec<&str> = updates.iter().map(|u| u.id.as_str()).collect();
-            format!("flatpak update -y -- {}", ids.join(" "))
-        }
-    }
-
-    fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> Result<bool, std::io::Error> {
-        let mut cmd = Command::new("flatpak");
-        cmd.arg("update").arg("-y").arg("--");
-        for u in updates {
-            cmd.arg(&u.id);
-        }
-        let status = crate::progress::run(&mut cmd, crate::progress::Manager::Flatpak, "Updating Flatpak applications", || {})?;
-        Ok(status.success())
-    }
-
-    fn clean_command_str(&self) -> String {
-        "flatpak uninstall --unused -y".to_string()
-    }
-
-    fn execute_clean(&self) -> Result<bool, std::io::Error> {
-        let status = crate::progress::run(Command::new("flatpak").args(["uninstall", "--unused", "-y"]), crate::progress::Manager::Flatpak, "Removing unused Flatpak runtimes", || {})?;
-        Ok(status.success())
-    }
-}
-
 pub struct NixProvider;
-
-impl IntegrationProvider for NixProvider {
-    fn supports_refresh(&self) -> bool { true }
-    fn supports_clean(&self) -> bool { true }
-    fn name(&self) -> &'static str {
-        "Nix"
-    }
-
-    fn is_available(&self) -> bool {
-        Command::new("nix")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
-    fn refresh_metadata(&self) -> Result<(), std::io::Error> {
-        if Command::new("nix-channel")
-            .arg("--version")
-            .output()
-            .is_ok()
-        {
-            let _ = Command::new("nix-channel").arg("--update").output()?;
-        }
-        Ok(())
-    }
-
-    fn check_updates(&self) -> Vec<ExternalUpdate> {
-        // Check outdated packages via nix-env or nix profile
-        let output = Command::new("nix-env").args(["-q", "--outdated"]).output();
-
-        let mut results = Vec::new();
-        if let Ok(out) = output {
-            if out.status.success() {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                for line in stdout.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        results.push(ExternalUpdate {
-                            runner: "Nix".to_string(),
-                            id: trimmed.to_string(),
-                            name: trimmed.to_string(),
-                            repo: "nixpkgs".to_string(),
-                            version: "latest".to_string(),
-                        });
-                    }
-                }
-            }
-        }
-        results
-    }
-
-    fn upgrade_command_str(&self, _updates: &[ExternalUpdate]) -> String {
-        "nix profile upgrade '.*'".to_string()
-    }
-
-    fn execute_upgrade(&self, _updates: &[ExternalUpdate]) -> Result<bool, std::io::Error> {
-        let status = crate::progress::run(Command::new("nix").args(["profile", "upgrade", ".*"]), crate::progress::Manager::Nix, "Updating Nix profile", || {});
-
-        match status {
-            Ok(s) if s.success() => Ok(true),
-            _ => {
-                // Fallback to nix-env if profile is not used
-                let env_status = crate::progress::run(Command::new("nix-env").arg("-u"), crate::progress::Manager::Nix, "Updating Nix environment", || {})?;
-                Ok(env_status.success())
-            }
-        }
-    }
-
-    fn clean_command_str(&self) -> String {
-        "nix-collect-garbage -d".to_string()
-    }
-
-    fn execute_clean(&self) -> Result<bool, std::io::Error> {
-        let status = crate::progress::run(Command::new("nix-collect-garbage").arg("-d"), crate::progress::Manager::Nix, "Cleaning Nix generations", || {})?;
-        Ok(status.success())
-    }
-}
-
 pub struct PipxProvider;
-
-impl IntegrationProvider for PipxProvider {
-    fn name(&self) -> &'static str {
-        "Pipx"
-    }
-
-    fn is_available(&self) -> bool {
-        Command::new("pipx")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
-    fn refresh_metadata(&self) -> Result<(), std::io::Error> {
-        Ok(())
-    }
-
-    fn check_updates(&self) -> Vec<ExternalUpdate> {
-        let output = Command::new("pipx").args(["list", "--json"]).output();
-
-        let mut results = Vec::new();
-        if let Ok(out) = output {
-            if out.status.success() {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                    if let Some(venvs) = v.get("venvs").and_then(|v| v.as_object()) {
-                        let mut targets = Vec::new();
-                        for (app_name, info) in venvs {
-                            let installed_ver = info
-                                .get("metadata")
-                                .and_then(|m| m.get("main_package"))
-                                .and_then(|p| p.get("package_version"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-
-                            if !installed_ver.is_empty() {
-                                targets.push((app_name.clone(), installed_ver.to_string()));
-                            }
-                        }
-
-                        let agent = ureq::AgentBuilder::new()
-                            .timeout(std::time::Duration::from_secs(3))
-                            .user_agent(
-                                "pacpin/3.1 (GPLv3; +https://github.com/gyanhavingsyntropy/pacpin)",
-                            )
-                            .build();
-
-                        let arc_targets = std::sync::Arc::new(targets);
-                        let num_workers = 4.min(arc_targets.len().max(1));
-                        let mut handles = Vec::new();
-
-                        for worker_idx in 0..num_workers {
-                            let targets_clone = std::sync::Arc::clone(&arc_targets);
-                            let agent_clone = agent.clone();
-                            handles.push(std::thread::spawn(move || {
-                                let mut worker_results = Vec::new();
-                                for (i, (app_name, installed_ver)) in
-                                    targets_clone.iter().enumerate()
-                                {
-                                    if i % num_workers == worker_idx {
-                                        let pypi_url =
-                                            format!("https://pypi.org/pypi/{}/json", app_name);
-                                        if let Ok(resp) = agent_clone.get(&pypi_url).call() {
-                                            if resp.status() == 200 {
-                                                match pypi_version(resp.into_reader(), MAX_METADATA_BYTES) {
-                                                    Ok(latest_ver) => {
-                                                        if alpm::vercmp(latest_ver.as_str(), installed_ver)
-                                                            == std::cmp::Ordering::Greater
-                                                        {
-                                                            worker_results.push(ExternalUpdate {
-                                                                runner: "Pipx".to_string(),
-                                                                id: app_name.clone(),
-                                                                name: app_name.clone(),
-                                                                repo: "pypi".to_string(),
-                                                                version: latest_ver,
-                                                            });
-                                                        }
-                                                    }
-                                                    Err(_) => eprintln!(":: Warning: Pipx update check rejected oversized or invalid PyPI metadata; some applications were not checked."),
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                worker_results
-                            }));
-                        }
-
-                        for h in handles {
-                            if let Ok(updates) = h.join() {
-                                results.extend(updates);
-                            }
-                        }
-                    }
-                }
-            }
+macro_rules! builtin_provider {
+    ($provider:ident, $name:literal, $adapter:literal) => {
+        impl IntegrationProvider for $provider {
+            fn name(&self) -> &str { $name }
+            fn is_available(&self) -> bool { crate::is_command_available($adapter) }
+            fn refresh_metadata(&self) -> std::io::Result<()> { builtin::refresh($adapter, &BTreeMap::new()) }
+            fn supports_refresh(&self) -> bool { $adapter == "flatpak" }
+            fn check_updates(&self) -> std::io::Result<Vec<ExternalUpdate>> { builtin::check($adapter, &BTreeMap::new()) }
+            fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String { builtin::preview($adapter, updates) }
+            fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> std::io::Result<bool> { builtin::execute($adapter, updates) }
+            fn clean_command_str(&self) -> String { builtin::clean_preview($adapter) }
+            fn execute_clean(&self) -> std::io::Result<bool> { builtin::clean($adapter, &BTreeMap::new()) }
+            fn supports_clean(&self) -> bool { $adapter != "pipx" }
         }
-        results
-    }
-
-    fn upgrade_command_str(&self, _updates: &[ExternalUpdate]) -> String {
-        "pipx upgrade-all".to_string()
-    }
-
-    fn execute_upgrade(&self, _updates: &[ExternalUpdate]) -> Result<bool, std::io::Error> {
-        let status = crate::progress::run(Command::new("pipx").arg("upgrade-all"), crate::progress::Manager::Pipx, "Updating Pipx applications", || {})?;
-        Ok(status.success())
-    }
-
-    fn clean_command_str(&self) -> String {
-        "pipx list".to_string()
-    }
-
-    fn execute_clean(&self) -> Result<bool, std::io::Error> {
-        Ok(true)
-    }
-
-    fn supports_clean(&self) -> bool {
-        false
-    }
+    };
 }
+builtin_provider!(FlatpakProvider, "Flatpak", "flatpak");
+builtin_provider!(NixProvider, "Nix", "nix");
+builtin_provider!(PipxProvider, "Pipx", "pipx");
 
 pub struct IntegrationsManager;
-
 impl IntegrationsManager {
+    pub fn configured_actions(config: &Config, name: &str, flags: &[String], execute: bool) -> Result<Vec<String>, String> {
+        let definition = config.manager_file.managers.get(name).ok_or_else(|| format!("Unknown manager '{name}'; configure managers.toml"))?;
+        if flags.is_empty() { return Err("Choose at least one configured manager flag".into()); }
+        let mut commands = Vec::new();
+        for flag in flags {
+            let key = flag.strip_prefix("--").ok_or("Manager actions must be flags")?;
+            let key = if let Some((owner, key)) = key.split_once('.') {
+                if owner != name { return Err(format!("{flag} belongs to a different manager")); } key
+            } else { key };
+            let action = definition.flags.get(key).ok_or_else(|| format!("Unknown custom flag --{name}.{key}"))?;
+            if action.command.is_empty() { return Err(format!("--{name}.{key} only adds upgrade arguments; use it with pin upgrade")); }
+            if !commands.contains(&action.command) { commands.push(action.command.clone()); }
+        }
+        if execute {
+            crate::progress::configure_managers(config.manager_file.managers.keys().cloned().collect());
+            if unsafe { libc::geteuid() } == 0 { return Err("Configured actions must run as a regular user".into()); }
+            for arguments in &commands {
+                let mut command = Command::new(&arguments[0]); command.args(&arguments[1..]).envs(&definition.env);
+                let status = crate::progress::run(&mut command, crate::progress::integration_manager(match name { "flatpak" => "Flatpak", "nix" => "Nix", "pipx" => "Pipx", _ => name }), "Running configured action", || {}).map_err(|e| e.to_string())?;
+                if !status.success() { return Err(format!("{name} action failed with {status}")); }
+            }
+        }
+        Ok(commands.iter().map(|c| builtin::display(c)).collect())
+    }
     pub fn get_active_providers(config: &Config) -> Vec<Arc<dyn IntegrationProvider>> {
         let mut providers: Vec<Arc<dyn IntegrationProvider>> = Vec::new();
         if !config.sources.is_empty() {
             providers.push(Arc::new(crate::sources::SourceProvider::new(config)));
         }
-        if !config.features.integrations {
-            return Self::filter_available_parallel(providers);
+        crate::progress::configure_managers(config.manager_file.managers.keys().cloned().collect());
+        for (key, name, legacy) in [("flatpak", "Flatpak", config.integrations.flatpak), ("nix", "Nix", config.integrations.nix), ("pipx", "Pipx", config.integrations.pipx)] {
+            let definition = config.manager_file.managers.get(key).cloned().unwrap_or_else(|| crate::manager_config::Definition { adapter: key.into(), ..Default::default() });
+            if definition.enabled.unwrap_or(config.features.integrations && legacy) {
+                providers.push(Arc::new(configured::Provider::new(name.into(), definition)));
+            }
         }
-
-        if config.integrations.flatpak {
-            providers.push(Arc::new(FlatpakProvider));
+        for (name, definition) in &config.manager_file.managers {
+            if definition.adapter == "command" && definition.enabled == Some(true) {
+                providers.push(Arc::new(configured::Provider::new(name.clone(), definition.clone())));
+            }
         }
-
-        if config.integrations.nix {
-            providers.push(Arc::new(NixProvider));
-        }
-
-        if config.integrations.pipx {
-            providers.push(Arc::new(PipxProvider));
-        }
-
-        Self::filter_available_parallel(providers)
+        // Explicitly enabled unavailable managers fail their checks. Sources
+        // with no owned installed packages have no work to discover.
+        providers.retain(|p| p.name() != "Sources" || p.is_available());
+        providers
     }
 
+    #[cfg(test)]
     fn filter_available_parallel(
         providers: Vec<Arc<dyn IntegrationProvider>>,
     ) -> Vec<Arc<dyn IntegrationProvider>> {
@@ -489,10 +243,10 @@ impl IntegrationsManager {
         handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
     }
 
-    pub fn refresh_all_parallel(providers: &[Arc<dyn IntegrationProvider>]) {
+    pub fn refresh_all_parallel(providers: &[Arc<dyn IntegrationProvider>]) -> std::io::Result<()> {
         let providers: Vec<_> = providers.iter().filter(|p| p.supports_refresh()).collect();
         if providers.is_empty() {
-            return;
+            return Ok(());
         }
 
         println!(
@@ -503,36 +257,43 @@ impl IntegrationsManager {
 
         for p in providers {
             let provider = Arc::clone(p);
-            handles.push(thread::spawn(move || provider.refresh_metadata()));
+            handles.push((p.name().to_string(), thread::spawn(move || provider.refresh_metadata())));
         }
 
-        for h in handles {
-            let _ = h.join();
+        let mut errors = Vec::new();
+        for (name, handle) in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}, Ok(Err(error)) => errors.push(format!("{name}: {error}")),
+                Err(_) => errors.push(format!("{name}: metadata worker failed")),
+            }
         }
+        if errors.is_empty() { Ok(()) } else { Err(std::io::Error::other(errors.join("; "))) }
     }
 
     pub fn check_updates_parallel(
         providers: &[Arc<dyn IntegrationProvider>],
-    ) -> Vec<ExternalUpdate> {
+    ) -> std::io::Result<Vec<ExternalUpdate>> {
         if providers.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut handles = Vec::new();
 
         for p in providers {
             let provider = Arc::clone(p);
-            handles.push(thread::spawn(move || provider.check_updates()));
+            handles.push((p.name().to_string(), thread::spawn(move || provider.check_updates())));
         }
 
         let mut all_updates = Vec::new();
-        for h in handles {
-            if let Ok(updates) = h.join() {
-                all_updates.extend(updates);
+        let mut errors = Vec::new();
+        for (name, handle) in handles {
+            match handle.join() {
+                Ok(Ok(updates)) => all_updates.extend(updates),
+                Ok(Err(error)) => errors.push(format!("{name}: {error}")),
+                Err(_) => errors.push(format!("{name}: update worker failed")),
             }
         }
-
-        all_updates
+        if errors.is_empty() { Ok(all_updates) } else { Err(std::io::Error::other(format!("Update check incomplete: {}", errors.join("; ")))) }
     }
 
     pub fn spawn_prefetch(
@@ -599,6 +360,7 @@ impl IntegrationsManager {
         external_updates: &[ExternalUpdate],
     ) -> Vec<(String, String, bool)> {
         let mut outcomes = Vec::new();
+        let mut stopped = false;
         for p in providers {
             let p_updates: Vec<ExternalUpdate> = external_updates
                 .iter()
@@ -609,6 +371,7 @@ impl IntegrationsManager {
             if p_updates.is_empty() {
                 continue;
             }
+            if stopped { println!(":: {}: skipped because an earlier external upgrade failed.", p.name()); outcomes.push((p.name().to_string(), String::new(), false)); continue; }
 
             let cmd_str = p.upgrade_command_str(&p_updates);
             println!(
@@ -618,13 +381,7 @@ impl IntegrationsManager {
                 p_updates.len(),
                 cmd_str.dimmed()
             );
-            let manager = match p.name() {
-                        "Sources" => Some(crate::progress::Manager::Sources),
-                        "Flatpak" => Some(crate::progress::Manager::Flatpak),
-                        "Nix" => Some(crate::progress::Manager::Nix),
-                        "Pipx" => Some(crate::progress::Manager::Pipx),
-                        _ => None,
-            };
+            let manager = Some(crate::progress::integration_manager(p.name()));
             match p.execute_upgrade(&p_updates) {
                 Ok(true) => {
                     if let Some(manager) = manager { crate::progress::completed(manager); }
@@ -632,6 +389,7 @@ impl IntegrationsManager {
                     outcomes.push((p.name().to_string(), cmd_str, true));
                 }
                 Ok(false) => {
+                    stopped = true;
                     if let Some(manager) = manager { crate::progress::failed(manager); }
                     eprintln!(
                         "{}",
@@ -640,6 +398,7 @@ impl IntegrationsManager {
                     outcomes.push((p.name().to_string(), cmd_str, false));
                 }
                 Err(e) => {
+                    stopped = true;
                     if let Some(manager) = manager { crate::progress::failed(manager); }
                     eprintln!(
                         "{}",
@@ -650,6 +409,33 @@ impl IntegrationsManager {
             }
         }
         outcomes
+    }
+
+    pub fn validate_options(providers: &[Arc<dyn IntegrationProvider>], updates: &[ExternalUpdate], no_cache: bool) -> Result<(), String> {
+        for provider in providers {
+            if updates.iter().any(|u| u.runner == provider.name()) {
+                provider.validate_options(no_cache)?;
+                provider.configure_no_cache(no_cache);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn transaction_cache_cleanup(providers: &[Arc<dyn IntegrationProvider>], outcomes: &[(String, bool)], no_cache: bool) -> bool {
+        if !no_cache { return true; }
+        let mut success = true;
+        for (name, completed) in outcomes {
+            if !completed { println!(":: {name}: cache cleanup skipped because its upgrade did not complete."); continue; }
+            let Some(provider) = providers.iter().find(|p| p.name() == name) else { continue; };
+            let Some(preview) = provider.cache_command_str() else { continue; };
+            println!(":: {name}: --no-cache action: {preview}");
+            match provider.execute_cache_cleanup() {
+                Ok(true) => println!("✔ {name}: cache action completed."),
+                Ok(false) => { eprintln!(":: {name}: cache cleanup failed."); success = false; },
+                Err(error) => { eprintln!(":: {name}: cache cleanup failed: {error}"); success = false; },
+            }
+        }
+        success
     }
 
     pub fn execute_cleanups(providers: &[Arc<dyn IntegrationProvider>]) -> bool {
@@ -747,6 +533,7 @@ mod tests {
             name: "Firefox".to_string(),
             repo: "flathub".to_string(),
             version: "130.0".to_string(),
+            ..ExternalUpdate::default()
         };
         assert_eq!(update.runner, "Flatpak");
         assert_eq!(update.repo, "flathub");
@@ -815,9 +602,13 @@ mod tests {
             self.available
         }
         fn refresh_metadata(&self) -> Result<(), std::io::Error> { Ok(()) }
-        fn check_updates(&self) -> Vec<ExternalUpdate> { Vec::new() }
+        fn check_updates(&self) -> std::io::Result<Vec<ExternalUpdate>> {
+            if self.label == "fail-check" { Err(std::io::Error::other("fixture check failed")) } else { Ok(Vec::new()) }
+        }
         fn upgrade_command_str(&self, _: &[ExternalUpdate]) -> String { String::new() }
-        fn execute_upgrade(&self, _: &[ExternalUpdate]) -> Result<bool, std::io::Error> { Ok(true) }
+        fn execute_upgrade(&self, _: &[ExternalUpdate]) -> Result<bool, std::io::Error> {
+            self.active.fetch_add(1, Ordering::SeqCst); Ok(self.label != "fail-upgrade")
+        }
         fn clean_command_str(&self) -> String { String::new() }
         fn execute_clean(&self) -> Result<bool, std::io::Error> { Ok(true) }
     }
@@ -839,13 +630,13 @@ mod tests {
     #[test]
     fn metadata_refresh_requires_an_explicit_capability() {
         assert!(FlatpakProvider.supports_refresh());
-        assert!(NixProvider.supports_refresh());
+        assert!(!NixProvider.supports_refresh());
         assert!(!PipxProvider.supports_refresh());
         assert!(!crate::sources::SourceProvider::new(&Config::default()).supports_refresh());
         let provider = MockProvider { label: "future", available: true,
             active: Arc::new(AtomicUsize::new(0)), peak: Arc::new(AtomicUsize::new(0)) };
         assert!(!provider.supports_refresh());
-        IntegrationsManager::refresh_all_parallel(&[Arc::new(provider)]);
+        IntegrationsManager::refresh_all_parallel(&[Arc::new(provider)]).unwrap();
     }
 
     #[test]
@@ -861,11 +652,25 @@ mod tests {
     #[test]
     fn prefetch_is_opt_in_and_matches_the_selected_manager() {
         let providers: Vec<Arc<dyn IntegrationProvider>> = vec![Arc::new(FlatpakProvider), Arc::new(crate::sources::SourceProvider::new(&Config::default()))];
-        let mut updates = vec![ExternalUpdate { runner: "Flatpak".into(), id: "app".into(), name: "App".into(), repo: "test".into(), version: "1".into() }];
+        let mut updates = vec![ExternalUpdate { runner: "Flatpak".into(), id: "app".into(), name: "App".into(), repo: "test".into(), version: "1".into(), ..ExternalUpdate::default() }];
         assert!(!IntegrationsManager::has_prefetch(&providers, &updates));
         assert!(IntegrationsManager::spawn_prefetch(&providers, &updates).is_none());
         updates[0].runner = "Sources".into();
         assert!(IntegrationsManager::has_prefetch(&providers, &updates));
         assert!(!IntegrationsManager::has_prefetch(&providers, &[]));
+    }
+
+    #[test]
+    fn failed_checks_are_errors_and_failed_upgrades_stop_later_managers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = |label| Arc::new(MockProvider { label, available: true, active: Arc::clone(&calls), peak: Arc::new(AtomicUsize::new(0)) }) as Arc<dyn IntegrationProvider>;
+        let error = IntegrationsManager::check_updates_parallel(&[provider("fail-check")]).unwrap_err();
+        assert!(error.to_string().contains("fail-check"));
+        let outcomes = IntegrationsManager::execute_upgrades(&[provider("fail-upgrade"), provider("later")], &[
+            ExternalUpdate { runner: "fail-upgrade".into(), id: "first".into(), ..ExternalUpdate::default() },
+            ExternalUpdate { runner: "later".into(), id: "second".into(), ..ExternalUpdate::default() },
+        ]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(outcomes.iter().all(|(_, _, success)| !success));
     }
 }

@@ -23,6 +23,7 @@ ctrlc = { version = "3.4", features = ["termination"] }
 semver = "1.0"
 url = "2.5"
 sha2 = "0.10"
+pep440_rs = "0.7.3"
 
 [dev-dependencies]
 # Independent archive fixture generator; production extraction uses libarchive.

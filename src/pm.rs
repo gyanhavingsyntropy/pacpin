@@ -1007,14 +1007,12 @@ pub fn transaction_cache_cleanup(config: &Config, requested: bool, native: Optio
 }
 
 fn prune_download_directories(config: &Config, full: bool) -> Result<(), String> {
-    let output = crate::progress::capture_output(Command::new("pacman-conf").arg("CacheDir"))
-        .map_err(|error| format!("Cannot inspect native cache directories: {error}"))?;
-    if !output.status.success() { return Err("Native cache directory lookup failed".into()); }
+    let native_config = crate::pacman_config::snapshot()?;
     let mut empty = Vec::new();
     let mut stale = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let now = SystemTime::now();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in native_config.option("CacheDir") {
         let path = std::path::Path::new(line);
         if !path.is_absolute() { return Err("Native cache path must be absolute".into()); }
         let cache_dir = match path.canonicalize() {
@@ -1336,6 +1334,7 @@ fn get_lock_info_at(lock_path: std::path::PathBuf) -> Option<LockInfo> {
 
 /// Checks if pacman database is currently locked.
 pub fn check_lock() -> Result<(), String> {
+    crate::pacman_config::snapshot()?;
     if let Some(info) = get_lock_info() {
         if !info.is_alive {
             if let Some(pid) = info.pid {

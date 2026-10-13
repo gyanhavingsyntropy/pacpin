@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+#[cfg(test)]
 use std::env;
 use std::fs;
 use std::io::Read;
@@ -157,9 +158,11 @@ pub fn fetch_package_archive(
     expected_sha: Option<&str>,
     allow_unverified: bool,
     downloaded_tarballs: &mut Vec<PathBuf>,
+    workspace: &Path,
+    use_cache: bool,
 ) -> Result<PathBuf, String> {
     // 1. Check local pacman cache first
-    let cache_dirs = crate::journal::TransactionJournal::get_cache_dirs();
+    let cache_dirs = if use_cache { crate::journal::TransactionJournal::get_cache_dirs() } else { Vec::new() };
     for cache_dir in cache_dirs {
         if let Ok(entries) = fs::read_dir(&cache_dir) {
             let mut matching: Vec<PathBuf> = entries
@@ -247,7 +250,7 @@ pub fn fetch_package_archive(
         let ext = archive_extension(url);
 
         let temp_download = create_secure_temp_file(
-            &env::temp_dir(),
+            workspace,
             &format!("pacpin-download-{}", pkg),
             ext,
         )?;

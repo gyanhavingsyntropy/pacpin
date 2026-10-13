@@ -51,6 +51,12 @@ fn parse_args(args: &[String], mode: Mode) -> (Option<String>, Vec<String>, TryO
             options.audio = true;
         } else if arg == "--allow-unverified" {
             options.allow_unverified = true;
+        } else if arg == "--installed" {
+            options.installed = true;
+        } else if matches!(arg.as_str(), "--no-cache" | "--clean-cache") {
+            options.no_cache = true;
+        } else if arg == "--dry-run" {
+            options.dry_run = true;
         } else if arg == "--noconfirm" || arg == "-y" {
             options.noconfirm = true;
         } else if arg == "--bin" {
@@ -81,9 +87,13 @@ fn print_missing_target(mode: Mode) {
                     .bold()
             );
             eprintln!("Usage: pacpin run [options] [repo/]package [arguments...]");
-            eprintln!("Runs an official, AUR, Flatpak, or Nix package directly on host without permanent installation.");
+            eprintln!("Runs a native repository or installed package, Flatpak, Nix, or Pipx target on the host.");
             eprintln!();
             eprintln!("Options:");
+            eprintln!("  --dry-run              Preview without downloading or starting the application");
+            eprintln!("  --no-cache             Native: bypass archive cache; Pipx: bypass environment reuse");
+            eprintln!("  --use-ram/--use-storage Keep repository downloads and extracted files in RAM/on disk");
+            eprintln!("  --installed            Run the installed native package instead of a repository download");
             eprintln!(
                 "  --sandbox              Run in Bubblewrap container (unsandboxed by default)"
             );
@@ -107,6 +117,10 @@ fn print_missing_target(mode: Mode) {
             eprintln!("Runs native Arch packages in a Bubblewrap container; Flatpak uses its own sandbox.");
             eprintln!();
             eprintln!("Options:");
+            eprintln!("  --dry-run              Preview without downloading or starting the application");
+            eprintln!("  --no-cache             Native: bypass archive cache; Pipx: bypass environment reuse");
+            eprintln!("  --use-ram/--use-storage Keep repository downloads and extracted files in RAM/on disk");
+            eprintln!("  --installed            Test the installed native package with Bubblewrap isolation");
             eprintln!("  --no-sandbox, --bare   Bypass Bubblewrap containerization and run directly on host");
             eprintln!("  --net, --network       Share host network access (unshared by default)");
             eprintln!("  --rw, --write-cwd      Mount current working directory read-write (read-only by default)");
@@ -179,5 +193,19 @@ mod tests {
         assert_eq!(passthrough, strings(&["--version"]));
         assert!(!options.no_sandbox && !options.is_run_mode);
         assert!(!options.share_net && !options.rw_cwd);
+    }
+
+    #[test]
+    fn installed_flag_is_owned_and_double_dash_preserves_program_options() {
+        let (target, args, options) = parse_args(&strings(&["--installed", "neofetch", "--", "--installed"]), Mode::Try);
+        assert_eq!(target.as_deref(), Some("neofetch"));
+        assert!(options.installed && !options.no_sandbox);
+        assert_eq!(args, strings(&["--installed"]));
+    }
+    #[test]
+    fn ephemeral_preview_and_cache_flags_do_not_swallow_app_flags_after_delimiter() {
+        let (_, args, options) = parse_args(&strings(&["--dry-run", "--no-cache", "app", "--", "--dry-run", "--no-cache"]), Mode::Run);
+        assert!(options.dry_run && options.no_cache);
+        assert_eq!(args, strings(&["--dry-run", "--no-cache"]));
     }
 }

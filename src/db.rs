@@ -18,7 +18,6 @@ use alpm::{Alpm, SigLevel};
 use glob::Pattern;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct DownloadTarget {
@@ -26,6 +25,8 @@ pub struct DownloadTarget {
     pub url: String,
     pub candidate_urls: Vec<String>,
     pub sha256: Option<String>,
+    pub download_bytes: u64,
+    pub installed_bytes: u64,
 }
 
 pub struct AlpmManager {
@@ -39,32 +40,15 @@ impl AlpmManager {
     }
 
     pub fn get_dbpath() -> PathBuf {
-        if let Ok(output) = Command::new("pacman-conf").arg("DBPath").output() {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let trimmed = stdout.trim();
-                if !trimmed.is_empty() {
-                    return PathBuf::from(trimmed);
-                }
-            }
-        }
-        PathBuf::from("/var/lib/pacman")
+        crate::pacman_config::snapshot().ok().and_then(|s| s.option("DBPath").first().map(PathBuf::from)).unwrap_or_else(|| "/var/lib/pacman".into())
     }
 
     pub fn get_rootdir() -> PathBuf {
-        if let Ok(output) = Command::new("pacman-conf").arg("RootDir").output() {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let trimmed = stdout.trim();
-                if !trimmed.is_empty() {
-                    return PathBuf::from(trimmed);
-                }
-            }
-        }
-        PathBuf::from("/")
+        crate::pacman_config::snapshot().ok().and_then(|s| s.option("RootDir").first().map(PathBuf::from)).unwrap_or_else(|| "/".into())
     }
 
     pub fn with_repo_order(repo_order: &[String]) -> Result<Self, alpm::Error> {
+        crate::pacman_config::snapshot().map_err(|error| { eprintln!(":: Native configuration unavailable: {error}"); alpm::Error::System })?;
         let root = Self::get_rootdir();
         let dbpath = Self::get_dbpath();
         let root = root.to_string_lossy();
@@ -147,20 +131,7 @@ impl AlpmManager {
     }
 
     pub fn discover_repos() -> Vec<String> {
-        if let Ok(output) = Command::new("pacman-conf").arg("--repo-list").output() {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let repos: Vec<String> = stdout
-                    .lines()
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty())
-                    .collect();
-                if !repos.is_empty() {
-                    return repos;
-                }
-            }
-        }
-        vec!["core".into(), "extra".into(), "multilib".into()]
+        crate::pacman_config::snapshot().map(|s| s.order.clone()).unwrap_or_default()
     }
 
     pub fn repos(&self) -> &[String] {
@@ -168,23 +139,32 @@ impl AlpmManager {
     }
 
     pub fn get_mirror_servers(repo: &str) -> Vec<String> {
-        if let Ok(output) = Command::new("pacman-conf")
-            .args(["--repo", repo, "Server"])
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let servers: Vec<String> = stdout
-                    .lines()
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty())
-                    .collect();
-                if !servers.is_empty() {
-                    return servers;
-                }
-            }
+        crate::pacman_config::snapshot().map(|s| s.servers(repo)).unwrap_or_default()
+    }
+
+    /// Distinguish a missing repository target from a later resolution failure.
+    pub fn installed_version(&self, pkg_name: &str) -> Option<String> {
+        self.handle.localdb().pkg(pkg_name).ok().map(|p| p.version().to_string())
+    }
+
+    pub fn has_repository_target(&self, pkg_name: &str) -> bool {
+        self.handle.syncdbs().into_iter().any(|db| db.pkg(pkg_name).is_ok() || db.pkgs().find_satisfier(pkg_name).is_some())
+    }
+
+    /// Executable paths owned by this exact installed package, never PATH guesses.
+    pub fn installed_executables(&self, pkg_name: &str) -> Result<Option<(String, Vec<PathBuf>)>, String> {
+        let Ok(package) = self.handle.localdb().pkg(pkg_name) else { return Ok(None); };
+        if Self::get_rootdir() != std::path::Path::new("/") {
+            return Err("Installed-package execution requires the host RootDir '/'; use an explicit repository target for another root".into());
         }
-        Vec::new()
+        let mut paths = Vec::new();
+        for file in package.files().files() {
+            let Ok(name) = std::str::from_utf8(file.name()) else { continue; };
+            if !crate::sandbox::is_package_entry_point(std::path::Path::new(name)) { continue; }
+            let path = std::path::Path::new("/").join(name);
+            if crate::utils::is_executable_file(&path) { paths.push(path); }
+        }
+        Ok(Some((package.version().to_string(), paths)))
     }
 
     pub fn resolve_download_urls(
@@ -310,6 +290,8 @@ impl AlpmManager {
                             url,
                             candidate_urls,
                             sha256,
+                            download_bytes: dep_pkg.size().max(0) as u64,
+                            installed_bytes: dep_pkg.isize().max(0) as u64,
                         });
                     }
                 } else {
@@ -349,6 +331,8 @@ impl AlpmManager {
             url: target_url,
             candidate_urls: target_candidate_urls,
             sha256: target_sha256,
+            download_bytes: target_pkg.size().max(0) as u64,
+            installed_bytes: target_pkg.isize().max(0) as u64,
         });
 
         Ok(ordered_targets)

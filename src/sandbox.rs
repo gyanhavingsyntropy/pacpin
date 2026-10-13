@@ -26,6 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static CLEANUP_TARGETS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 static ACTIVE_CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static ACTIVE_GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static TERMINATING: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 pub(crate) static CHILD_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -36,6 +37,11 @@ pub fn register_child(pid: u32) {
 
 pub fn unregister_child(pid: u32) {
     if let Ok(mut children) = ACTIVE_CHILDREN.lock() { children.retain(|&active| active != pid); }
+    if let Ok(mut groups) = ACTIVE_GROUPS.lock() { groups.retain(|&active| active != pid); }
+}
+pub fn register_child_group(pid: u32) {
+    if let Ok(mut groups) = ACTIVE_GROUPS.lock() { groups.push(pid); }
+    register_child(pid);
 }
 
 pub fn is_terminating() -> bool {
@@ -66,11 +72,17 @@ pub fn run_tracked_command(command: &mut Command) -> io::Result<std::process::Ex
 }
 
 fn kill_active_children() {
-    let mut children = ACTIVE_CHILDREN.lock().map(|mut lock| std::mem::take(&mut *lock)).unwrap_or_default();
+    let children = ACTIVE_CHILDREN.lock().map(|mut lock| std::mem::take(&mut *lock)).unwrap_or_default();
+    let groups = ACTIVE_GROUPS.lock().map(|mut lock| std::mem::take(&mut *lock)).unwrap_or_default();
+    terminate_children(children, groups);
+}
+
+fn terminate_children(mut children: Vec<u32>, groups: Vec<u32>) {
     // Let sudo relay interruption and let pacman release its database lock.
     // An immediate SIGKILL can leave an interrupted download's lock behind.
     for &pid in &children {
-        unsafe { libc::kill(pid as i32, libc::SIGINT); }
+        let target = if groups.contains(&pid) { -(pid as i32) } else { pid as i32 };
+        unsafe { libc::kill(target, libc::SIGINT); }
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while !children.is_empty() && std::time::Instant::now() < deadline {
@@ -85,6 +97,7 @@ fn kill_active_children() {
     for pid in children {
         unsafe { libc::kill(pid as i32, libc::SIGKILL); }
     }
+    for pid in groups { unsafe { libc::kill(-(pid as i32), libc::SIGKILL); } }
 }
 
 #[cfg(test)]
@@ -147,8 +160,13 @@ pub fn clean_stale_sandboxes() {
         }
     }
 
-    // Also clean any fallback temp directories created in env::temp_dir()
-    if let Ok(entries) = fs::read_dir(env::temp_dir()) {
+    // Forced policies can select a base different from the default TMPDIR.
+    let mut bases = crate::scratch::bases(crate::scratch::Policy::Ram);
+    bases.extend(crate::scratch::bases(crate::scratch::Policy::Storage));
+    bases.sort();
+    bases.dedup();
+    for base in bases {
+    if let Ok(entries) = fs::read_dir(base) {
         for entry in entries.flatten() {
             let p = entry.path();
             if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
@@ -160,6 +178,7 @@ pub fn clean_stale_sandboxes() {
                 }
             }
         }
+    }
     }
 }
 
@@ -277,6 +296,9 @@ pub struct TryOptions {
     pub allow_unverified: bool,
     pub is_run_mode: bool,
     pub noconfirm: bool,
+    pub installed: bool,
+    pub no_cache: bool,
+    pub dry_run: bool,
 }
 
 impl TryOptions {
@@ -291,12 +313,39 @@ impl TryOptions {
             allow_unverified: false,
             is_run_mode: true,
             noconfirm: false,
+            installed: false,
+            no_cache: false,
+            dry_run: false,
         }
     }
 }
 
 pub fn cmd_try(target: &str, args: &[String], options: &TryOptions) {
     let (prefix, pkg) = parse_target(target);
+    if options.no_cache && matches!(prefix, Some("flatpak" | "nix" | "nixpkgs")) {
+        eprintln!("Error: --no-cache is unsupported for this run/try backend. Its installed runtime/store is not a disposable cache.");
+        exit(2);
+    }
+    if crate::scratch::policy() != crate::scratch::Policy::Auto
+        && matches!(prefix, Some("flatpak" | "nix" | "nixpkgs" | "pipx"))
+    {
+        eprintln!("Error: --use-ram/--use-storage is unsupported for {prefix:?} run/try: this backend owns its store or environment and cannot guarantee relocation. Native repository packages support these flags.");
+        exit(2);
+    }
+    if options.installed && prefix.is_some() {
+        eprintln!("Error: --installed requires an unqualified native package name; omit the repository/provider prefix.");
+        exit(2);
+    }
+    if options.dry_run && matches!(prefix, Some("flatpak" | "nix" | "nixpkgs" | "pipx")) {
+        if !crate::journal::TransactionJournal::is_safe_pkg_name(pkg) {
+            eprintln!("Error: invalid package identity"); exit(2);
+        }
+        if host_only_provider(prefix) && !options.no_sandbox {
+            eprintln!("Error: Nix and Pipx require run or --no-sandbox"); exit(2);
+        }
+        println!(":: Dry-run: backend {:?} would run {pkg:?} with arguments {args:?}; no command executed.{}", prefix, if options.no_cache { " Pipx environment reuse disabled." } else { "" });
+        exit(0);
+    }
 
     let res = match prefix {
         Some("flatpak") => try_flatpak(pkg, args),
@@ -305,7 +354,7 @@ pub fn cmd_try(target: &str, args: &[String], options: &TryOptions) {
                 .to_string(),
         ),
         Some("nix") | Some("nixpkgs") => try_nix(pkg, args),
-        Some("pipx") => try_pipx(pkg, args),
+        Some("pipx") => try_pipx(pkg, args, options.no_cache),
         Some(repo) => try_pacman(Some(repo), pkg, args, options),
         None => try_pacman(None, pkg, args, options),
     };
@@ -336,9 +385,7 @@ fn try_flatpak(app_id: &str, args: &[String]) -> Result<i32, String> {
     }
 
     // Check if the application is already installed on the system
-    let is_already_installed = Command::new("flatpak")
-        .args(["info", app_id])
-        .output()
+    let is_already_installed = crate::progress::capture_output(Command::new("flatpak").args(["info", app_id]))
         .map(|o| o.status.success())
         .unwrap_or(false);
 
@@ -351,9 +398,7 @@ fn try_flatpak(app_id: &str, args: &[String]) -> Result<i32, String> {
         fn drop(&mut self) {
             if self.needs_cleanup {
                 println!("\n{} Purging ephemeral Flatpak '{}'...", "::".cyan(), self.app_id);
-                let status = Command::new("flatpak")
-                    .args(["uninstall", "--user", "-y", self.app_id])
-                    .status();
+                let status = run_tracked_command(Command::new("flatpak").args(["uninstall", "--user", "-y", self.app_id]));
                 // Flatpak app data may predate this invocation. Never delete it here.
                 match status {
                     Ok(status) if status.success() => println!("✔ Ephemeral Flatpak '{}' uninstalled.", self.app_id.green()),
@@ -374,9 +419,7 @@ fn try_flatpak(app_id: &str, args: &[String]) -> Result<i32, String> {
             "::".cyan(),
             app_id.bold()
         );
-        let install_status = Command::new("flatpak")
-            .args(["install", "--user", "--noninteractive", "-y", "flathub", app_id])
-            .status()
+        let install_status = run_tracked_command(Command::new("flatpak").args(["install", "--user", "--noninteractive", "-y", "flathub", app_id]))
             .map_err(|e| format!("Failed to run flatpak install: {}", e))?;
 
         if install_status.success() {
@@ -405,9 +448,7 @@ fn try_flatpak(app_id: &str, args: &[String]) -> Result<i32, String> {
     let mut run_args = vec!["run", app_id];
     run_args.extend(args.iter().map(|s| s.as_str()));
 
-    let child_status = Command::new("flatpak")
-        .args(&run_args)
-        .status()
+    let child_status = run_tracked_command(Command::new("flatpak").args(&run_args))
         .map_err(|e| format!("Failed to execute flatpak run: {}", e))?;
 
     drop(guard);
@@ -436,33 +477,13 @@ fn try_nix(pkg: &str, args: &[String]) -> Result<i32, String> {
         nix_args.extend(args.iter().map(|s| s.as_str()));
     }
 
-    let status = Command::new("nix")
-        .args(&nix_args)
-        .status()
+    let status = run_tracked_command(Command::new("nix").args(&nix_args))
         .map_err(|e| format!("Failed to execute nix: {}", e))?;
 
-    if status.success() {
-        return Ok(0);
-    }
-
-    // Fallback: nix-shell -p <pkg> --run "<pkg> [args...]"
-    println!(
-        "{} 'nix run' exited with {}. Trying 'nix-shell' fallback...",
-        "::".yellow(),
-        status.code().unwrap_or(1)
-    );
-    let mut cmd_parts = vec![crate::utils::shell_quote(pkg)];
-    cmd_parts.extend(args.iter().map(|s| crate::utils::shell_quote(s)));
-    let shell_cmd = cmd_parts.join(" ");
-    let shell_status = Command::new("nix-shell")
-        .args(["-p", pkg, "--run", &shell_cmd])
-        .status()
-        .map_err(|e| format!("Failed to run nix-shell: {}", e))?;
-
-    Ok(shell_status.code().unwrap_or(1))
+    Ok(status.code().unwrap_or(1))
 }
 
-fn try_pipx(pkg: &str, args: &[String]) -> Result<i32, String> {
+fn try_pipx(pkg: &str, args: &[String], no_cache: bool) -> Result<i32, String> {
     if !crate::journal::TransactionJournal::is_safe_pkg_name(pkg) {
         return Err(format!("Invalid Pipx package name '{}'.", pkg));
     }
@@ -477,22 +498,41 @@ fn try_pipx(pkg: &str, args: &[String]) -> Result<i32, String> {
         pkg.bold()
     );
 
-    let mut pipx_args = vec!["run", pkg];
+    let mut pipx_args = vec!["run"];
+    if no_cache { pipx_args.push("--no-cache"); }
+    pipx_args.push(pkg);
     pipx_args.extend(args.iter().map(|s| s.as_str()));
 
-    let status = Command::new("pipx")
-        .args(&pipx_args)
-        .status()
+    // Pipx's freshness flag alone can defer environment deletion. Own the
+    // entire run cache when no-cache is requested, without replacing HOME or
+    // touching previously installed environments. Footprint is unknown: this
+    // is a starting capacity check, not a complete Python build guarantee.
+    let workspace = if no_cache { Some(crate::scratch::Workspace::create(crate::scratch::Policy::Auto, 64 * 1024 * 1024)?) } else { None };
+    let mut command = Command::new("pipx");
+    command.args(&pipx_args);
+    if let Some(workspace) = &workspace {
+        println!(":: --no-cache: private Pipx workspace {}; removed on exit. Python build footprint is unknown.", workspace.path.display());
+        for (key, directory) in [("PIPX_HOME", "home"), ("PIPX_BIN_DIR", "bin"), ("PIPX_MAN_DIR", "man"), ("PIPX_SHARED_LIBS", "shared"), ("PIPX_VENV_CACHEDIR", "venvs"), ("PIP_CACHE_DIR", "pip-cache"), ("UV_CACHE_DIR", "uv-cache")] {
+            command.env(key, workspace.path.join(directory));
+        }
+        command.env("TMPDIR", &workspace.path);
+    }
+    let status = run_tracked_command(&mut command)
         .map_err(|e| format!("Failed to execute pipx: {}", e))?;
 
     Ok(status.code().unwrap_or(1))
 }
 
+#[cfg(test)]
 fn create_secure_temp_dir(prefix: &str) -> Result<PathBuf, String> {
     let sub = if prefix.starts_with("pacpin-run") { "run" } else { "try" };
     let base_dir = env::var_os("XDG_RUNTIME_DIR")
         .and_then(|runtime| private_runtime_subdir(Path::new(&runtime), sub).ok())
         .unwrap_or_else(env::temp_dir);
+    create_secure_temp_dir_in(prefix, &base_dir)
+}
+
+fn create_secure_temp_dir_in(prefix: &str, base_dir: &Path) -> Result<PathBuf, String> {
 
     #[cfg(unix)]
     use std::os::unix::fs::DirBuilderExt;
@@ -524,6 +564,7 @@ fn create_secure_temp_dir(prefix: &str) -> Result<PathBuf, String> {
     Err("Failed to create secure sandbox directory with exclusive permissions".to_string())
 }
 
+#[cfg(test)]
 fn private_runtime_subdir(runtime: &Path, sub: &str) -> Result<PathBuf, String> {
     #[cfg(unix)]
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -629,7 +670,7 @@ fn supports_ro_overlay() -> bool {
         "--ro-overlay", "/usr/share", "--proc", "/proc", "--dev", "/dev",
         "--tmpfs", "/tmp", "--", "/usr/bin/true",
     ]);
-    probe.output().is_ok_and(|output| output.status.success())
+    crate::progress::capture_output(&mut probe).is_ok_and(|output| output.status.success())
 }
 
 fn add_package_data_mounts(
@@ -678,9 +719,7 @@ pub fn check_bwrap_capability() -> Result<(), String> {
     let mut probe = Command::new("bwrap");
     probe.args(["--unshare-all", "--die-with-parent", "--new-session"]);
     add_host_runtime_mounts(&mut probe);
-    let test_res = probe
-        .args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--", "/usr/bin/true"])
-        .output();
+    let test_res = crate::progress::capture_output(probe.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--", "/usr/bin/true"]));
 
     match test_res {
         Ok(out) if out.status.success() => Ok(()),
@@ -711,7 +750,7 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
 
     init_signal_handlers();
 
-    if !options.no_sandbox {
+    if !options.no_sandbox && !options.dry_run {
         if let Err(err_reason) = check_bwrap_capability() {
             if !crate::is_command_available("bwrap") {
                 let is_interactive = io::stdin().is_terminal() && !options.noconfirm;
@@ -787,18 +826,56 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
         }
     }
 
-    let prefix = if options.is_run_mode { "pacpin-run" } else { "pacpin-try" };
-    let sandbox_dir = create_secure_temp_dir(&format!("{}-{}", prefix, pkg))?;
-
-    let mut guard = SandboxGuard::new(sandbox_dir.clone());
-
     let cfg = crate::config::load_config();
     let manager = crate::db::AlpmManager::with_repo_order(&cfg.repo_order)
         .map_err(|e| format!("Error initializing ALPM: {}", e))?;
 
-    println!("{} Resolving download URLs for '{}' via ALPM...", "::".cyan(), pkg);
-    let resolved = manager.resolve_download_urls(repo, pkg)
-        .map_err(|err| format!("Error resolving download URLs: {}", err))?;
+    if let Some(version) = manager.installed_version(pkg) {
+        println!("{} '{}' is already installed ({version}).", "::".cyan(), pkg);
+    }
+    let installed = if options.installed || repo.is_none() && !manager.has_repository_target(pkg) {
+        let installed = manager.installed_executables(pkg)?;
+        if options.installed && installed.is_none() { return Err(format!("Package '{pkg}' is not installed; omit --installed to test a repository download")); }
+        installed
+    } else { None };
+    let installed_execution = installed.is_some();
+    if installed_execution && crate::scratch::policy() != crate::scratch::Policy::Auto {
+        return Err("--use-ram/--use-storage requires a repository archive to relocate. Installed execution uses the existing files; omit --installed and select a repository target, or omit the scratch flag for this local package.".into());
+    }
+    let resolved = if installed_execution { Vec::new() } else {
+        manager.resolve_download_urls(repo, pkg)
+            .map_err(|err| format!("Error resolving download URLs: {err}"))?
+    };
+    let (bytes, inodes) = ephemeral_footprint(&resolved);
+    let base = crate::scratch::choose(crate::scratch::policy(), bytes, inodes)?;
+    if options.dry_run {
+        if let Some((version, executables)) = &installed {
+            let binary = select_executable(executables.clone(), pkg, options.bin.as_deref())?;
+            println!(":: Dry-run: installed {pkg} ({version}), executable {}, arguments {args:?}.", binary.display());
+        } else {
+            println!(":: Dry-run: {:?} workspace in {}; estimated peak {:.1} MiB. Archive paths checked after download.{}", crate::scratch::policy(), base.display(), bytes as f64 / 1_048_576.0, if options.no_cache { " Existing archive cache bypassed." } else { "" });
+            for target in &resolved { println!("  {}: {}", target.name, target.url); }
+            println!(":: {} execution with arguments {args:?}; no download, extraction or application execution.", if options.no_sandbox { "Host" } else { "Bubblewrap" });
+        }
+        return Ok(0);
+    }
+    if options.no_cache {
+        println!(":: --no-cache: {}; existing cache files are preserved.", if installed_execution { "installed execution needs no downloads" } else { "temporary downloads bypass the native archive cache" });
+    }
+    let prefix = if options.is_run_mode { "pacpin-run" } else { "pacpin-try" };
+    let sandbox_dir = create_secure_temp_dir_in(&format!("{prefix}-{pkg}"), &base)?;
+    let mut guard = SandboxGuard::new(sandbox_dir.clone());
+    let view = crate::progress::session_view();
+    if !installed_execution {
+        println!(":: Temporary app workspace: {} ({:?}); downloads and extracted files are removed on exit.", sandbox_dir.display(), crate::scratch::policy());
+    }
+    let binary_path = if let Some((version, executables)) = installed {
+        println!("{} Using installed '{}' ({version}){}.", "::".cyan(), pkg,
+            if options.installed { " (--installed)" } else { "; no configured repository offers this target" });
+        select_executable(executables, pkg, options.bin.as_deref())?
+    } else {
+        println!("{} Resolving download URLs for '{}' via ALPM...", "::".cyan(), pkg);
+        if manager.installed_version(pkg).is_some() { println!(":: Testing the repository package; the installed package remains in place. Use --installed to run the local version."); }
 
     if resolved.len() > 1 {
         println!(
@@ -811,26 +888,59 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
 
     // Downloads are independent; extraction stays ordered so dependencies cannot
     // race while writing into the same root.
-    let archives = download_targets_parallel(&resolved, options.allow_unverified, &mut guard, |target, allow_unverified, downloaded| {
+    let total = resolved.iter().fold(0u64, |sum, target| sum.saturating_add(target.download_bytes));
+    let cache_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let measured_cache = cache_bytes.clone();
+    let measured_dir = sandbox_dir.clone();
+    let archives = crate::progress::operation_dynamic(crate::progress::Manager::Runtime, move || {
+        let downloaded = fs::read_dir(&measured_dir).into_iter().flatten().flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("pacpin-download-"))
+            .filter_map(|entry| entry.metadata().ok().map(|meta| meta.len()))
+            .fold(measured_cache.load(Ordering::Relaxed), u64::saturating_add);
+        ephemeral_download_label(downloaded, total)
+    }, || download_targets_parallel(&resolved, options.allow_unverified, &mut guard, |target, allow_unverified, downloaded| {
         let urls = if target.candidate_urls.is_empty() {
             vec![target.url.clone()]
         } else {
             target.candidate_urls.clone()
         };
-        crate::download::fetch_package_archive(
+        let archive = crate::download::fetch_package_archive(
             &target.name,
             &urls,
             target.sha256.as_deref(),
             allow_unverified,
             downloaded,
-        )
-    })?;
-    for tarball_path in archives {
-        crate::download::extract_archive(&tarball_path, &sandbox_dir)?;
+            &sandbox_dir,
+            !options.no_cache,
+        )?;
+        if archive.parent() != Some(sandbox_dir.as_path()) { cache_bytes.fetch_add(target.download_bytes, Ordering::Relaxed); }
+        Ok(archive)
+    }))?;
+    println!(":: Archive downloads and checksum verification complete.");
+    let (unpacked_bytes, unpacked_inodes, owned_executables) = crate::progress::operation(crate::progress::Manager::Runtime, "Checking extraction capacity", || archives.iter().enumerate().try_fold((32 * 1024 * 1024u64, 128u64, Vec::new()), |(bytes, inodes, owned), (index, archive)| {
+        // ALPM resolves dependencies first and the requested target last.
+        // Inventory must come from that archive, not the merged dependency root.
+        let (payload, paths, owned) = if index + 1 == archives.len() {
+            crate::archive::executable_footprint(archive)?
+        } else { let (payload, paths) = crate::archive::footprint(archive)?; (payload, paths, owned) };
+        Ok::<_, String>((bytes.saturating_add(payload), inodes.saturating_add(paths), owned))
+    }))?;
+    let remaining = crate::scratch::capacity(&sandbox_dir)?;
+    let available = crate::scratch::mem_available_bytes().unwrap_or(0);
+    if !crate::scratch::fits(remaining, unpacked_bytes, unpacked_inodes, available) {
+        return Err(format!("Insufficient scratch capacity before extraction: {}", crate::scratch::describe(remaining, unpacked_bytes, unpacked_inodes, available)));
+    }
+    let archive_count = archives.len();
+    for (index, tarball_path) in archives.into_iter().enumerate() {
+        println!(":: Extracting package {}/{archive_count}...", index + 1);
+        crate::progress::operation(crate::progress::Manager::Runtime, &format!("Extracting package {}/{archive_count}", index + 1), || crate::download::extract_archive(&tarball_path, &sandbox_dir))?;
     }
 
     // 2. Find executable binary
-    let binary_path = find_executable(&sandbox_dir, pkg, options.bin.as_deref())?;
+        let paths = owned_executables.into_iter().map(|path| sandbox_dir.join(path))
+            .filter(|path| is_executable_file(path)).collect();
+        select_executable(paths, pkg, options.bin.as_deref())?
+    };
 
     // 3. Construct isolated environment paths
     let usr_bin = sandbox_dir.join("usr").join("bin");
@@ -856,7 +966,9 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
     let sandbox_xdg = format!("{}:/usr/local/share:/usr/share", usr_share.display());
 
     if options.no_sandbox {
-        if options.is_run_mode {
+        if installed_execution {
+            println!("{} Running installed '{}' on host...\n", "::".cyan().bold(), pkg.bold());
+        } else if options.is_run_mode {
             println!(
                 "{} Running ephemeral '{}' on host (will be removed upon exit)...\n",
                 "::".cyan().bold(),
@@ -880,12 +992,16 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
             if options.rw_cwd { "read-write" } else { "read-only" }
         );
         println!(
-            "{} Running ephemeral '{}' (sandbox will be destroyed upon exit)...\n",
+            "{} Running {} '{}' (sandbox will be destroyed upon exit)...\n",
             "::".cyan(),
+            if installed_execution { "installed" } else { "ephemeral" },
             pkg.bold()
         );
     }
 
+    // Applications can own their terminal UI. Retire preparation's footer
+    // before executing them, including interactive host programs.
+    drop(view);
     let child_status = if !options.no_sandbox {
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
@@ -991,7 +1107,7 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
         bwrap_cmd.args(["--setenv", "TERM", &term]);
 
         bwrap_cmd.arg(&binary_path).args(args);
-        bwrap_cmd.status()
+        run_tracked_command(&mut bwrap_cmd)
     } else {
         run_tracked_command(
             Command::new(&binary_path)
@@ -1008,6 +1124,24 @@ fn try_pacman(repo: Option<&str>, pkg: &str, args: &[String], options: &TryOptio
         Ok(s) => Ok(s.code().unwrap_or(1)),
         Err(e) => Err(format!("Execution failed: {}", e)),
     }
+}
+
+fn ephemeral_download_label(downloaded: u64, total: u64) -> String {
+    let (scale, unit) = if total.max(downloaded) < 1_048_576 { (1024.0, "KiB") } else { (1_048_576.0, "MiB") };
+    if total == 0 { return format!("Download/verify {:.1} {unit}", downloaded as f64 / scale); }
+    format!("Download/verify {:.1}/{:.1} {unit} ({}%)", downloaded as f64 / scale, total as f64 / scale, downloaded.saturating_mul(100).checked_div(total).unwrap_or(0).min(100))
+}
+
+fn ephemeral_footprint(targets: &[crate::db::DownloadTarget]) -> (u64, u64) {
+    // Archives and extraction coexist. Metadata sizes provide an estimate,
+    // not a reservation or a limit on the running app's memory.
+    let bytes = targets.iter().fold(32 * 1024 * 1024u64, |sum, target| {
+        sum.saturating_add(target.download_bytes)
+            .saturating_add(target.installed_bytes.saturating_mul(2))
+    });
+    // Before downloading we know the number of archive files, not the number
+    // of extracted paths. Count those through archive::footprint afterwards.
+    (bytes, (targets.len() as u64).saturating_mul(2).saturating_add(128))
 }
 
 fn download_targets_parallel<F>(
@@ -1065,61 +1199,58 @@ where
     Ok(archives)
 }
 
+#[cfg(test)]
 fn find_executable(sandbox_dir: &Path, pkg: &str, requested_bin: Option<&str>) -> Result<PathBuf, String> {
     let usr_bin = sandbox_dir.join("usr").join("bin");
     let usr_sbin = sandbox_dir.join("usr").join("sbin");
 
+    let mut executables = Vec::new();
+    for dir in [&usr_bin, &usr_sbin] {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if is_executable_file(&path) { executables.push(path); }
+            }
+        }
+    }
+    select_executable(executables, pkg, requested_bin)
+}
+
+pub(crate) fn is_package_entry_point(path: &Path) -> bool {
+    if path.is_absolute() || path.components().any(|part| !matches!(part, std::path::Component::Normal(_)))
+        || path.to_string_lossy().chars().any(char::is_control) { return false; }
+    let Some(parent) = path.parent() else { return false; };
+    parent == Path::new("usr/bin") || parent == Path::new("usr/sbin")
+        || (path.starts_with("usr/lib") || path.starts_with("opt")) && parent.file_name().is_some_and(|name| name == "bin" || name == "sbin")
+}
+
+fn select_executable(mut executables: Vec<PathBuf>, pkg: &str, requested_bin: Option<&str>) -> Result<PathBuf, String> {
+    executables.sort();
+    executables.dedup();
     if let Some(bin_name) = requested_bin {
         if bin_name.is_empty()
             || bin_name == "."
             || bin_name == ".."
             || bin_name.starts_with('-')
-            || bin_name.contains(['/', '\\', '\0'])
+            || bin_name.contains(['/', '\\']) || bin_name.chars().any(char::is_control)
         {
             return Err("--bin must name a single executable within the package".to_string());
         }
-        let p1 = usr_bin.join(bin_name);
-        if is_executable_file(&p1) {
-            return Ok(p1);
-        }
-        let p2 = usr_sbin.join(bin_name);
-        if is_executable_file(&p2) {
-            return Ok(p2);
-        }
+        let candidates: Vec<_> = executables.iter().filter(|p| p.file_name().is_some_and(|n| n == bin_name)).collect();
+        if candidates.len() == 1 { return Ok(candidates[0].clone()); }
+        if candidates.len() > 1 { return Err(format!("Requested binary '{bin_name}' is ambiguous within this package: {}", candidates.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", "))); }
         return Err(format!(
-            "Requested binary '{}' not found in package usr/bin or usr/sbin.",
+            "Requested binary '{}' not found in package executable inventory.",
             bin_name
         ));
     }
 
     // 1. Direct match: usr/bin/<pkg>
-    let direct = usr_bin.join(pkg);
-    if is_executable_file(&direct) {
-        return Ok(direct);
-    }
-    let direct_sbin = usr_sbin.join(pkg);
-    if is_executable_file(&direct_sbin) {
-        return Ok(direct_sbin);
-    }
-
-    // 2. Scan all executables in usr/bin and usr/sbin
-    let mut executables: Vec<PathBuf> = Vec::new();
-    for dir in &[&usr_bin, &usr_sbin] {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if is_executable_file(&p) {
-                    executables.push(p);
-                }
-            }
-        }
-    }
-    executables.sort();
-    executables.dedup();
+    if let Some(path) = executables.iter().find(|p| p.file_name().is_some_and(|n| n == pkg)) { return Ok(path.clone()); }
 
     if executables.is_empty() {
         return Err(format!(
-            "No executable found for package '{}' in sandbox (usr/bin or usr/sbin).",
+            "No executable entry point found in requested package '{}'. Use --bin with a package-owned tool name when available.",
             pkg
         ));
     }
@@ -1169,6 +1300,25 @@ pub fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ephemeral_scratch_estimate_includes_archives_extraction_and_overhead() {
+        assert!(super::ephemeral_download_label(10, 40).contains("25%"));
+        assert!(super::ephemeral_download_label(1024, 2048).contains("1.0/2.0 KiB"));
+        assert!(!super::ephemeral_download_label(10, 0).contains('%'));
+        let targets = [crate::db::DownloadTarget {
+            name: "fixture".into(), url: String::new(), candidate_urls: Vec::new(), sha256: None,
+            download_bytes: 100, installed_bytes: 1024 * 1024 * 1024,
+        }];
+        let (bytes, inodes) = super::ephemeral_footprint(&targets);
+        assert_eq!(bytes, 32 * 1024 * 1024 + 100 + 2 * 1024 * 1024 * 1024);
+        assert_eq!(inodes, 130);
+        let base = std::env::temp_dir();
+        let workspace = super::create_secure_temp_dir_in("pacpin-run-medium-test", &base).unwrap();
+        assert_eq!(workspace.parent(), Some(base.as_path()));
+        let guard = super::SandboxGuard::new(workspace.clone());
+        drop(guard);
+        assert!(!workspace.exists());
+    }
     use super::*;
 
     #[test]
@@ -1250,6 +1400,23 @@ mod tests {
     }
 
     #[test]
+    fn installed_executable_selection_is_limited_to_package_inventory() {
+        assert!(is_package_entry_point(Path::new("usr/lib/jvm/java-fixture/bin/java")));
+        assert!(is_package_entry_point(Path::new("opt/tool/bin/tool")));
+        assert!(!is_package_entry_point(Path::new("usr/share/doc/bin/example")));
+        assert!(!is_package_entry_point(Path::new("usr/lib/../../tmp/bin/tool")));
+        assert!(!is_package_entry_point(Path::new("/usr/bin/tool")));
+        assert!(select_executable(vec!["/usr/bin/java".into(), "/usr/lib/jvm/tool/bin/java".into()], "jdk", Some("java")).is_err());
+        let paths = vec![PathBuf::from("/usr/bin/one"), PathBuf::from("/usr/bin/two")];
+        assert!(select_executable(paths.clone(), "package", None).is_err());
+        assert_eq!(select_executable(paths.clone(), "package", Some("two")).unwrap(), Path::new("/usr/bin/two"));
+        assert!(select_executable(paths.clone(), "package", Some("sh")).is_err());
+        for invalid in ["../one", "/usr/bin/one", "one\n", "-one"] { assert!(select_executable(paths.clone(), "package", Some(invalid)).is_err()); }
+        assert_eq!(select_executable(paths.clone(), "one", None).unwrap(), paths[0]);
+        assert_eq!(select_executable(vec![paths[1].clone()], "package", None).unwrap(), paths[1]);
+    }
+
+    #[test]
     fn test_try_options_for_run() {
         let opts = TryOptions::for_run();
         assert!(opts.no_sandbox);
@@ -1265,6 +1432,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_registry() {
+        let _serial = CHILD_TEST_LOCK.lock().unwrap();
         let temp_dir = std::env::temp_dir().join(format!("pacpin-test-cleanup-reg-{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
         assert!(temp_dir.exists());
@@ -1388,10 +1556,11 @@ mod tests {
         let ready = fixture.join("ready");
         let cleaned = fixture.join("cleaned");
         let handler = format!("touch {}; exit 0", crate::utils::shell_quote(&cleaned.to_string_lossy()));
-        let script = format!("trap {} INT; touch {}; while :; do sleep .02; done", crate::utils::shell_quote(&handler), crate::utils::shell_quote(&ready.to_string_lossy()));
+        let script = format!("trap {} INT; printf '%s' \"$$\" > {}; while :; do sleep .02; done", crate::utils::shell_quote(&handler), crate::utils::shell_quote(&ready.to_string_lossy()));
         let worker = std::thread::spawn(move || run_tracked_command(Command::new("bash").args(["-c", &script])).unwrap());
         wait_for_test_file(&ready);
-        kill_active_children();
+        let pid = fs::read_to_string(&ready).unwrap().parse().unwrap();
+        terminate_children(vec![pid], Vec::new());
         assert!(worker.join().unwrap().success());
         assert!(cleaned.exists(), "child did not get a chance to clean up");
         fs::remove_dir_all(fixture).unwrap();
@@ -1401,17 +1570,19 @@ mod tests {
     #[test]
     fn test_active_download_children_are_killed_before_cleanup() {
         let _serial = CHILD_TEST_LOCK.lock().unwrap();
-        let worker = std::thread::spawn(|| {
-            run_tracked_command(Command::new("sleep").arg("30")).unwrap()
+        let fixture = create_secure_temp_dir("pacpin-run-kill-test").unwrap();
+        let ready = fixture.join("ready");
+        let script = format!("printf '%s' \"$$\" > {}; exec sleep 30", crate::utils::shell_quote(&ready.to_string_lossy()));
+        let worker = std::thread::spawn(move || {
+            run_tracked_command(Command::new("sh").args(["-c", &script])).unwrap()
         });
-        for _ in 0..100 {
-            if ACTIVE_CHILDREN.lock().unwrap().len() == 1 { break; }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(ACTIVE_CHILDREN.lock().unwrap().len(), 1);
-        kill_active_children();
+        // Concurrent ALPM metadata tests also register children. Seeing one
+        // arbitrary PID is not proof that this worker has started.
+        wait_for_test_file(&ready);
+        let pid = fs::read_to_string(&ready).unwrap().parse().unwrap();
+        terminate_children(vec![pid], Vec::new());
         assert!(!worker.join().unwrap().success());
-        assert!(ACTIVE_CHILDREN.lock().unwrap().is_empty());
+        fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
@@ -1421,6 +1592,7 @@ mod tests {
             .map(|i| crate::db::DownloadTarget {
                 name: format!("pkg-{}", i), url: String::new(),
                 candidate_urls: Vec::new(), sha256: None,
+                download_bytes: 0, installed_bytes: 0,
             })
             .collect();
         let active = AtomicUsize::new(0);
@@ -1443,6 +1615,7 @@ mod tests {
         let mut guard = SandboxGuard::new(sandbox.clone());
         let target = crate::db::DownloadTarget {
             name: "broken".into(), url: String::new(), candidate_urls: Vec::new(), sha256: None,
+            download_bytes: 0, installed_bytes: 0,
         };
         let mut downloaded_path = None;
         let result = download_targets_parallel(&[target], false, &mut guard, |_, _, downloaded| {

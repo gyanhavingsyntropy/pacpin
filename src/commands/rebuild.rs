@@ -57,6 +57,7 @@ struct RebuildOptions {
     dry_run: bool,
     noconfirm: bool,
     enforce_repos: bool,
+    no_cache: bool,
 }
 
 fn parse_rebuild_options(args: &[String]) -> Result<RebuildOptions, String> {
@@ -66,6 +67,7 @@ fn parse_rebuild_options(args: &[String]) -> Result<RebuildOptions, String> {
             "-n" | "--dry-run" => options.dry_run = true,
             "--noconfirm" => options.noconfirm = true,
             "--enforce-repos" => options.enforce_repos = true,
+            "--no-cache" | "--clean-cache" => options.no_cache = true,
             other => return Err(format!("Unknown rebuild option '{}'.", other)),
         }
     }
@@ -388,6 +390,15 @@ pub fn cmd_rebuild(mut config: Config, args: &[String]) -> Result<(), String> {
     let snapshot = collect_snapshot(&manager, &config.packages)?;
     let plan = make_plan(&config, &snapshot, options.enforce_repos)?;
     print_plan(&plan);
+    if (!plan.flatpak_user.is_empty() || !plan.flatpak_system.is_empty())
+        && (crate::scratch::policy() != crate::scratch::Policy::Auto || options.no_cache)
+    {
+        return Err("Manifest Flatpak installation does not support scratch/cache overrides. Apply the native/AUR/Sources manifest separately or omit these flags; no packages have been changed.".into());
+    }
+    if let Some(description) = crate::scratch::describe_plan(
+        plan.install.iter().chain(&plan.enforce_repo).any(|target| crate::sources::owner(&config, target).is_some() || target.split_once('/').is_some_and(|(alias, _)| config.sources.contains_key(alias))),
+        plan.install.iter().chain(&plan.enforce_repo).any(|target| target.starts_with("aur/")),
+    ) { println!(":: {description}"); }
     if options.dry_run || plan.is_empty() {
         return Ok(());
     }
@@ -414,6 +425,7 @@ pub fn cmd_rebuild(mut config: Config, args: &[String]) -> Result<(), String> {
             &plan.install,
             &InstallOptions {
                 noconfirm: true,
+                no_cache: options.no_cache,
                 ..InstallOptions::default()
             },
         )?;
@@ -425,6 +437,7 @@ pub fn cmd_rebuild(mut config: Config, args: &[String]) -> Result<(), String> {
             &InstallOptions {
                 needed: false,
                 noconfirm: true,
+                no_cache: options.no_cache,
                 ..InstallOptions::default()
             },
         )?;
@@ -556,6 +569,11 @@ pub fn cmd_capture(config: Config, args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn manifest_cache_flag_composes_with_preview() {
+        let options = parse_rebuild_options(&["--dry-run".into(), "--no-cache".into()]).unwrap();
+        assert!(options.dry_run && options.no_cache);
+    }
 
     fn snapshot() -> Snapshot {
         Snapshot {

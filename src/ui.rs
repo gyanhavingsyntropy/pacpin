@@ -623,12 +623,14 @@ pub fn render_transaction_plan(
 
     if updates.is_empty() && external_updates.is_empty() && details.as_ref().is_none_or(|d| d.preview.adds.is_empty() && d.requested.iter().all(|p| p.status == RequestedStatus::AlreadyCurrent)) {
         if held.is_empty() {
-            println!("\n{}", "✔ System is fully up to date!".green());
-            println!(
-                "  {} packages inspected across {} repositories.",
-                data.installed_count,
-                data.repos.len()
-            );
+            println!("\n{}", "✔ No updates found in the checked scope.".green());
+            if !data.repos.is_empty() {
+                println!(
+                    "  {} packages inspected across {} repositories.",
+                    data.installed_count,
+                    data.repos.len()
+                );
+            }
         }
         return Vec::new();
     }

@@ -22,7 +22,7 @@
 5. **Ephemeral Package Sandbox (`pacpin try [repo/]pkg [args...]`)**: Download and execute native Arch packages in a Bubblewrap (`bwrap`) container with unshared namespaces, read-only system mounts, private in-memory `/tmp`, SHA256 verification, and archive traversal guards. Flatpak apps use Flatpak's own sandbox; Nix and Pipx execute on the host only with explicit `pin run` or `--no-sandbox`.
 6. **Post-Upgrade Restart Inspector (`needrestart`)**: Automatically inspect running processes holding deleted `.so` libraries in RAM (`/proc/*/maps`) and verify running kernel vs installed modules (supporting Arch, CachyOS, XanMod, RT, TKG, and Bochs kernels), advising on exact service restart commands (`sudo systemctl restart <srv>`) with zero noise when nothing needs restarting.
 7. **Scrollable Checkbox TUI with Batch Shortcuts**: Interactive viewport checklist (`Space` toggle, `Enter` confirm) with one-key batch actions (`[a]` All, `[n]` None, `[p]` Pure Only, `[i]` Invert, `/` Search) for orphan management and setup.
-8. **Unified Multi-Package Manager Integrations**: Simultaneously check, refresh, and execute updates for Flatpak, Nix, and Pipx alongside Pacman and AUR in a single transaction view.
+8. **Configurable Package Manager Integrations**: Check Flatpak, modern flake-backed Nix profiles, Pipx, and custom managers alongside Pacman/AUR. Preview exact scoped targets, stop on failed checks/transactions, and explicitly declare manager-specific flags and cleanup actions in [managers.toml](docs/managers.md).
 9. **Batch Pinning from Files**: Pin multiple packages at once or import a package list from a text file (`pacpin pin <repo> -f <file>`).
 10. **Stability Delay Buffers**: Enforce quarantine windows (e.g. `pacpin delay linux 3`) with automatic reverse-dependency cascade holds to prevent ABI mismatches.
 11. **Companion Cascade Detection**: Automatically detects split packages (sharing `%BASE%`) and prefix-related dependencies when pinning or installing to prevent version desynchronization.
@@ -33,6 +33,24 @@
 ---
 
 ## Configuration (`~/.config/pacpin/config.toml`)
+
+All editable files live together under `$XDG_CONFIG_HOME/pacpin`, or
+`~/.config/pacpin` when XDG_CONFIG_HOME is unset:
+
+| File | Purpose |
+| --- | --- |
+| `config.toml` | Pins, package manifest, repository order and general preferences |
+| `managers.toml` | Manager adapters, literal commands, supported scratch/cache mappings and custom flags |
+| `sources.toml` | Optional upstream release recipes using `[sources.alias]` |
+| `hooks.toml` | Optional post-update actions using `[hooks.name]` |
+
+`pin config init` creates missing manager/recipe/hook files with documented
+defaults. Setup also creates them. Existing files are preserved, and read-only
+checks never create them. `pin config validate` checks all files. Existing inline
+`[sources]` and `[hooks]` remain supported; duplicate aliases/hook names across
+files are errors. Automatic pin updates leave separate recipe/hook files intact.
+See [manager configuration and flags](docs/managers.md), [release recipes](docs/sources.md),
+and [post-update hooks](docs/verification/2026-10-11-runtime-hooks.md).
 
 ```toml
 repo_order = ["core", "cachyos", "extra", "multilib"]
@@ -106,7 +124,14 @@ The shared footer also describes repository refresh, update/dependency/space che
 
 The final plan summary follows dependency and removal details. Its native counts and sizes include the prepared transaction's additional packages: for example, `41 upgrades + 7 new dependencies`, with no `+ 0` when there are none. Sources and other managers retain unknown sizes rather than appearing to add zero bytes.
 
-`--no-cache` cleans only the native/AUR caches involved in successful manager transactions. Sources remove their temporary workspaces separately. Cleanup reports completion, failure, or a reason for skipping; failed-manager archives remain available for recovery. A requested cleanup failure makes the command fail even when package installation succeeded. Cleanup finishes before restart advice.
+`--no-cache` cleans native/AUR caches involved in successful manager transactions.
+Sources remove temporary workspaces separately. Other managers must declare
+cache-disabling arguments or a cache-cleanup command; unsupported combinations
+fail before package installation. Pipx defaults to `--no-cache-dir`. Removing
+installed Flatpak runtimes or old Nix generations is a separate explicit action,
+not automatic cache cleanup. Successful managers can clean their caches even if
+a later manager fails; failed-manager caches are retained. Cleanup failures make
+the command fail, and cleanup finishes before restart advice.
 
 Full native cleanup also clears inactive ALPM `download-*` directories inside configured native caches, including sandbox-owned partial downloads. The database must be unlocked and nonempty directories must be at least two minutes old. Recent nonempty downloads and partial (`-Sc`) cleanup preserve their contents and report incomplete cleanup. Symlink targets and other filesystems are preserved; AUR-only cleanup never scans native caches.
 
@@ -117,17 +142,22 @@ Use `pin clean -Scc --repo` for native caches or `pin clean -Scc --aur` for AUR 
 ```sh
 pin upgrade --sources-only                 # configured upstream Sources only
 pin upgrade --aur-only                     # AUR targets only
+pin upgrade --external-only                # enabled Flatpak/Nix/Pipx/custom managers
 pin upgrade --sources-only --use-ram       # Sources download / packaging in tmpfs
 pin upgrade --aur-only --use-ram            # Paru clones / downloads / builds in tmpfs
 TMPDIR=/path/to/disk/scratch pin upgrade --sources-only --use-storage
 pin -S aur/antigravity --use-ram            # one AUR package
 pin -S source-alias/package --use-storage   # one Source package
 pin -Syu --keep-going                      # guarded Sources continuation after AUR failure
+pin run --use-ram extra/jq -- . input.json  # downloads + extracted files in RAM; host execution
+pin try --use-storage extra/jq -- . input.json # disk files; Bubblewrap isolation
+pin run --dry-run --use-ram extra/jq        # inspect the workspace policy without downloading
+pin rebuild --use-storage --no-cache --dry-run # preview declared native/AUR/Sources work
 ```
 
-`--sources-only` and `--aur-only` are mutually exclusive and exclude other integration upgrades. Native repository databases are not refreshed in scoped runs, including when spelled `-Syu`; AUR helpers can still install required build dependencies through pacman. Keep the native system current before AUR updates. Scoped runs do not remove orphans automatically; use `pin orphans -c` separately.
+`--sources-only`, `--aur-only` and `--external-only` are mutually exclusive. Each excludes unrelated manager upgrades and native repository refresh, including when spelled `-Syu`; AUR helpers can still install required build dependencies through pacman. Keep the native system current before AUR updates. Scoped runs do not remove orphans automatically; use `pin orphans -c` separately.
 
-`--use-ram` and `--use-storage` are mutually exclusive, invocation-only preferences for Sources and Paru temporary workspaces. Defaults retain automatic Sources allocation and the helper's existing AUR workspace. Forced RAM requires tmpfs, quotas/inodes and the 2.5 GiB OS reserve; it never silently falls back to disk. Forced storage requires a writable non-tmpfs filesystem, using `TMPDIR` or `/var/tmp`. No mount or filesystem repair is performed. AUR build footprints are unknown: the starting capacity check cannot guarantee a large compilation will fit. Tmpfs can also be swapped by Linux. These flags do not move already-installed files, native pacman downloads, helper metadata, or installed build dependencies out of root. Root installation capacity remains required.
+`--use-ram` and `--use-storage` are mutually exclusive, invocation-only preferences for Sources/Paru temporary workspaces and native repository `run`/`try` files. Defaults retain automatic Sources allocation and the helper's existing AUR workspace; native `run`/`try` checks `TMPDIR` then `/var/tmp`. Forced RAM requires tmpfs, quotas/inodes and the 2.5 GiB OS reserve; it never silently falls back to disk. Forced storage requires a writable non-tmpfs filesystem, using `TMPDIR` or `/var/tmp`. No mount or filesystem repair is performed. AUR build footprints are unknown: the starting capacity check cannot guarantee a large compilation will fit. Tmpfs can also be swapped by Linux. These flags do not move already-installed files, native pacman installation downloads, helper metadata, or installed build dependencies out of root. Root installation capacity remains required. Manifest `rebuild` forwards scratch/cache policy to native/AUR/Sources installation; a manifest Flatpak installation rejects these overrides before changing packages.
 
 Paru receives a private clone directory and makepkg directory environment overrides. Successful temporary workspaces are removed; failed AUR workspaces are retained with their path for inspection (RAM contents disappear on reboot). Custom clone/makepkg/chroot/local-repository flags conflict with this policy; other helpers fail explicitly rather than ignoring the request. Sources retain their automatic temporary-workspace cleanup.
 
@@ -139,7 +169,8 @@ Cache removal after installation does not eliminate temporary installation space
 
 ### Post-update hooks
 
-Configure actions in `config.toml` for `pin upgrade`, `pin -Su`, or `pin -Syu`:
+Configure actions in `hooks.toml` (existing inline hooks in `config.toml` also work)
+for `pin upgrade`, `pin -Su`, or `pin -Syu`:
 
 ```toml
 [hooks.rounded-blur]
@@ -213,6 +244,9 @@ incompatible upstream recipe build successfully.
 | `pacpin list` | List active engine features, pins, exclusions, delays, and repo priority |
 | `pacpin reset [-f]` | Reset all configurations, pins, and delays to default (creates automatic timestamped backup) |
 | `pacpin init [--reset]` | Interactive onboarding wizard to configure preferences from scratch |
+| `pacpin config init` | Create missing editable manager, source and hook files without overwriting existing files |
+| `pacpin config validate` | Validate the main config and all supplemental files |
+| `pacpin manager NAME --FLAG [-n|--noconfirm]` | Preview or run configured standalone manager actions |
 | `pacpin capture [-n|--force]` | Save explicitly installed packages and Flatpak apps to `[packages]` (`-n` previews) |
 | `pacpin rebuild [-n|--noconfirm] [--enforce-repos]` | Install missing listed packages without deleting extras; optionally reinstall from declared repositories |
 
@@ -231,7 +265,13 @@ incompatible upstream recipe build successfully.
 | `pacpin rollback [id] [-n]` | Restore previous package versions from pacman cache |
 
 > **Sandbox Security Note**:
-> - **Credential & Home Isolation**: Sandboxed containers run in unshared Linux user, mount, IPC, PID, and network namespaces with read-only root filesystems and a private in-memory tmpfs over `$HOME`. When running `pacpin try` from `$HOME` itself, the working directory is deliberately not overlaid to keep host credentials (`~/.ssh`, `~/.gnupg`, tokens) strictly isolated.
+> - **Installed packages without a repository**: An unqualified native `try`/`run` target uses its installed package-owned executable when no configured repository offers it. `try` retains Bubblewrap isolation; `run` executes on the host. `--bin` must belong to that package. Explicit `repo/package` targets still require that repository. No automatic AUR build is attempted.
+> - **Choosing a version**: `pin try --installed PACKAGE` and `pin run --installed PACKAGE` explicitly choose the local version. Without this flag, an available repository candidate is downloaded for testing, including a newer version, and the installed version is reported and preserved. Use `repo/package` to select a particular repository. `--installed` cannot be combined with a repository/provider prefix.
+> - **Temporary storage**: Native repository `run`/`try` keeps new archives and extracted files together in the selected workspace and removes them on exit or handled interruption. It checks live quota, inode and memory capacity before download, then checks actual archive paths and sizes before extraction. These are checks, not reservations; the running app can consume more memory. The footer reports aggregate download bytes/percentage, checking capacity and extraction, then retires before app execution. Redirected output uses milestones without cursor controls.
+> - **Flag composition**: Native `run`/`try --no-cache` bypasses existing archive reuse; it does not purge the system's pacman cache. `--dry-run` previews without starting the app. Put application flags after `--`, including flags named `--use-ram`, `--no-cache` or `--pkexec`. An installed-only target rejects forced scratch placement because its files stay installed. Flatpak/Nix/Pipx `run`/`try` rejects scratch overrides rather than claiming to relocate their stores. Flatpak/Nix also rejects `--no-cache`; Pipx uses a private environment and download-cache workspace which is removed on exit, preserving normal home data and installed Pipx environments. Its 64 MiB starting check cannot predict arbitrary Python build footprints. See [command and flag roles](docs/cli-controls.md).
+> - **Application output**: `run` preserves normal project/home writes. `--use-ram` relocates temporary package files only; generated files still use their normal filesystem. Native `try` discards its private home and `/tmp`, and makes an eligible current project read-only; `--rw` preserves writes to that mounted project. The home tree, its ancestors and system paths are excluded from project mounts even with `--rw`. See [output persistence and Java examples](docs/cli-controls.md#application-files-and-persistence).
+> - **Executable selection**: `--bin` selects an entry point owned by the requested package, including toolkit `bin`/`sbin` directories under `/usr/lib` or `/opt`. It cannot select a downloaded dependency's tool. For a JDK use `pin run --use-ram --bin java jdk-openjdk -- Hello` or `--bin javac` to compile.
+> - **Credential & Home Isolation**: Sandboxed containers run in unshared Linux user, mount, IPC, PID, and network namespaces with read-only root filesystems and a private in-memory tmpfs over `$HOME`. The host home tree is excluded from current-directory mounts to keep host credentials (`~/.ssh`, `~/.gnupg`, tokens) isolated.
 > - **Hardware & GUI Passthrough**: Flags like `--gui` and `--audio` pass through host display sockets (`/tmp/.X11-unix`, Wayland) and audio nodes (`/dev/snd`), which intentionally broadens the trust boundary for desktop interaction.
 > - **Archive & Input Verification**: Ephemeral packages are downloaded with fail-closed SHA256 integrity verification, streamed through structured `tar` header validation, and guarded against symlink/hardlink directory escapes.
 

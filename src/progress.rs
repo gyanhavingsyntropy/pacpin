@@ -132,6 +132,13 @@ pub fn context<T>(manager: Manager, label: &str, work: impl FnOnce() -> T) -> T 
 /// Display a phase owned by pacpin itself. Child processes use `run` instead;
 /// nesting a phase must never replace the terminal restoration owner.
 pub fn operation<T>(manager: Manager, label: &str, work: impl FnOnce() -> T) -> T {
+    let label = label.to_owned();
+    operation_dynamic(manager, move || label.clone(), work)
+}
+
+/// Refresh a pacpin-owned phase from live measurements; child execution and
+/// terminal restoration remain owned by the same shared renderer.
+pub fn operation_dynamic<T>(manager: Manager, label: impl Fn() -> String + Send + 'static, work: impl FnOnce() -> T) -> T {
     crate::sandbox::init_signal_handlers();
     struct Display {
         stop: std::sync::mpsc::Sender<()>,
@@ -147,12 +154,11 @@ pub fn operation<T>(manager: Manager, label: &str, work: impl FnOnce() -> T) -> 
         Footer::new(manager, false).ok()
     } else { None };
     let _display = footer.map(|mut footer| {
-        let _ = footer.draw(label);
-        let label = label.to_owned();
+        let _ = footer.draw(&label());
         let (stop, stopped) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             while matches!(stopped.recv_timeout(std::time::Duration::from_millis(100)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
-                if footer.resize().and_then(|_| footer.draw(&label)).is_err() { break; }
+                if footer.resize().and_then(|_| footer.draw(&label())).is_err() { break; }
             }
         });
         Display { stop, worker: Some(worker) }
@@ -171,6 +177,7 @@ pub fn unregister_input_restore() {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Manager {
+    Custom(u16),
     Native,
     Aur,
     Sources,
@@ -186,10 +193,12 @@ pub enum Manager {
     Review,
     Record,
     Restart,
+    Runtime,
 }
 impl Manager {
     fn label(self) -> &'static str {
         match self {
+            Self::Custom(index) => CUSTOM_NAMES.get().and_then(|names| names.get(index as usize)).map(String::as_str).unwrap_or("External"),
             Self::Native => "Pacman",
             Self::Aur => "AUR",
             Self::Sources => "Sources",
@@ -205,6 +214,7 @@ impl Manager {
             Self::Review => "Review",
             Self::Record => "Records",
             Self::Restart => "Restart",
+            Self::Runtime => "App",
         }
     }
 
@@ -219,8 +229,18 @@ impl Manager {
             Self::Review => "Review complete",
             Self::Record => "Records saved",
             Self::Restart => "Restart check complete",
+            Self::Runtime => "Preparation complete",
             _ => "Upgrade complete",
         }
+    }
+}
+static CUSTOM_NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+pub fn configure_managers(names: Vec<String>) { let _ = CUSTOM_NAMES.set(names); }
+pub fn integration_manager(name: &str) -> Manager {
+    match name {
+        "Sources" => Manager::Sources, "Flatpak" => Manager::Flatpak,
+        "Nix" => Manager::Nix, "Pipx" => Manager::Pipx,
+        _ => Manager::Custom(CUSTOM_NAMES.get().and_then(|names| names.iter().position(|n| n == name)).unwrap_or(0) as u16),
     }
 }
 
@@ -559,9 +579,9 @@ impl Footer {
 
     fn suspend(&mut self) -> io::Result<()> {
         if self.height == 0 { return Ok(()); }
-        let bottom = self.rows.saturating_sub(self.height).max(1);
+        let clear_row = footer_cleanup_row(self.rows, terminal_size().ws_row, self.height);
         let mut out = io::stdout().lock();
-        write!(out, "\x1b7\x1b[{};1H\x1b[J\x1b[r\x1b8", bottom + 1)?;
+        write!(out, "\x1b7\x1b[{clear_row};1H\x1b[J\x1b[r\x1b8")?;
         out.flush()?;
         self.height = 0;
         if let Some((_, height)) = TERMINAL.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { *height = 0; }
@@ -578,9 +598,13 @@ impl Footer {
         // Complete terminal setup before spawning a child: sudo writes its
         // prompt directly to /dev/tty, outside our buffered output relay.
         write!(out, "\x1b7\x1b[r\x1b8")?;
-        if self.height != 0 && self.rows == size.ws_row && self.cols == size.ws_col {
-            let old_bottom = self.rows.saturating_sub(self.height).max(1);
-            write!(out, "\x1b7\x1b[{};1H\x1b[J\x1b8", old_bottom + 1)?;
+        if self.height != 0 {
+            // Erase the previous footer before scrolling reserves the new
+            // region. On shrink its rows are clipped to the new viewport;
+            // on expansion they remain at their earlier positions. Skipping
+            // this cleanup on resize moves old footer text into main output.
+            let clear_row = footer_cleanup_row(self.rows, size.ws_row, self.height);
+            write!(out, "\x1b7\x1b[{clear_row};1H\x1b[J\x1b8")?;
         }
         // Move existing text into scrollback and keep its cursor in place
         // relative to that text. Never pad each phase with newline characters
@@ -650,17 +674,29 @@ impl Footer {
     }
 
     fn draw(&self, native: &str) -> io::Result<()> {
+        let size = terminal_size();
+        if (self.rows, self.cols) != (size.ws_row, size.ws_col) {
+            // A resize can occur after the caller checked the viewport. Never
+            // send coordinates/widths from the previous size to the terminal.
+            return Ok(());
+        }
         let row = self.rows.saturating_sub(self.height).saturating_add(1);
         let lines = self.lines(native, self.rows, self.cols);
         let mut out = io::stdout().lock();
         // DEC save/restore does not change the package manager's output cursor.
-        write!(out, "\x1b7\x1b[{row};1H\x1b[0m\x1b[2K{}", "─".repeat(self.cols.saturating_sub(1) as usize))?;
+        // DECSC/DECRC also preserve autowrap. If the window shrinks during this
+        // write, clip footer text instead of wrapping it into ordinary output.
+        write!(out, "\x1b7\x1b[?7l\x1b[{row};1H\x1b[0m\x1b[2K{}", "─".repeat(self.cols.saturating_sub(1) as usize))?;
         for (index, line) in lines.iter().enumerate() {
             write!(out, "\x1b[{};1H\x1b[2K{line}", row + 1 + index as u16)?;
         }
         write!(out, "\x1b8")?;
         out.flush()
     }
+}
+
+fn footer_cleanup_row(previous_rows: u16, current_rows: u16, height: u16) -> u16 {
+    previous_rows.min(current_rows).saturating_sub(height).max(1).saturating_add(1)
 }
 
 fn fit_rows(history: Vec<String>, active: Vec<String>, capacity: usize) -> Vec<String> {
@@ -672,9 +708,9 @@ fn fit_rows(history: Vec<String>, active: Vec<String>, capacity: usize) -> Vec<S
 impl Drop for Footer {
     fn drop(&mut self) {
         if self.height != 0 {
-            let bottom = self.rows.saturating_sub(self.height).max(1);
+            let clear_row = footer_cleanup_row(self.rows, terminal_size().ws_row, self.height);
             let reset = if SESSION_VIEW.load(std::sync::atomic::Ordering::Relaxed) { "" } else { "\x1b[r" };
-            let _ = write!(io::stdout(), "\x1b7\x1b[{};1H\x1b[J{reset}\x1b8", bottom + 1);
+            let _ = write!(io::stdout(), "\x1b7\x1b[{clear_row};1H\x1b[J{reset}\x1b8");
             let _ = io::stdout().flush();
         }
         if self.height != 0 && SESSION_VIEW.load(std::sync::atomic::Ordering::Relaxed) {
@@ -937,6 +973,15 @@ fn run_observed_with_stdin(
             }
             return Err(error);
         }
+        // Repair the scroll region before forwarding bytes produced after a
+        // resize. Otherwise those bytes can land on the previous footer rows.
+        if let Some(footer) = &mut footer {
+            if footer.height != 0 && footer.resize()? {
+                let mut size = terminal_size();
+                size.ws_row = size.ws_row.saturating_sub(footer.height);
+                unsafe { libc::ioctl(read_fd, libc::TIOCSWINSZ, &size); }
+            }
+        }
         if fd.revents != 0 {
             match input.read(&mut buf) {
                 Ok(0) => break,
@@ -986,6 +1031,7 @@ fn run_observed_with_stdin(
     if !observer.line.is_empty() {
         on_line(&String::from_utf8_lossy(&observer.line));
     }
+    crate::pacman_config::invalidate();
     Ok(status)
 }
 
@@ -1001,28 +1047,59 @@ fn ensure_not_terminating() -> io::Result<()> {
 /// Bounded read-only tool capture with the same child tracking as foreground
 /// operations. Drain both pipes concurrently even after the capture limit.
 pub fn capture_output(command: &mut Command) -> io::Result<std::process::Output> {
+    capture_output_with_limit(command, 32_768, std::time::Duration::from_secs(600))
+}
+
+/// Metadata must be complete: an oversized body is an error, never a silently
+/// truncated successful check. Readers drain both pipes and the child is reaped
+/// on timeout, overflow, cancellation, and ordinary failure.
+pub fn capture_output_with_limit(command: &mut Command, limit: usize, timeout: std::time::Duration) -> io::Result<std::process::Output> {
+    use std::os::unix::process::CommandExt;
     ensure_not_terminating()?;
-    fn read_bounded(mut stream: impl Read) -> io::Result<Vec<u8>> {
+    fn read_bounded(mut stream: impl Read, limit: usize, overflow: std::sync::Arc<std::sync::atomic::AtomicBool>) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         let mut buffer = [0u8; 4096];
         loop {
             let count = stream.read(&mut buffer)?;
             if count == 0 { return Ok(bytes); }
-            let keep = count.min(32_768usize.saturating_sub(bytes.len()));
+            let keep = count.min(limit.saturating_sub(bytes.len()));
+            if keep != count { overflow.store(true, std::sync::atomic::Ordering::SeqCst); }
             bytes.extend_from_slice(&buffer[..keep]);
         }
     }
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command.process_group(0).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = ChildGuard(command.spawn()?);
-    crate::sandbox::register_child(child.0.id());
+    crate::sandbox::register_child_group(child.0.id());
     let stdout = child.0.stdout.take().ok_or_else(|| io::Error::other("Missing stdout pipe"))?;
     let stderr = child.0.stderr.take().ok_or_else(|| io::Error::other("Missing stderr pipe"))?;
-    let output = std::thread::spawn(move || read_bounded(stdout));
-    let errors = std::thread::spawn(move || read_bounded(stderr));
-    let status = child.0.wait();
+    let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let out_overflow = std::sync::Arc::clone(&overflow);
+    let err_overflow = std::sync::Arc::clone(&overflow);
+    let output = std::thread::spawn(move || read_bounded(stdout, limit, out_overflow));
+    let errors = std::thread::spawn(move || read_bounded(stderr, limit, err_overflow));
+    let start = std::time::Instant::now();
+    let status = loop {
+        if overflow.load(std::sync::atomic::Ordering::SeqCst) {
+            break Err(io::Error::other("Command output exceeds metadata limit"));
+        }
+        if start.elapsed() >= timeout {
+            break Err(io::Error::new(io::ErrorKind::TimedOut, "Metadata command timed out"));
+        }
+        if crate::sandbox::is_terminating() {
+            break Err(io::Error::new(io::ErrorKind::Interrupted, "pacpin is terminating"));
+        }
+        match child.0.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Err(error) => break Err(error),
+        }
+    };
     if status.is_err() { let _ = child.0.kill(); let _ = child.0.wait(); }
+    // Metadata scripts must not leave descendants holding capture pipes open.
+    unsafe { libc::kill(-(child.0.id() as i32), libc::SIGKILL); }
     let stdout = output.join().map_err(|_| io::Error::other("Output reader failed"))??;
     let stderr = errors.join().map_err(|_| io::Error::other("Error reader failed"))??;
+    if overflow.load(std::sync::atomic::Ordering::SeqCst) { return Err(io::Error::other("Command output exceeds metadata limit")); }
     ensure_not_terminating()?;
     Ok(std::process::Output { status: status?, stdout, stderr })
 }
@@ -1181,6 +1258,14 @@ pub fn wait_for_sources(handle: &std::thread::JoinHandle<()>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn footer_cleanup_keeps_the_previous_region_visible_across_resize() {
+        assert_eq!(super::footer_cleanup_row(30, 18, 3), 16);
+        assert_eq!(super::footer_cleanup_row(18, 30, 3), 16);
+        assert_eq!(super::footer_cleanup_row(30, 30, 3), 28);
+        assert_eq!(super::footer_cleanup_row(18, 18, 2), 17);
+    }
+
     use super::*;
     #[test]
     fn native_totals_weight_all_archives_and_ignore_individual_bars() {
@@ -1273,9 +1358,13 @@ mod tests {
     #[test]
     fn bounded_capture_drains_both_streams_and_preserves_failure() {
         let _guard = crate::sandbox::CHILD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let output = capture_output(Command::new("/bin/sh").args(["-c", "head -c 65536 /dev/zero; head -c 65536 /dev/zero >&2; exit 7"])).unwrap();
+        let output = capture_output(Command::new("/bin/sh").args(["-c", "head -c 16384 /dev/zero; head -c 16384 /dev/zero >&2; exit 7"])).unwrap();
         assert_eq!(output.status.code(), Some(7));
-        assert_eq!(output.stdout.len(), 32768); assert_eq!(output.stderr.len(), 32768);
+        assert_eq!(output.stdout.len(), 16384); assert_eq!(output.stderr.len(), 16384);
+        assert!(capture_output(Command::new("/bin/sh").args(["-c", "head -c 65536 /dev/zero"])).is_err());
+        let start = std::time::Instant::now();
+        assert!(capture_output_with_limit(Command::new("/bin/sh").args(["-c", "sleep 30 & wait"]), 1024, std::time::Duration::from_millis(50)).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
     #[test]
     fn footer_describes_phases_without_echoing_prompts_or_hook_logs() {

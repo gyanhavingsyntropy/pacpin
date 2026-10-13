@@ -129,6 +129,15 @@ fn native_path(path: &Path) -> Result<CString, String> {
 /// Inspect logical payload sizes before allocating extraction/build space.
 /// This writes no files and uses the same native filters and bounds as extraction.
 pub(crate) fn footprint(archive_path: &Path) -> Result<(u64, u64), String> {
+    let (bytes, inodes, _) = inspect_payload(archive_path, false)?;
+    Ok((bytes, inodes))
+}
+
+pub(crate) fn executable_footprint(archive_path: &Path) -> Result<(u64, u64, Vec<PathBuf>), String> {
+    inspect_payload(archive_path, true)
+}
+
+fn inspect_payload(archive_path: &Path, collect_executables: bool) -> Result<(u64, u64, Vec<PathBuf>), String> {
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
@@ -142,6 +151,7 @@ pub(crate) fn footprint(archive_path: &Path) -> Result<(u64, u64), String> {
     let mut logical_bytes = 0u64;
     let mut paths = HashSet::new();
     let mut entries = 0usize;
+    let mut executables = Vec::new();
     // SAFETY: reader owns its handle, file stays open until reader is dropped,
     // and each reader-owned entry is consumed before advancing to the next.
     unsafe {
@@ -192,6 +202,12 @@ pub(crate) fn footprint(archive_path: &Path) -> Result<(u64, u64), String> {
             let name =
                 header_text(la::archive_entry_pathname(entry))?.ok_or("Missing archive path")?;
             let path = relative_path(&name)?;
+            let kind = la::archive_entry_filetype(entry);
+            if collect_executables && crate::sandbox::is_package_entry_point(&path)
+                && (kind == la::AE_IFLNK || kind == la::AE_IFREG && la::archive_entry_perm(entry) & 0o111 != 0)
+            {
+                executables.push(path.clone());
+            }
             for parent in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
                 paths.insert(parent.to_path_buf());
                 if paths.len() > crate::download::MAX_ARCHIVE_ENTRIES {
@@ -215,6 +231,7 @@ pub(crate) fn footprint(archive_path: &Path) -> Result<(u64, u64), String> {
     Ok((
         bytes.saturating_add((paths.len() as u64).saturating_mul(4096)),
         paths.len() as u64,
+        executables,
     ))
 }
 
@@ -735,6 +752,23 @@ mod tests {
         let (bytes, inodes) = footprint(&archive).unwrap();
         assert_eq!(inodes, 3);
         assert_eq!(bytes, 4 * 4096);
+        assert!(!fixture.0.join("usr").exists());
+    }
+
+    #[test]
+    fn executable_inventory_includes_toolkit_bins_and_excludes_non_entry_points() {
+        let fixture = Fixture::new();
+        let mut builder = tar::Builder::new(Vec::new());
+        add_file(&mut builder, "usr/bin/app", b"app");
+        add_file(&mut builder, "usr/lib/jvm/fixture/bin/java", b"java");
+        add_file(&mut builder, "usr/share/doc/bin/example", b"example");
+        let mut header = tar::Header::new_gnu();
+        header.set_size(4); header.set_mode(0o644); header.set_cksum();
+        builder.append_data(&mut header, "usr/bin/data", &b"data"[..]).unwrap();
+        let archive = fixture.save(&builder.into_inner().unwrap());
+        let (bytes, inodes, executables) = executable_footprint(&archive).unwrap();
+        assert_eq!((bytes, inodes), footprint(&archive).unwrap());
+        assert_eq!(executables, vec![PathBuf::from("usr/bin/app"), PathBuf::from("usr/lib/jvm/fixture/bin/java")]);
         assert!(!fixture.0.join("usr").exists());
     }
 

@@ -99,7 +99,7 @@ fn read_rpc_body(reader: impl Read, limit: u64) -> Result<String, String> {
     Ok(text)
 }
 
-fn query_aur_chunk(chunk: &[String]) -> HashMap<String, AurItem> {
+fn query_aur_chunk(chunk: &[String]) -> Result<HashMap<String, AurItem>, String> {
     let mut results = HashMap::new();
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(6))
@@ -195,7 +195,7 @@ fn query_aur_chunk(chunk: &[String]) -> HashMap<String, AurItem> {
         }
     }
 
-    results
+    if success { Ok(results) } else { Err(format!("AUR check failed for {} package(s) after {max_attempts} attempts", chunk.len())) }
 }
 
 fn parse_requested_aur_response(body: &str, requested: &[String]) -> Result<Vec<AurItem>, String> {
@@ -207,8 +207,12 @@ fn parse_requested_aur_response(body: &str, requested: &[String]) -> Result<Vec<
 }
 
 pub fn query_aur(pkg_names: &[String]) -> HashMap<String, AurItem> {
+    query_aur_checked(pkg_names).unwrap_or_default()
+}
+
+pub fn query_aur_checked(pkg_names: &[String]) -> Result<HashMap<String, AurItem>, String> {
     if pkg_names.is_empty() {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
 
     if pkg_names.len() <= 50 {
@@ -227,13 +231,11 @@ pub fn query_aur(pkg_names: &[String]) -> HashMap<String, AurItem> {
             handles.push(std::thread::spawn(move || query_aur_chunk(&chunk)));
         }
         for h in handles {
-            if let Ok(chunk_res) = h.join() {
-                results.extend(chunk_res);
-            }
+            results.extend(h.join().map_err(|_| "AUR check worker failed")??);
         }
     }
 
-    results
+    Ok(results)
 }
 
 fn urlencoding(input: &str) -> String {

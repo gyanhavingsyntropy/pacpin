@@ -16,7 +16,7 @@ impl SourceProvider {
     }
 }
 impl IntegrationProvider for SourceProvider {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Sources"
     }
     fn is_available(&self) -> bool {
@@ -28,26 +28,14 @@ impl IntegrationProvider for SourceProvider {
     fn refresh_metadata(&self) -> Result<(), io::Error> {
         Ok(())
     }
-    fn check_updates(&self) -> Vec<ExternalUpdate> {
-        let manager = match crate::db::AlpmManager::with_repo_order(&self.config.repo_order) {
-            Ok(manager) => manager,
-            Err(e) => {
-                eprintln!("Warning: Cannot check source packages: {e}");
-                return vec![];
-            }
-        };
-        let ignore_flags: Vec<String> = std::process::Command::new("pacman-conf")
-            .arg("IgnorePkg")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| {
-                String::from_utf8_lossy(&output.stdout)
-                    .split_whitespace()
+    fn check_updates(&self) -> io::Result<Vec<ExternalUpdate>> {
+        let manager = crate::db::AlpmManager::with_repo_order(&self.config.repo_order).map_err(io::Error::other)?;
+        let native_config = crate::pacman_config::snapshot().map_err(io::Error::other)?;
+        let ignore_flags: Vec<String> = {
+                native_config.option("IgnorePkg").iter().flat_map(|s| s.split_whitespace())
                     .map(|pattern| format!("--ignore={pattern}"))
                     .collect()
-            })
-            .unwrap_or_default();
+            };
         let targets: Vec<_> = manager
             .handle()
             .localdb()
@@ -63,21 +51,24 @@ impl IntegrationProvider for SourceProvider {
             .collect();
         drop(manager);
         let mut plans = Vec::new();
+        let mut errors = Vec::new();
         // Bound HTTP pressure independently of core count. All source checks run
         // concurrently with native ALPM/AUR/external-manager checks.
         for batch in targets.chunks(4) {
             std::thread::scope(|scope| {
                 let handles: Vec<_> = batch.iter().map(|(target, installed)| scope.spawn(move || {
-                    let plan = match plan(&self.config, target) { Ok(plan) => plan, Err(e) => { eprintln!("Warning: Source check for '{target}' failed: {e}; package held at installed version"); return None; } };
-                    if alpm::vercmp(plan.version.as_str(), installed.as_str()).is_gt() { Some(plan) } else { None }
+                    let plan = plan(&self.config, target).map_err(|e| format!("Source '{target}': {e}"))?;
+                    Ok::<_, String>(if alpm::vercmp(plan.version.as_str(), installed.as_str()).is_gt() { Some(plan) } else { None })
                 })).collect();
                 for handle in handles {
-                    if let Ok(Some(plan)) = handle.join() {
-                        plans.push(plan);
+                    match handle.join() {
+                        Ok(Ok(Some(plan))) => plans.push(plan), Ok(Ok(None)) => {},
+                        Ok(Err(error)) => errors.push(error), Err(_) => errors.push("Source check worker failed".into()),
                     }
                 }
             });
         }
+        if !errors.is_empty() { self.approved.lock().unwrap_or_else(|e| e.into_inner()).clear(); return Err(io::Error::other(errors.join("; "))); }
         let updates = plans
             .iter()
             .map(|p| ExternalUpdate {
@@ -86,10 +77,11 @@ impl IntegrationProvider for SourceProvider {
                 name: p.name.clone(),
                 repo: p.alias.clone(),
                 version: p.version.clone(),
+                ..ExternalUpdate::default()
             })
             .collect();
         *self.approved.lock().unwrap_or_else(|e| e.into_inner()) = plans;
-        updates
+        Ok(updates)
     }
     fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String {
         format!(

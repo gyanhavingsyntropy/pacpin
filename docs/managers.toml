@@ -1,0 +1,58 @@
+# pacpin manager adapters, schema version 1. Commands are literal argv arrays.
+# Edit this file; pacpin never rewrites it. Missing enabled preserves config.toml
+# integration selection. Set enabled = true/false to explicitly select a manager.
+version = 1
+
+[managers.pacman]
+adapter = "pacman"
+# privilege_tool = "pkexec" # sudo, pkexec, doas
+# Typed adapter owns: pacman -Sy, -S --needed -- TARGETS, -Rn, -Scc.
+# It retains ALPM planning, locks, root/cache space checks and privilege routing.
+
+[managers.aur]
+adapter = "aur"
+# helper = "paru" # supported helper name or trusted absolute executable path
+# Typed adapter owns: paru -S -- TARGETS, -Scc --aur, --clonedir for scratch.
+# Builds remain unprivileged; pacman dependency/install stages elevate separately.
+
+[managers.flatpak]
+adapter = "flatpak"
+# These are the adapter's default commands. Upgrade runs once per approved ref.
+upgrade = ["flatpak", "update", "-y", "{scope}", "--commit={revision}", "--", "{id}"]
+clean = ["flatpak", "uninstall", "--unused", "-y"]
+# --use-ram/--use-storage/--no-cache are unsupported until a mapping is declared.
+# Pruning installed runtimes is NOT cache cleanup; no cache_cleanup default.
+
+[managers.nix]
+adapter = "nix"
+upgrade = ["nix", "profile", "upgrade", "--override-flake", "{scope}", "{revision}", "--", "{id}"]
+clean = ["nix-collect-garbage"] # unreferenced store paths; preserves generations
+# Modern flake-backed profiles only. No automatic switch to nix-env after errors.
+# RAM build location is daemon policy; TMPDIR alone cannot move /nix/store.
+
+[managers.pipx]
+adapter = "pipx"
+upgrade = ["pipx", "upgrade", "--", "{id}"]
+no_cache_args = ["--pip-args=--no-cache-dir"]
+
+# Custom adapter example (uncomment, supply your own wrapper, then enable):
+# [managers.my-manager]
+# adapter = "command"
+# enabled = true
+# check = ["/absolute/path/my-manager-check"]
+# verify = ["/absolute/path/my-manager-verify", "{id}", "{version}"] # exit 0 only for the installed target
+# upgrade = ["my-manager", "upgrade", "--", "{id}", "{version}"]
+# upgrade_ram = ["my-manager", "upgrade", "--", "{id}", "{version}"]
+# upgrade_storage = ["my-manager", "upgrade", "--", "{id}", "{version}"]
+# scratch_mib = 256 # declared temporary footprint; final installation needs space
+# no_cache_args = ["--no-cache"] # inserted before any '--' target separator
+# cache_cleanup = ["my-manager", "clean-cache"] # successful transactions only
+# clean = ["my-manager", "prune-unused"] # explicit pin clean, separate operation
+# Check JSON: [{"id":"app","name":"App","repo":"repo","version":"2"}]
+# Optional installed_version/revision/scope fields are supported.
+
+# User flag example: pin -Syu --nix.collect-garbage
+# Runs after successful Nix work, is previewed, and never reaches pacman/paru.
+# [managers.nix.flags.collect-garbage]
+# command = ["nix-collect-garbage"]
+# args = [] # optional arguments added to only this manager's upgrade command

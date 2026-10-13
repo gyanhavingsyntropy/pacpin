@@ -164,6 +164,14 @@ impl PackageManifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Config {
+    #[serde(skip)]
+    pub manager_file: crate::manager_config::ManagerFile,
+    #[serde(skip)]
+    pub manager_base_options: Option<Options>,
+    #[serde(skip)]
+    pub external_sources: BTreeMap<String, crate::sources::Source>,
+    #[serde(skip)]
+    pub external_hooks: BTreeMap<String, crate::hooks::Hook>,
     #[serde(default)]
     pub hooks: BTreeMap<String, crate::hooks::Hook>,
     #[serde(default)]
@@ -241,10 +249,7 @@ pub fn config_exists() -> bool {
 
 pub fn load_config() -> Config {
     let path = get_config_path();
-    if !path.exists() {
-        return Config::default();
-    }
-    let mut config: Config = match fs::read_to_string(&path) {
+    let mut config: Config = if !path.exists() { Config::default() } else { match fs::read_to_string(&path) {
         Ok(contents) => match toml::from_str(&contents) {
             Ok(cfg) => cfg,
             Err(e) => {
@@ -275,7 +280,12 @@ pub fn load_config() -> Config {
             );
             std::process::exit(1);
         }
-    };
+    }};
+
+    if let Err(error) = load_supplements(&mut config, &path) {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
 
     if let Err(e) = crate::hooks::validate(&config) {
         eprintln!("Error: Invalid post-update hook configuration: {e}");
@@ -296,6 +306,52 @@ pub fn load_config() -> Config {
     }
 
     config
+}
+
+fn load_supplements(config: &mut Config, path: &Path) -> Result<(), String> {
+    #[derive(Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SourcesFile {
+        #[serde(default)]
+        sources: BTreeMap<String, crate::sources::Source>,
+    }
+    #[derive(Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct HooksFile {
+        #[serde(default)]
+        hooks: BTreeMap<String, crate::hooks::Hook>,
+    }
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    config.manager_file = crate::manager_config::read_optional(&directory.join("managers.toml"))?;
+    crate::manager_config::validate(&config.manager_file)?;
+    let sources: SourcesFile = crate::manager_config::read_optional(&directory.join("sources.toml"))?;
+    for (alias, source) in &sources.sources {
+        if config.sources.contains_key(alias) { return Err(format!("Source alias '{alias}' is defined in both config.toml and sources.toml; keep one definition")); }
+        config.sources.insert(alias.clone(), source.clone());
+    }
+    config.external_sources = sources.sources;
+    let hooks: HooksFile = crate::manager_config::read_optional(&directory.join("hooks.toml"))?;
+    for (name, hook) in &hooks.hooks {
+        if config.hooks.contains_key(name) { return Err(format!("Hook '{name}' is defined in both config.toml and hooks.toml; keep one definition")); }
+        config.hooks.insert(name.clone(), hook.clone());
+    }
+    config.external_hooks = hooks.hooks;
+    config.manager_base_options = Some(config.options.clone());
+    if let Some(definition) = config.manager_file.managers.get("pacman") {
+        if let Some(tool) = &definition.privilege_tool { config.options.privilege_tool = tool.clone(); }
+    }
+    if let Some(definition) = config.manager_file.managers.get("aur") {
+        if let Some(helper) = &definition.helper { config.options.helper = helper.clone(); }
+    }
+    Ok(())
+}
+
+pub fn supplemental_defaults() -> Result<Config, String> {
+    let mut config = Config::default();
+    load_supplements(&mut config, &get_config_path())?;
+    crate::hooks::validate(&config)?;
+    crate::sources::validate_config(&config)?;
+    Ok(config)
 }
 
 pub fn save_config(config: &Config) -> Result<(), std::io::Error> {
@@ -321,6 +377,7 @@ where
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
         Err(e) => return Err(format!("Failed to read configuration: {}", e)),
     };
+    load_supplements(&mut cfg, path)?;
     let res = f(&mut cfg)?;
     write_config_unlocked(&cfg, path)
         .map_err(|e| format!("Failed to save configuration: {}", e))?;
@@ -383,7 +440,22 @@ pub fn save_config_to_path(config: &Config, path: &Path) -> Result<(), std::io::
 fn write_config_unlocked(config: &Config, path: &Path) -> Result<(), std::io::Error> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
 
-    let toml_str = toml::to_string_pretty(config)
+    let mut persistent = config.clone();
+    if let Some(base) = &config.manager_base_options {
+        if config.manager_file.managers.get("pacman").is_some_and(|d| d.privilege_tool.is_some()) { persistent.options.privilege_tool = base.privilege_tool.clone(); }
+        if config.manager_file.managers.get("aur").is_some_and(|d| d.helper.is_some()) { persistent.options.helper = base.helper.clone(); }
+    }
+    for (alias, original) in &config.external_sources {
+        if persistent.sources.remove(alias).as_ref() != Some(original) {
+            return Err(std::io::Error::other(format!("Source '{alias}' is owned by sources.toml; edit that file directly")));
+        }
+    }
+    for (name, original) in &config.external_hooks {
+        if persistent.hooks.remove(name).as_ref() != Some(original) {
+            return Err(std::io::Error::other(format!("Hook '{name}' is owned by hooks.toml; edit that file directly")));
+        }
+    }
+    let toml_str = toml::to_string_pretty(&persistent)
         .map_err(std::io::Error::other)?;
 
     use std::io::Write;
@@ -651,5 +723,33 @@ mod tests {
         assert!(!leftover);
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn supplements_merge_without_being_copied_into_the_main_config() {
+        let directory = std::env::temp_dir().join(format!("pacpin-supplements-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        fs::write(&path, "[pins]\napp='local'\n").unwrap();
+        let source = "[sources.local]\nkind='local'\nurl='/tmp/catalog.json'\npackages={}\n";
+        let hook = "[hooks.example]\nwatch=['mutter']\naction='script'\ncommand=['/usr/bin/true']\n";
+        fs::write(directory.join("sources.toml"), source).unwrap();
+        fs::write(directory.join("hooks.toml"), hook).unwrap();
+        fs::write(directory.join("managers.toml"), "[managers.pacman]\nadapter='pacman'\nprivilege_tool='pkexec'\n[managers.aur]\nadapter='aur'\nhelper='yay'\n").unwrap();
+        let mut config: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        load_supplements(&mut config, &path).unwrap();
+        assert_eq!(config.sources.len(), 1); assert_eq!(config.hooks.len(), 1);
+        assert_eq!(config.options.privilege_tool, "pkexec"); assert_eq!(config.options.helper, "yay");
+        mutate_config_at(&path, |config| { config.pins.insert("another".into(), "extra".into()); Ok(()) }).unwrap();
+        let persisted: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(persisted.sources.is_empty()); assert!(persisted.hooks.is_empty());
+        assert_eq!(persisted.options.privilege_tool, "sudo"); assert_eq!(persisted.options.helper, "paru");
+        assert_eq!(fs::read_to_string(directory.join("sources.toml")).unwrap(), source);
+        assert_eq!(fs::read_to_string(directory.join("hooks.toml")).unwrap(), hook);
+        let mut duplicate = Config { sources: config.sources.clone(), ..Config::default() };
+        assert!(load_supplements(&mut duplicate, &path).is_err());
+        let mut changed = config; changed.sources.remove("local");
+        assert!(save_config_to_path(&changed, &path).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

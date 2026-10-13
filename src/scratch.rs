@@ -21,14 +21,39 @@ pub fn initialize(policy: Policy) {
 pub fn policy() -> Policy {
     POLICY.get().copied().unwrap_or_default()
 }
+
+/// Private temporary workspace shared by user-configured manager adapters.
+pub struct Workspace { pub path: PathBuf }
+impl Workspace {
+    pub fn create(policy: Policy, bytes: u64) -> Result<Self, String> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let base = choose(policy, bytes, 128)?;
+        let mut template = base.join("pacpin-manager-XXXXXX").as_os_str().as_bytes().to_vec();
+        template.push(0);
+        if unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) }.is_null() { return Err(io::Error::last_os_error().to_string()); }
+        template.pop();
+        let path = PathBuf::from(std::ffi::OsString::from_vec(template));
+        crate::sandbox::register_cleanup_target(path.clone());
+        Ok(Self { path })
+    }
+}
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+        crate::sandbox::unregister_cleanup_target(&self.path);
+    }
+}
 pub fn describe_plan(has_sources: bool, has_aur: bool) -> Option<String> {
+    describe_managers(has_sources, has_aur, &[])
+}
+pub fn describe_managers(has_sources: bool, has_aur: bool, external: &[&str]) -> Option<String> {
     if policy() == Policy::Auto { return None; }
-    let managers = match (has_sources, has_aur) {
-        (true, true) => "Sources / Paru",
-        (true, false) => "Sources",
-        (false, true) => "Paru",
-        (false, false) => return Some("Scratch preference unused: this plan has no AUR or Sources workspace.".into()),
-    };
+    let mut managers = Vec::new();
+    if has_sources { managers.push("Sources"); }
+    if has_aur { managers.push("Paru"); }
+    managers.extend_from_slice(external);
+    if managers.is_empty() { return Some("Scratch preference unused: this plan has no temporary build workspace.".into()); }
+    let managers = managers.join(" / ");
     Some(format!("{:?} temporary workspace for {managers}; root installation space remains required.", policy()))
 }
 #[derive(Clone, Copy, Debug)]
@@ -150,11 +175,14 @@ pub fn mem_available_bytes() -> Option<u64> {
 }
 
 pub fn bases(policy: Policy) -> Vec<PathBuf> {
-    match policy {
+    let mut bases: Vec<PathBuf> = match policy {
         Policy::Auto => vec![std::env::temp_dir(), "/var/tmp".into()],
         Policy::Ram => vec![std::env::temp_dir(), "/tmp".into(), "/dev/shm".into()],
         Policy::Storage => vec![std::env::temp_dir(), "/var/tmp".into()],
-    }
+    };
+    let mut seen = std::collections::HashSet::new();
+    bases.retain(|base| seen.insert(base.clone()));
+    bases
 }
 pub fn accepts(policy: Policy, space: Capacity) -> bool {
     match policy {

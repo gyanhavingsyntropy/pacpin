@@ -129,6 +129,11 @@ pub fn cmd_check(config: &Config, args: &[String]) {
     }
 
     let mut res = resolver.resolve_with_options(config, skip_aur);
+    if !res.check_errors.is_empty() {
+        eprintln!("Error: Update check incomplete: {}", res.check_errors.join("; "));
+        if let Some(handle) = ext_handle { let _ = handle.join(); }
+        exit(1);
+    }
 
     if aur_only {
         res.updates.retain(|u| {
@@ -147,8 +152,12 @@ pub fn cmd_check(config: &Config, args: &[String]) {
     };
 
     let external_updates = ext_handle
-        .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
+        .map(|h| h.join().unwrap_or_else(|_| Err(std::io::Error::other("External update worker failed"))))
+        .unwrap_or_else(|| Ok(Vec::new()));
+    let external_updates = match external_updates {
+        Ok(updates) => updates,
+        Err(error) => { eprintln!("Error: {error}"); exit(1); }
+    };
 
     if quiet {
         for p in &res.updates {

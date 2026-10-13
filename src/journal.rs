@@ -23,6 +23,45 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Read backwards from a length snapshot. Bounded chunks/lines avoid scanning
+/// old history or allocating an unbounded malformed tail. Keep chronological
+/// order and ignore partial or malformed records, as the previous reader did.
+fn recent_records(mut file: fs::File, limit: usize) -> std::io::Result<Vec<TransactionRecord>> {
+    use std::io::{Read, Seek, SeekFrom};
+    if limit == 0 { return Ok(Vec::new()); }
+    let mut position = file.metadata()?.len();
+    let mut block = [0u8; 65536];
+    let mut line = Vec::new();
+    let mut oversized = false;
+    let mut records = Vec::new();
+    loop {
+        let count = position.min(block.len() as u64) as usize;
+        position -= count as u64;
+        file.seek(SeekFrom::Start(position))?;
+        file.read_exact(&mut block[..count])?;
+        for &byte in block[..count].iter().rev() {
+            if byte == b'\n' {
+                if !oversized && !line.is_empty() {
+                    line.reverse();
+                    if let Ok(record) = serde_json::from_slice(&line) { records.push(record); }
+                }
+                line.clear(); oversized = false;
+                if records.len() == limit { records.reverse(); return Ok(records); }
+            } else if !oversized {
+                if line.len() == 8 * 1024 * 1024 { line.clear(); oversized = true; }
+                else { line.push(byte); }
+            }
+        }
+        if position == 0 {
+            if !oversized && !line.is_empty() {
+                line.reverse();
+                if let Ok(record) = serde_json::from_slice(&line) { records.push(record); }
+            }
+            records.reverse(); return Ok(records);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionRecord {
     pub id: usize,
@@ -224,6 +263,7 @@ impl TransactionJournal {
     }
 
     pub fn list_transactions(limit: usize) -> Vec<TransactionRecord> {
+        if limit == 0 { return Vec::new(); }
         let history_file = match Self::history_file() {
             Ok(f) => f,
             Err(_) => return Vec::new(),
@@ -232,20 +272,7 @@ impl TransactionJournal {
             return Vec::new();
         }
 
-        let mut txs = std::collections::VecDeque::with_capacity(limit);
-        if let Ok(file) = fs::File::open(&history_file) {
-            let reader = BufReader::new(file);
-            for line in reader.lines().map_while(Result::ok) {
-                if let Ok(record) = serde_json::from_str::<TransactionRecord>(&line) {
-                    if txs.len() == limit {
-                        txs.pop_front();
-                    }
-                    txs.push_back(record);
-                }
-            }
-        }
-
-        txs.into_iter().collect()
+        fs::File::open(&history_file).and_then(|file| recent_records(file, limit)).unwrap_or_default()
     }
 
     pub fn get_transaction(tx_id: usize) -> Option<TransactionRecord> {
@@ -291,12 +318,16 @@ impl TransactionJournal {
         } else {
             txs.iter()
                 .rev()
-                .find(|t| t.action == "upgrade" || t.action == "install")
+                .find(|t| t.action == "upgrade" || t.action == "install" || t.action == "external-upgrade")
                 .cloned()
                 .unwrap_or_else(|| txs.last().unwrap().clone())
         };
 
         let t_id = target_tx.id;
+        if target_tx.packages.iter().any(|package| package.get("manager").is_some()) {
+            eprintln!("Error: Transaction #{t_id} contains external-manager updates. Native cache rollback cannot restore these; use the manager's recovery mechanism.");
+            std::process::exit(2);
+        }
         println!(
             "\n{} ({} — {})",
             format!("Rolling Back Transaction #{}", t_id).bold(),
@@ -479,6 +510,13 @@ mod tests {
         let contents = fs::read_to_string(&path).unwrap();
         let ids: Vec<_> = contents.lines().filter_map(|line| serde_json::from_str::<TransactionRecord>(line).ok()).map(|r| r.id).collect();
         assert_eq!(ids, [1, 2, 3]);
+        let recent = recent_records(fs::File::open(&path).unwrap(), 2).unwrap();
+        assert_eq!(recent.iter().map(|r| r.id).collect::<Vec<_>>(), [2, 3]);
+        let mut tail = OpenOptions::new().append(true).open(&path).unwrap();
+        tail.write_all(b"malformed\n{\"partial\":").unwrap(); drop(tail);
+        assert_eq!(recent_records(fs::File::open(&path).unwrap(), 1).unwrap()[0].id, 3);
+        assert_eq!(recent_records(fs::File::open(&path).unwrap(), 100).unwrap().len(), 3);
+        assert!(recent_records(fs::File::open(&path).unwrap(), 0).unwrap().is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 

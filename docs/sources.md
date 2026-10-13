@@ -50,7 +50,7 @@ explicit `gitlab:https://host/group/project` form. That shorthand assumes a
 root-mounted GitLab instance; for installations under a URL subpath or a custom
 API base, use a configured `[sources]` GitLab source with its exact `url`.
 
-Add to `~/.config/pacpin/config.toml`:
+Add to `~/.config/pacpin/sources.toml` (existing recipes in `config.toml` also work):
 
 ```toml
 [sources.codex-alpha]

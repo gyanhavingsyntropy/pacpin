@@ -42,13 +42,14 @@ fn token(source: &Source) -> Result<Option<String>, String> {
 /// forward credentials to another origin. Private cross-origin downloads must
 /// use a pre-authorized asset URL rather than ambient tokens.
 pub fn request(url: &str, auth: Option<&str>, origin: &Url) -> Result<ureq::Response, String> {
-    let agent = ureq::AgentBuilder::new()
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    let agent = AGENT.get_or_init(|| ureq::AgentBuilder::new()
         .redirects(0)
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(60))
         .timeout_write(Duration::from_secs(30))
         .timeout(Duration::from_secs(600))
-        .build();
+        .build());
     let mut current = https_url(url)?;
     for _ in 0..6 {
         let mut req = agent
