@@ -21,6 +21,30 @@ use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 
+const MAX_METADATA_BYTES: u64 = 10 * 1024 * 1024;
+
+fn pypi_version(reader: impl std::io::Read, limit: u64) -> std::io::Result<String> {
+    use std::io::Read;
+    #[derive(Deserialize)]
+    struct Metadata { info: Info }
+    #[derive(Deserialize)]
+    struct Info { version: String }
+    let mut body = Vec::new();
+    reader.take(limit.saturating_add(1)).read_to_end(&mut body)?;
+    if body.len() as u64 > limit {
+        return Err(std::io::Error::other("PyPI metadata exceeds size limit"));
+    }
+    // Skip the potentially large release history instead of constructing a
+    // serde_json::Value tree for data the update check never uses.
+    let metadata: Metadata = serde_json::from_slice(&body).map_err(std::io::Error::other)?;
+    let version = metadata.info.version;
+    if version.is_empty() || version.len() > 256 || !version.chars().all(|c|
+        c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | '!')) {
+        return Err(std::io::Error::other("Invalid PyPI version"));
+    }
+    Ok(version)
+}
+
 fn flatpak_cache_file() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     flatpak_cache_file_in(std::path::Path::new(&home))
@@ -34,10 +58,55 @@ fn flatpak_cache_file_in(home: &std::path::Path) -> Option<std::path::PathBuf> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if std::fs::metadata(&dir).ok()?.uid() != unsafe { libc::geteuid() } {
+            return None;
+        }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
     }
     Some(dir.join("flatpak_updates.json"))
+}
+
+fn read_flatpak_cache(path: &std::path::Path) -> Option<Vec<ExternalUpdate>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.modified().ok()?.elapsed().ok()?.as_secs() >= 120 {
+        return None;
+    }
+    let mut content = Vec::new();
+    file.take(MAX_METADATA_BYTES + 1).read_to_end(&mut content).ok()?;
+    if content.len() as u64 > MAX_METADATA_BYTES { return None; }
+    let mut cached: Vec<ExternalUpdate> = serde_json::from_slice(&content).ok()?;
+    for update in &mut cached {
+        if update.runner != "Flatpak" { return None; }
+        update.id = crate::utils::sanitize_display_text(&update.id);
+        update.name = crate::utils::sanitize_display_text(&update.name);
+        update.repo = crate::utils::sanitize_display_text(&update.repo);
+        update.version = crate::utils::sanitize_display_text(&update.version);
+    }
+    Some(cached)
+}
+
+fn write_flatpak_cache(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = path.parent().ok_or_else(|| std::io::Error::other("Cache has no parent"))?;
+    let temporary = crate::download::create_secure_temp_file(parent, ".flatpak-updates", "tmp")
+        .map_err(std::io::Error::other)?;
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new().write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(&temporary)?;
+        file.write_all(content)?;
+        drop(file);
+        // Rename replaces a destination symlink itself; it never truncates the
+        // symlink target. Readers see either the previous or complete new cache.
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+    result
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,18 +169,8 @@ impl IntegrationProvider for FlatpakProvider {
     fn check_updates(&self) -> Vec<ExternalUpdate> {
         let cache_file = flatpak_cache_file();
         if let Some(path) = cache_file.as_ref() {
-            if let Ok(metadata) = std::fs::metadata(path) {
-                if let Ok(mtime) = metadata.modified() {
-                    if let Ok(elapsed) = mtime.elapsed() {
-                        if elapsed.as_secs() < 120 {
-                            if let Ok(content) = std::fs::read_to_string(path) {
-                                if let Ok(cached) = serde_json::from_str::<Vec<ExternalUpdate>>(&content) {
-                                    return cached;
-                                }
-                            }
-                        }
-                    }
-                }
+            if let Some(cached) = read_flatpak_cache(path) {
+                return cached;
             }
         }
 
@@ -151,7 +210,7 @@ impl IntegrationProvider for FlatpakProvider {
             }
         }
         if let (Some(path), Ok(serialized)) = (cache_file, serde_json::to_string(&results)) {
-            let _ = std::fs::write(path, serialized);
+            let _ = write_flatpak_cache(&path, serialized.as_bytes());
         }
         results
     }
@@ -330,15 +389,9 @@ impl IntegrationProvider for PipxProvider {
                                             format!("https://pypi.org/pypi/{}/json", app_name);
                                         if let Ok(resp) = agent_clone.get(&pypi_url).call() {
                                             if resp.status() == 200 {
-                                                if let Ok(json) =
-                                                    resp.into_json::<serde_json::Value>()
-                                                {
-                                                    if let Some(latest_ver) = json
-                                                        .get("info")
-                                                        .and_then(|info| info.get("version"))
-                                                        .and_then(|v| v.as_str())
-                                                    {
-                                                        if alpm::vercmp(latest_ver, installed_ver)
+                                                match pypi_version(resp.into_reader(), MAX_METADATA_BYTES) {
+                                                    Ok(latest_ver) => {
+                                                        if alpm::vercmp(latest_ver.as_str(), installed_ver)
                                                             == std::cmp::Ordering::Greater
                                                         {
                                                             worker_results.push(ExternalUpdate {
@@ -346,10 +399,11 @@ impl IntegrationProvider for PipxProvider {
                                                                 id: app_name.clone(),
                                                                 name: app_name.clone(),
                                                                 repo: "pypi".to_string(),
-                                                                version: latest_ver.to_string(),
+                                                                version: latest_ver,
                                                             });
                                                         }
                                                     }
+                                                    Err(_) => eprintln!(":: Warning: Pipx update check rejected oversized or invalid PyPI metadata; some applications were not checked."),
                                                 }
                                             }
                                         }
@@ -640,6 +694,50 @@ mod tests {
     use super::*;
 
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn flatpak_cache_never_follows_a_file_symlink_and_writes_atomically() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let fixture = crate::db::test_support::AlpmFixture::new(&[], &[]);
+        let root = std::path::PathBuf::from(fixture.manager.handle().dbpath());
+        let cache = root.join("flatpak.json");
+        let sentinel = root.join("keep");
+        std::fs::write(&sentinel, b"preserve").unwrap();
+        symlink(&sentinel, &cache).unwrap();
+        assert!(read_flatpak_cache(&cache).is_none());
+        write_flatpak_cache(&cache, b"[]").unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+        assert!(!std::fs::symlink_metadata(&cache).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::metadata(&cache).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(read_flatpak_cache(&cache).unwrap().is_empty());
+        // Never block on a FIFO that occupies the cache filename.
+        std::fs::remove_file(&cache).unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(cache.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_flatpak_cache(&cache).is_none());
+        std::fs::remove_file(&cache).unwrap();
+        std::fs::create_dir(&cache).unwrap();
+        assert!(write_flatpak_cache(&cache, b"[]").is_err());
+        assert!(!std::fs::read_dir(&root).unwrap().flatten().any(|entry| entry.file_name().to_string_lossy().starts_with(".flatpak-updates-")));
+    }
+
+    #[test]
+    fn pypi_metadata_is_bounded_and_only_retains_the_version() {
+        let body = br#"{"info":{"version":"1!2.0rc1+local"},"releases":{"old":[{"unused":"data"}]}}"#;
+        assert_eq!(pypi_version(body.as_slice(), body.len() as u64).unwrap(), "1!2.0rc1+local");
+        assert!(pypi_version(body.as_slice(), body.len() as u64 - 1).is_err());
+        assert!(pypi_version(b"{}".as_slice(), 100).is_err());
+        assert!(pypi_version(b"invalid".as_slice(), 100).is_err());
+        for version in ["", "1.0\u{1b}[2J", "1.0\nspoofed", "1.0/escape"] {
+            let body = serde_json::json!({"info":{"version":version}}).to_string();
+            assert!(pypi_version(body.as_bytes(), 1024).is_err());
+        }
+        // A valid JSON document followed by an oversized whitespace body must
+        // also be rejected, rather than treating a truncated prefix as complete.
+        let body = format!("{{\"info\":{{\"version\":\"1.0\"}}}}{}", " ".repeat(200));
+        assert!(pypi_version(body.as_bytes(), 100).is_err());
+    }
 
     #[test]
     fn test_external_update_struct() {

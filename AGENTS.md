@@ -59,6 +59,15 @@
 - Respect the configured/runtime privilege tool in refresh, install, remove, orphan removal, keep, rollback and forwarding paths. Do not pass sudo-only validation/noninteractive flags to pkexec or doas. Helpers and makepkg remain unprivileged.
 - Back these contracts with regression tests and real terminal checks in the disposable VM: new-dependency counts and ordering, long/narrow selectors, one Enter, background download status, completed manager rows, failed native extraction with possible partial application, failed cleanup exit codes, cleanup ordering and storage refusal. Record which failures were injected; a native download failure does not exercise extraction failure.
 
+## Security and resource checks
+
+- Audit locked Rust dependencies with `cargo audit` when reviewing security. Record the advisory database revision and distinguish advisories from yanked or unmaintained releases. This does not audit system libraries such as libarchive or libalpm.
+- Bound remote metadata and cache reads before parsing, including decompressed HTTP bodies. Deserialize only fields needed by the caller. Reject control characters in remote versions and sanitize cached display fields too.
+- Resolve symlinks component by component in filesystem order, including intermediate links before `..`. Lexical normalization and checking only the last component do not prove confinement. Fail on inspection errors; test intermediate-link escapes, absolute links, cycles and safe dangling links.
+- Hash regular files through the download boundary with bounded streaming buffers. Refuse symlink/device/FIFO inputs and keep cancellation checks; checksum correctness must not depend on external program output or filename escaping.
+- Cache writes must atomically replace the destination without following a file symlink. Check private directory ownership, bound reads, use exclusive private temporary files, and remove them on failure. Test an unrelated sentinel file and cache hits to cover both safety and avoiding repeated discovery.
+- Security review evidence must state the trust boundary and verification limits. Checksums establish integrity, not publisher trust; successful unit tests are not a claim that every package manager or integration was exercised.
+
 ## Required verification after code changes
 
 Use `PATH="$HOME/.cargo/bin:$PATH"` for Rust commands. Run:

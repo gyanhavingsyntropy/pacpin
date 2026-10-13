@@ -1,6 +1,8 @@
-use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,22 +11,26 @@ use colored::Colorize;
 
 /// Computes the SHA256 checksum of a file.
 pub fn compute_sha256(path: &Path) -> Result<String, String> {
-    let out = Command::new("sha256sum")
-        .arg(path)
-        .output()
-        .map_err(|e| format!("Failed to run sha256sum: {}", e))?;
-
-    if !out.status.success() {
-        return Err(format!("sha256sum failed for '{}'", path.display()));
+    use sha2::{Digest, Sha256};
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| format!("Cannot open checksum input: {e}"))?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Checksum input must be a regular file".into());
     }
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let hash = stdout.split_whitespace().next().unwrap_or("").to_lowercase();
-    if hash.is_empty() {
-        return Err(format!("Empty hash returned for '{}'", path.display()));
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        if crate::sandbox::is_terminating() {
+            return Err("Checksum verification interrupted".into());
+        }
+        let count = file.read(&mut buffer).map_err(|e| format!("Cannot read checksum input: {e}"))?;
+        if count == 0 { break; }
+        hash.update(&buffer[..count]);
     }
-
-    Ok(hash)
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 /// Creates a secure temporary file with 0600 permissions.
@@ -393,98 +399,57 @@ pub fn extract_archive(archive_path: &Path, target_dir: &Path) -> Result<(), Str
 /// Traverses all symlinks in the extracted root to verify they do not escape the sandbox
 /// root and do not contain circular loops or exceed maximum link depth.
 pub fn validate_symlink_traversal(root: &Path, max_depth: usize) -> Result<(), String> {
-    fn walk_dir(current_dir: &Path, root: &Path, max_depth: usize) -> Result<(), String> {
-        let entries = match fs::read_dir(current_dir) {
-            Ok(e) => e,
-            Err(_) => return Ok(()),
-        };
-
-        let root_components: Vec<_> = root
-            .components()
-            .filter_map(|c| match c {
-                std::path::Component::Normal(n) => Some(n),
-                _ => None,
-            })
-            .collect();
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-
-            if file_type.is_symlink() {
-                let mut current = path.clone();
-                let mut visited = HashSet::new();
-                let mut depth = 0;
-
-                while let Ok(target) = fs::read_link(&current) {
-                    depth += 1;
-                    if depth > max_depth {
-                        return Err(format!(
-                            "Security violation: Symlink '{}' exceeds maximum link depth of {} (circular loop detected).",
-                            path.display(),
-                            max_depth
-                        ));
+    // Resolve components in filesystem order. Lexically collapsing `..` first
+    // is unsafe: `dir/alias/../../outside` escapes when alias points to `.`.
+    fn resolve_link(path: &Path, root: &Path, max_depth: usize) -> Result<(), String> {
+        let relative = path.strip_prefix(root).map_err(|_| "Link outside sandbox root")?;
+        let mut pending: VecDeque<_> = relative.components().map(|c| c.as_os_str().to_owned()).collect();
+        let mut resolved = root.to_path_buf();
+        let mut followed = 0usize;
+        while let Some(component) = pending.pop_front() {
+            if component == "." { continue; }
+            if component == ".." {
+                if resolved == root {
+                    return Err("Security violation: Symlink resolves outside sandbox root".into());
+                }
+                resolved.pop();
+                continue;
+            }
+            resolved.push(component);
+            match fs::symlink_metadata(&resolved) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    followed += 1;
+                    if followed > max_depth {
+                        return Err("Security violation: Circular symlink loop or maximum link depth exceeded".into());
                     }
-
-                    let mut norm_components = if target.is_absolute() {
-                        root_components.clone()
-                    } else {
-                        current
-                            .parent()
-                            .unwrap_or(root)
-                            .components()
-                            .filter_map(|c| match c {
-                                std::path::Component::Normal(n) => Some(n),
-                                _ => None,
-                            })
-                            .collect()
-                    };
-
-                    let mut escaped = false;
-                    for comp in target.components() {
-                        match comp {
-                            std::path::Component::ParentDir => {
-                                if norm_components.len() <= root_components.len() {
-                                    escaped = true;
-                                    break;
-                                }
-                                norm_components.pop();
-                            }
-                            std::path::Component::Normal(c) => {
-                                norm_components.push(c);
-                            }
-                            _ => {}
-                        }
+                    let target = fs::read_link(&resolved).map_err(|e| format!("Cannot read extracted symlink: {e}"))?;
+                    if target.is_absolute() {
+                        return Err("Security violation: Absolute symlink resolves outside sandbox root".into());
                     }
-
-                    if escaped || !norm_components.starts_with(&root_components) {
-                        return Err(format!(
-                            "Security violation: Symlink '{}' resolves to path outside sandbox root.",
-                            path.display()
-                        ));
-                    }
-
-                    let mut resolved = PathBuf::from("/");
-                    for c in &norm_components {
-                        resolved.push(c);
-                    }
-
-                    if !visited.insert(resolved.clone()) {
-                        return Err(format!(
-                            "Security violation: Circular symlink loop detected involving '{}'.",
-                            path.display()
-                        ));
-                    }
-
-                    if resolved.is_symlink() {
-                        current = resolved;
-                    } else {
-                        break;
+                    resolved.pop();
+                    for part in target.components().rev() {
+                        pending.push_front(part.as_os_str().to_owned());
                     }
                 }
+                Ok(_) => {}
+                // Dangling relative links are permitted, but their remaining
+                // components still must not traverse above the extraction root.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("Cannot inspect extracted symlink target: {e}")),
+            }
+        }
+        Ok(())
+    }
+
+    fn walk_dir(current_dir: &Path, root: &Path, max_depth: usize) -> Result<(), String> {
+        let entries = fs::read_dir(current_dir).map_err(|e| format!("Cannot inspect extracted directory: {e}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Cannot inspect extracted entry: {e}"))?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|e| format!("Cannot inspect extracted file type: {e}"))?;
+
+            if file_type.is_symlink() {
+                resolve_link(&path, root, max_depth)?;
             } else if file_type.is_dir() {
                 walk_dir(&path, root, max_depth)?;
             }
@@ -492,12 +457,68 @@ pub fn validate_symlink_traversal(root: &Path, max_depth: usize) -> Result<(), S
         Ok(())
     }
 
-    walk_dir(root, root, max_depth)
+    let root = root.canonicalize().map_err(|e| format!("Cannot resolve extraction root: {e}"))?;
+    walk_dir(&root, &root, max_depth)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_streams_regular_files_and_rejects_links_and_special_files() {
+        let root = test_dir("sha256");
+        // Coreutils escapes newline-containing filenames in its text output;
+        // checksum verification must depend only on the file's bytes.
+        let input = root.join("--unusual\nname");
+        fs::write(&input, b"abc").unwrap();
+        assert_eq!(compute_sha256(&input).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        let large = vec![b'a'; 200_000];
+        fs::write(&input, &large).unwrap();
+        use sha2::{Digest, Sha256};
+        assert_eq!(compute_sha256(&input).unwrap(), format!("{:x}", Sha256::digest(&large)));
+        std::os::unix::fs::symlink(&input, root.join("link")).unwrap();
+        assert!(compute_sha256(&root.join("link")).is_err());
+        assert!(compute_sha256(&root).is_err());
+        let fifo = root.join("fifo");
+        use std::os::unix::ffi::OsStrExt;
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        assert!(compute_sha256(&fifo).is_err());
+        assert!(compute_sha256(&root.join("missing")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn symlink_validation_resolves_intermediate_links_before_parent_components() {
+        let root = test_dir("intermediate-link");
+        let payload = root.join("payload");
+        fs::create_dir_all(payload.join("dir")).unwrap();
+        fs::write(root.join("outside"), b"must not be reachable").unwrap();
+        std::os::unix::fs::symlink(".", payload.join("dir/alias")).unwrap();
+        std::os::unix::fs::symlink("dir/alias/../../outside", payload.join("escape")).unwrap();
+        // Linux resolves this lexically innocent path outside the payload.
+        assert_eq!(payload.join("escape").canonicalize().unwrap(), root.join("outside"));
+        assert!(validate_symlink_traversal(&payload, 32).unwrap_err().contains("outside sandbox root"));
+        fs::remove_file(payload.join("escape")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", payload.join("absolute")).unwrap();
+        assert!(validate_symlink_traversal(&payload, 32).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn symlink_validation_allows_safe_intermediate_and_dangling_links() {
+        let root = test_dir("safe-intermediate-link");
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(root.join("target"), b"safe").unwrap();
+        std::os::unix::fs::symlink(".", root.join("dir/alias")).unwrap();
+        std::os::unix::fs::symlink("dir/alias/../target", root.join("safe")).unwrap();
+        std::os::unix::fs::symlink("missing/file", root.join("dangling")).unwrap();
+        assert_eq!(root.join("safe").canonicalize().unwrap(), root.join("target"));
+        assert!(validate_symlink_traversal(&root, 32).is_ok());
+        assert!(validate_symlink_traversal(&root, 0).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn test_dir(label: &str) -> PathBuf {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
