@@ -20,8 +20,11 @@ forwarded to every backend. Application arguments belong after `--`.
 
 `--sources-only`, `--aur-only` and `--external-only` apply to upgrades, exclude
 unrelated checks/refresh/cleanup, and are mutually exclusive. `--keep-going`
-retains the verified AUR build-failure-to-Sources contract; it is not a general
-ignore-errors switch. Namespaced flags apply to their configured manager's
+skips managers with explicitly unsupported upgrade options before approval and
+continues eligible work with an incomplete/nonzero result. Invalid configuration
+and capacity failures remain fatal. Its runtime continuation still uses the
+verified AUR build-failure-to-Sources contract. It is not a general ignore-errors
+switch; pending orphan cleanup is preserved after a skip. Namespaced flags apply to their configured manager's
 upgrade or separately approved standalone actions.
 
 `--sudo` and `--pkexec` select the privilege boundary for operations which need

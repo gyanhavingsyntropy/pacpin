@@ -1,6 +1,22 @@
 //! Own the terminal while a package manager runs, keeping worker output out of
 //! its cursor-based progress display. A PTY preserves prompts and native bars.
+mod metrics;
+mod observer;
+mod stages;
+pub use stages::{activity, pending, stop_pending};
+#[cfg(test)]
+mod tests;
+use observer::{Observer, clean_text};
+use metrics::{NativeDownloads, download_text, footer_download, native_footer, phase_text, scoped_phase};
+
+impl NativeDownloads {
+    fn current() -> Self {
+        NATIVE_DOWNLOADS.with(|targets| Self::new(&targets.borrow()))
+    }
+}
+
 use std::cell::{Cell, RefCell};
+use crate::execution::{ChildGuard, ensure_not_terminating};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -32,6 +48,7 @@ static SESSION_VIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// Keep one output region across an invocation's successive footer phases.
 pub struct SessionView;
 pub fn session_view() -> SessionView {
+    crate::execution::register_interrupt_restore(restore_terminal);
     SESSION_VIEW.store(true, std::sync::atomic::Ordering::Relaxed);
     extern "C" fn restore_at_exit() { restore_terminal(); }
     // process::exit bypasses Rust destructors in several command handlers.
@@ -46,6 +63,7 @@ impl Drop for SessionView {
 }
 static COMPLETED: Mutex<Vec<Manager>> = Mutex::new(Vec::new());
 static FAILED: Mutex<Vec<Manager>> = Mutex::new(Vec::new());
+static SKIPPED: Mutex<Vec<Manager>> = Mutex::new(Vec::new());
 static NATIVE_BACKGROUND: Mutex<Option<String>> = Mutex::new(None);
 static CONTEXT: Mutex<Option<(Manager, String)>> = Mutex::new(None);
 thread_local! { static SELECTION_DISPLAY: RefCell<Option<Footer>> = const { RefCell::new(None) }; }
@@ -62,60 +80,34 @@ pub fn native_downloads<T>(targets: Vec<(String, u64)>, work: impl FnOnce() -> T
     work()
 }
 
-#[derive(Default)]
-struct NativeDownloads {
-    packages: Vec<(String, u64, u8)>,
-    ambiguous: bool,
-    aggregate: Option<u8>,
-    observed: bool,
-}
-impl NativeDownloads {
-    fn current() -> Self {
-        Self { packages: NATIVE_DOWNLOADS.with(|d| d.borrow().iter().map(|(name, size)| (name.clone(), *size, 0)).collect()), ..Default::default() }
-    }
-    fn observe(&mut self, line: &str) {
-        let Some(percent) = line_percent(line) else { return; };
-        let Some(label) = line.split_whitespace().next() else { return; };
-        if label == "Total" || label.starts_with("Total(") { self.aggregate = Some(percent); return; }
-        if label.starts_with('(') { return; }
-        let matching: Vec<_> = self.packages.iter_mut().filter(|(name, _, _)| {
-            label == name.as_str() || label.strip_suffix("...").is_some_and(|prefix| !prefix.is_empty() && name.starts_with(prefix))
-        }).collect();
-        if matching.len() == 1 {
-            matching.into_iter().next().unwrap().2 = percent;
-            self.observed = true;
-        } else { self.ambiguous = true; }
-    }
-    fn phase(&mut self, manager: Manager, line: &str, previous: &str) -> String {
-        self.observe(line);
-        let phase = phase_text(manager, line, previous);
-        if manager != Manager::Native || !phase.starts_with("Downloading packages") || line.trim_start().starts_with("Total") { return phase; }
-        if let Some(percent) = self.aggregate { return format!("Downloading packages ({percent}%)"); }
-        let total: u128 = self.packages.iter().map(|(_, size, _)| u128::from(*size)).sum();
-        if total == 0 || self.ambiguous || !self.observed { return phase; }
-        let percent = self.packages.iter().map(|(_, size, progress)| u128::from(*size) * u128::from(*progress)).sum::<u128>() / total;
-        format!("Downloading packages ({percent}%)")
-    }
-}
-
-fn line_percent(text: &str) -> Option<u8> {
-    text.split_whitespace().find_map(|word| word.strip_suffix('%').and_then(|number| number.parse::<u8>().ok()).filter(|&value| value <= 100))
-}
-
 pub fn begin_transaction() {
+    stages::clear();
     COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAILED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 pub fn completed(manager: Manager) {
+    stages::finished(manager);
+    SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&m| m != manager);
     FAILED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&m| m != manager);
     let mut completed = COMPLETED.lock().unwrap_or_else(|e| e.into_inner());
     if !completed.contains(&manager) { completed.push(manager); }
 }
 
 pub fn failed(manager: Manager) {
+    stages::finished(manager);
+    SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&m| m != manager);
     COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&m| m != manager);
     let mut failed = FAILED.lock().unwrap_or_else(|e| e.into_inner());
     if !failed.contains(&manager) { failed.push(manager); }
+}
+
+pub fn skipped(manager: Manager) {
+    stages::finished(manager);
+    COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&m| m != manager);
+    FAILED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&m| m != manager);
+    let mut skipped = SKIPPED.lock().unwrap_or_else(|e| e.into_inner());
+    if !skipped.contains(&manager) { skipped.push(manager); }
 }
 
 /// An outer operation may own work performed by another manager (an AUR
@@ -139,7 +131,7 @@ pub fn operation<T>(manager: Manager, label: &str, work: impl FnOnce() -> T) -> 
 /// Refresh a pacpin-owned phase from live measurements; child execution and
 /// terminal restoration remain owned by the same shared renderer.
 pub fn operation_dynamic<T>(manager: Manager, label: impl Fn() -> String + Send + 'static, work: impl FnOnce() -> T) -> T {
-    crate::sandbox::init_signal_handlers();
+    crate::execution::init_signal_handlers();
     struct Display {
         stop: std::sync::mpsc::Sender<()>,
         worker: Option<std::thread::JoinHandle<()>>,
@@ -340,150 +332,6 @@ pub fn source_download(name: &str, downloaded: u64, total: Option<u64>) {
     }
 }
 
-fn download_text(name: &str, downloaded: u64, total: Option<u64>) -> String {
-    let mib = downloaded as f64 / 1_048_576.0;
-    match total.filter(|&n| n != 0) {
-        Some(total) => {
-            let percent = (downloaded.saturating_mul(100) / total).min(100);
-            let filled = (percent / 10) as usize;
-            format!(
-                "{name} [{}{}] {mib:.1}/{:.1} MiB ({percent}%)",
-                "=".repeat(filled),
-                " ".repeat(10 - filled),
-                total as f64 / 1_048_576.0
-            )
-        }
-        None => format!("{name} [{mib:.1} MiB]"),
-    }
-}
-
-fn footer_download(name: &str, downloaded: u64, total: Option<u64>, width: usize) -> String {
-    let mut suffix = download_text("", downloaded, total);
-    if crate::ui::str_width(&suffix) > width {
-        if let Some(total) = total.filter(|&n| n != 0) {
-            let percent = (downloaded.saturating_mul(100) / total).min(100);
-            suffix = format!(
-                " {:.0}/{:.0}MiB {percent}%",
-                downloaded as f64 / 1_048_576.0,
-                total as f64 / 1_048_576.0
-            );
-        }
-    }
-    let name_width = width.saturating_sub(crate::ui::str_width(&suffix));
-    format!(
-        "{}{}",
-        crate::ui::truncate_str(&clean_text(name), name_width),
-        suffix
-    )
-}
-
-fn native_footer(text: &str, width: usize) -> String {
-    let clean = clean_text(text);
-    if let Some((phase, metrics)) = clean.split_once(" (").filter(|(_, metrics)| metrics.ends_with(')') && metrics.contains('%')) {
-        let suffix = format!(" ({metrics}");
-        if crate::ui::str_width(&suffix) + 2 <= width {
-            return format!("{}{suffix}", crate::ui::truncate_str(phase, width - crate::ui::str_width(&suffix)));
-        }
-        if let Some(percent) = metrics.split(',').next().filter(|percent| percent.trim_end_matches(')').ends_with('%')) {
-            let suffix = format!(" ({})", percent.trim_end_matches(')'));
-            return format!("{}{suffix}", crate::ui::truncate_str(phase, width.saturating_sub(crate::ui::str_width(&suffix))));
-        }
-    }
-    let words: Vec<_> = clean
-        .split_whitespace()
-        .filter(|word| {
-            // Pacman's long ASCII bar is already visible in the normal text area.
-            !(word.starts_with('[')
-                && word.ends_with(']')
-                && word[1..word.len() - 1]
-                    .chars()
-                    .all(|c| matches!(c, '#' | '-' | '=' | '>')))
-        })
-        .collect();
-    if let Some(unit) = words
-        .iter()
-        .position(|word| matches!(*word, "B" | "KiB" | "MiB" | "GiB"))
-        .filter(|&unit| unit > 0)
-    {
-        let suffix = words[unit - 1..].join(" ");
-        let name = words[..unit - 1].join(" ");
-        let name_width = width.saturating_sub(crate::ui::str_width(&suffix) + 1);
-        return format!("{} {suffix}", crate::ui::truncate_str(&name, name_width));
-    }
-    crate::ui::truncate_str(&words.join(" "), width)
-}
-
-fn phase_text(manager: Manager, text: &str, previous: &str) -> String {
-    if manager == Manager::Hooks { return previous.into(); }
-    let clean = clean_text(text);
-    let lower = clean.to_lowercase();
-    if lower.contains("waiting for repository downloads") { return "Queued; waiting for repository downloads".into(); }
-    if lower.contains("prefetch failed") { return "Prefetch failed; retry pending".into(); }
-    if lower.contains("enter a number") || lower.contains("enter a selection") { return "Awaiting package selection".into(); }
-    if lower.contains("password") || lower.contains("authentication") { return "Awaiting authorization".into(); }
-    if lower.contains("[y/n]") || lower.contains("[y/n") || lower.contains("proceed with") { return "Awaiting confirmation".into(); }
-    if lower.starts_with("error:") || lower.contains("failed") { return "Operation failed".into(); }
-    let stage = |phase: &str| phase_with_metrics(manager, &clean, phase);
-    if manager == Manager::Refresh { return stage("Refreshing repositories"); }
-    if manager == Manager::Record { return previous.into(); }
-    if manager == Manager::Orphans {
-        if lower.contains("checking dependencies") { return "Checking dependencies".into(); }
-        if lower.contains("removing") || lower.contains("processing package changes") { return stage("Removing packages"); }
-        if lower.contains("hooks") { return "Running removal hooks".into(); }
-        return previous.into();
-    }
-    if manager == Manager::Cache {
-        if lower.contains("unused repositories") { return "Cleaning repository metadata".into(); }
-        if lower.contains("download") && lower.contains("director") { return "Clearing download leftovers".into(); }
-        if lower.contains("removing all files") || lower.contains("cleaning") { return "Cleaning package cache".into(); }
-        return previous.into();
-    }
-    if lower.contains("dkms") { return stage("Building kernel modules"); }
-    if lower.contains("post-transaction") || lower.contains("hooks") { return stage("Running post-install hooks"); }
-    if lower.contains("resolving dependencies") || lower.contains("conflicting packages") { return stage("Resolving dependencies"); }
-    if lower.contains("checking") || lower.contains("verifying") { return stage("Verifying packages"); }
-    if lower.contains("completed download") || lower.contains("prefetched artifact") { return "Download verified; ready to package".into(); }
-    if lower.contains("fetching") || lower.contains("prefetching") || lower.contains("downloading") || lower.contains("retrieving packages") { return stage("Downloading packages"); }
-    if lower.contains("creating package") || lower.contains("compressing package") || lower.contains("packaging") { return "Packaging source".into(); }
-    if lower.contains("building") || lower.contains("makepkg") { return stage("Building packages"); }
-    if lower.contains("upgrading") || lower.contains("installing") || lower.contains("processing package changes") { return stage("Installing packages"); }
-    if matches!(manager, Manager::Native | Manager::Aur) && clean.contains('%') {
-        return stage(previous.split(" (").next().unwrap_or(previous));
-    }
-    previous.into()
-}
-
-fn phase_with_metrics(manager: Manager, text: &str, phase: &str) -> String {
-    if !matches!(manager, Manager::Native | Manager::Aur | Manager::Orphans) { return phase.into(); }
-    if let Some(counter) = text.trim_start().strip_prefix('(').and_then(|line| line.split_once(')').map(|(counter, _)| counter.trim())) {
-        if let Some((done, total)) = counter.split_once('/').and_then(|(done, total)| Some((done.trim().parse::<u64>().ok()?, total.trim().parse::<u64>().ok()?))).filter(|(_, total)| *total != 0) {
-            let done = done.min(total);
-            let progress = line_percent(text).map(|percent| u128::from(done.saturating_sub(1)) * 100 + u128::from(percent)).unwrap_or(u128::from(done) * 100);
-            // ALPM's keyring/integrity/loading/conflict/space bars already
-            // describe the full verification action. Package installation
-            // and removal bars describe the current package instead.
-            let percent = if phase == "Verifying packages" {
-                line_percent(text).map(u128::from).unwrap_or(u128::from(done) * 100 / u128::from(total))
-            } else { (progress / u128::from(total)).min(100) };
-            return format!("{phase} ({percent}%, {done}/{total})");
-        }
-    }
-    // Individual download bars are not a transaction percentage. Prefer
-    // pacman's aggregate Total bar; planned downloads are weighted separately.
-    if text.trim_start().strip_prefix("Total").is_some_and(|rest| rest.starts_with(char::is_whitespace) || rest.starts_with('(')) {
-        if let Some(percent) = line_percent(text) { return format!("{phase} ({percent}%)"); }
-    }
-    phase.into()
-}
-
-fn scoped_phase(manager: Manager, label: &str, phase: &str) -> String {
-    if manager == Manager::Cache {
-        let scope = if label.contains("native") { "Native" } else if label.contains("AUR") { "AUR" } else { return phase.into(); };
-        return format!("{scope}: {phase}");
-    }
-    phase.into()
-}
-
 pub fn queued_sources() {
     let mut state = SOURCE.lock().unwrap_or_else(|e| e.into_inner());
     *state = SourceState {
@@ -657,18 +505,35 @@ impl Footer {
             .map(|manager| format!("{}: ✔ {}", manager.label(), manager.completion())).collect();
         history.extend(FAILED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&m| m != self.manager)
             .map(|manager| format!("{}: ✗ Operation failed", manager.label())));
-        let mut active = vec![format!("{label}: {current}")];
+        history.extend(SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&m| m != self.manager)
+            .map(|manager| format!("{}: ⚠ Skipped (unsupported options)", manager.label())));
+        let stages = stages::snapshot();
+        let generic_check = matches!(self.manager, Manager::Checks | Manager::Metadata)
+            && matches!(native, "Checking external updates" | "Refreshing external metadata")
+            && !stages.activities.is_empty();
+        let mut active = Vec::new();
+        let mut visible = Vec::new();
+        if !generic_check {
+            active.push(format!("{label}: {current}"));
+            visible.push(self.manager);
+        }
         if let Some((manager, phase)) = CONTEXT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            if *manager != self.manager { active.push(format!("{}: {phase}", manager.label())); }
+            if *manager != self.manager && (*manager != Manager::Metadata || stages.activities.is_empty()) {
+                active.push(format!("{}: {phase}", manager.label()));
+                visible.push(*manager);
+            }
         }
         if self.manager != Manager::Native {
             if let Some(phase) = NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                 active.push(format!("Pacman: {phase}"));
+                visible.push(Manager::Native);
             }
         }
         if matches!(self.manager, Manager::Native | Manager::Aur) && !state.text.is_empty() {
             active.push(format!("Sources: {source}"));
+            visible.push(Manager::Sources);
         }
+        stages.append(&mut active, &mut visible);
         fit_rows(history, active, rows.saturating_sub(5) as usize).into_iter()
             .map(|line| crate::ui::truncate_str(&clean_text(&line), width)).collect()
     }
@@ -700,7 +565,12 @@ fn footer_cleanup_row(previous_rows: u16, current_rows: u16, height: u16) -> u16
 }
 
 fn fit_rows(history: Vec<String>, active: Vec<String>, capacity: usize) -> Vec<String> {
-    let capacity = capacity.max(active.len());
+    let capacity = capacity.max(1);
+    if active.len() > capacity {
+        let hidden = active.len() - capacity + 1;
+        return active.into_iter().take(capacity - 1)
+            .chain(std::iter::once(format!("… {hidden} more stages"))).collect();
+    }
     let keep = capacity.saturating_sub(active.len());
     let start = history.len().saturating_sub(keep);
     history.into_iter().skip(start).chain(active).collect()
@@ -745,101 +615,6 @@ fn output_pty(size: &libc::winsize) -> io::Result<(File, File)> {
     Ok(unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) })
 }
 
-#[derive(Default)]
-struct Observer {
-    line: Vec<u8>,
-    escape: u8,
-    ready: bool,
-    latest: String,
-    interrupted: bool,
-}
-impl Observer {
-    fn feed(&mut self, bytes: &[u8], on_ready: &mut impl FnMut()) {
-        self.feed_observed(bytes, on_ready, &mut |_| {});
-    }
-    fn feed_observed(&mut self, bytes: &[u8], on_ready: &mut impl FnMut(), on_line: &mut impl FnMut(&str)) {
-        for &byte in bytes {
-            // Consume CSI and OSC sequences even when split across reads.
-            match self.escape {
-                1 => {
-                    self.escape = match byte {
-                        b'[' => 2,
-                        b']' => 3,
-                        _ => 0,
-                    };
-                    continue;
-                }
-                2 => {
-                    if (0x40..=0x7e).contains(&byte) {
-                        self.escape = 0;
-                    }
-                    continue;
-                }
-                3 => {
-                    if byte == 7 {
-                        self.escape = 0;
-                    } else if byte == 27 {
-                        self.escape = 4;
-                    }
-                    continue;
-                }
-                4 => {
-                    self.escape = if byte == b'\\' { 0 } else { 3 };
-                    continue;
-                }
-                _ => {}
-            }
-            match byte {
-                27 => self.escape = 1,
-                b'\r' | b'\n' => {
-                    let line = String::from_utf8_lossy(&self.line).trim().to_owned();
-                    if !line.is_empty() {
-                        self.interrupted |= line == "Interrupt signal received";
-                        on_line(&line);
-                        if !self.ready && downloads_finished(&line) {
-                            self.ready = true;
-                            on_ready();
-                        }
-                        self.latest = line;
-                    }
-                    self.line.clear();
-                }
-                byte if byte >= 32 && byte != 127 => {
-                    if self.line.len() < 8192 {
-                        self.line.push(byte);
-                    }
-                    // A prompt/progress update need not end with a newline.
-                    if !self.ready && downloads_finished(&String::from_utf8_lossy(&self.line)) {
-                        self.ready = true;
-                        on_ready();
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    fn display(&self) -> String {
-        if self.line.is_empty() {
-            self.latest.clone()
-        } else {
-            String::from_utf8_lossy(&self.line).into_owned()
-        }
-    }
-}
-
-fn downloads_finished(line: &str) -> bool {
-    [
-        "checking keys in keyring",
-        "checking keyring",
-        "checking package integrity",
-        "checking for file conflicts",
-        "Processing package changes",
-        "there is nothing to do",
-    ]
-    .iter()
-    .any(|marker| line.contains(marker))
-}
-
 /// Pacman's in-place bars wrap their labels in small windows. Keep its stage
 /// messages in the text area; the footer still shows the current operation.
 pub fn pacman_progress_args() -> &'static [&'static str] {
@@ -849,23 +624,6 @@ pub fn pacman_progress_args() -> &'static [&'static str] {
         &[]
     }
 }
-fn clean_text(text: &str) -> String {
-    let mut observer = Observer::default();
-    observer.feed(text.as_bytes(), &mut || {});
-    observer.display()
-}
-
-struct ChildGuard(std::process::Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if self.0.try_wait().ok().flatten().is_none() {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-        crate::sandbox::unregister_child(self.0.id());
-    }
-}
-
 pub fn run(
     command: &mut Command,
     manager: Manager,
@@ -905,7 +663,7 @@ fn run_observed_with_stdin(
     mut on_line: impl FnMut(&str),
     stdin: Option<Stdio>,
 ) -> io::Result<ExitStatus> {
-    crate::sandbox::init_signal_handlers();
+    crate::execution::init_signal_handlers();
     ensure_not_terminating()?;
     // A later operation for the same manager is pending again (e.g. an ABI
     // rebuild hook after an AUR upgrade). Retain only other completed managers.
@@ -950,7 +708,7 @@ fn run_observed_with_stdin(
         input = Box::new(reader);
     }
     let mut child = ChildGuard(command.spawn()?);
-    crate::sandbox::register_child(child.0.id());
+    crate::execution::register_child(child.0.id());
     // Close the parent's copies of the slave/socket so EOF can be observed.
     command
         .stdin(Stdio::inherit())
@@ -1025,7 +783,7 @@ fn run_observed_with_stdin(
     }
     let status = child.0.wait()?;
     if observer.interrupted && matches!(manager, Manager::Native | Manager::Aur | Manager::Sources | Manager::Orphans | Manager::Cache | Manager::Refresh | Manager::Record) {
-        crate::sandbox::interrupt();
+        crate::execution::interrupt();
     }
     ensure_not_terminating()?;
     if !observer.line.is_empty() {
@@ -1033,75 +791,6 @@ fn run_observed_with_stdin(
     }
     crate::pacman_config::invalidate();
     Ok(status)
-}
-
-fn ensure_not_terminating() -> io::Result<()> {
-    // A manager may finish successfully while SIGINT interrupts its hook.
-    // The signal handler is still cleaning up; do not race it by accepting
-    // that status or starting another operation.
-    if crate::sandbox::is_terminating() {
-        crate::sandbox::interrupt()
-    } else { Ok(()) }
-}
-
-/// Bounded read-only tool capture with the same child tracking as foreground
-/// operations. Drain both pipes concurrently even after the capture limit.
-pub fn capture_output(command: &mut Command) -> io::Result<std::process::Output> {
-    capture_output_with_limit(command, 32_768, std::time::Duration::from_secs(600))
-}
-
-/// Metadata must be complete: an oversized body is an error, never a silently
-/// truncated successful check. Readers drain both pipes and the child is reaped
-/// on timeout, overflow, cancellation, and ordinary failure.
-pub fn capture_output_with_limit(command: &mut Command, limit: usize, timeout: std::time::Duration) -> io::Result<std::process::Output> {
-    use std::os::unix::process::CommandExt;
-    ensure_not_terminating()?;
-    fn read_bounded(mut stream: impl Read, limit: usize, overflow: std::sync::Arc<std::sync::atomic::AtomicBool>) -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        let mut buffer = [0u8; 4096];
-        loop {
-            let count = stream.read(&mut buffer)?;
-            if count == 0 { return Ok(bytes); }
-            let keep = count.min(limit.saturating_sub(bytes.len()));
-            if keep != count { overflow.store(true, std::sync::atomic::Ordering::SeqCst); }
-            bytes.extend_from_slice(&buffer[..keep]);
-        }
-    }
-    command.process_group(0).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = ChildGuard(command.spawn()?);
-    crate::sandbox::register_child_group(child.0.id());
-    let stdout = child.0.stdout.take().ok_or_else(|| io::Error::other("Missing stdout pipe"))?;
-    let stderr = child.0.stderr.take().ok_or_else(|| io::Error::other("Missing stderr pipe"))?;
-    let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let out_overflow = std::sync::Arc::clone(&overflow);
-    let err_overflow = std::sync::Arc::clone(&overflow);
-    let output = std::thread::spawn(move || read_bounded(stdout, limit, out_overflow));
-    let errors = std::thread::spawn(move || read_bounded(stderr, limit, err_overflow));
-    let start = std::time::Instant::now();
-    let status = loop {
-        if overflow.load(std::sync::atomic::Ordering::SeqCst) {
-            break Err(io::Error::other("Command output exceeds metadata limit"));
-        }
-        if start.elapsed() >= timeout {
-            break Err(io::Error::new(io::ErrorKind::TimedOut, "Metadata command timed out"));
-        }
-        if crate::sandbox::is_terminating() {
-            break Err(io::Error::new(io::ErrorKind::Interrupted, "pacpin is terminating"));
-        }
-        match child.0.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
-            Err(error) => break Err(error),
-        }
-    };
-    if status.is_err() { let _ = child.0.kill(); let _ = child.0.wait(); }
-    // Metadata scripts must not leave descendants holding capture pipes open.
-    unsafe { libc::kill(-(child.0.id() as i32), libc::SIGKILL); }
-    let stdout = output.join().map_err(|_| io::Error::other("Output reader failed"))??;
-    let stderr = errors.join().map_err(|_| io::Error::other("Error reader failed"))??;
-    if overflow.load(std::sync::atomic::Ordering::SeqCst) { return Err(io::Error::other("Command output exceeds metadata limit")); }
-    ensure_not_terminating()?;
-    Ok(std::process::Output { status: status?, stdout, stderr })
 }
 
 /// Background downloads cannot own the input terminal or emit foreground
@@ -1181,7 +870,7 @@ pub fn start_background(command: &mut Command) -> io::Result<BackgroundCommand> 
     }
     command.env("LC_ALL", "C").stdin(Stdio::null());
     let child = ChildGuard(command.spawn()?);
-    crate::sandbox::register_child(child.0.id());
+    crate::execution::register_child(child.0.id());
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     *NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()) = Some("Downloading repository packages".into());
     let mut downloads = NativeDownloads::current();
@@ -1253,465 +942,5 @@ pub fn wait_for_sources(handle: &std::thread::JoinHandle<()>) {
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn footer_cleanup_keeps_the_previous_region_visible_across_resize() {
-        assert_eq!(super::footer_cleanup_row(30, 18, 3), 16);
-        assert_eq!(super::footer_cleanup_row(18, 30, 3), 16);
-        assert_eq!(super::footer_cleanup_row(30, 30, 3), 28);
-        assert_eq!(super::footer_cleanup_row(18, 18, 2), 17);
-    }
-
-    use super::*;
-    #[test]
-    fn native_totals_weight_all_archives_and_ignore_individual_bars() {
-        native_downloads(vec![("small-1-x86_64".into(), 10), ("large-1-x86_64".into(), 90)], || {
-            let mut downloads = NativeDownloads::current();
-            downloads.observe("small-1-x86_64 1 KiB [###] 100%");
-            assert_eq!(downloads.phase(Manager::Native, "large-1-x86_64 1 KiB [###] 50%", "Downloading packages"), "Downloading packages (55%)");
-            assert_eq!(downloads.phase(Manager::Native, "large-1... [###] 50%", "Downloading packages"), "Downloading packages (55%)");
-            assert_eq!(downloads.phase(Manager::Native, "large-1-x86_64-other [###] 100%", "Downloading packages"), "Downloading packages");
-            assert_eq!(downloads.phase(Manager::Native, "Total (2/2) 1 KiB [###] 63%", "Downloading packages"), "Downloading packages (63%)");
-            assert_eq!(downloads.phase(Manager::Native, "(1/2) upgrading small [###] 100%", "Downloading packages"), "Installing packages (50%, 1/2)");
-        });
-        assert!(NativeDownloads::current().packages.is_empty());
-        assert_eq!(phase_text(Manager::Native, "(1/2) installing small 0%", "Starting"), "Installing packages (0%, 1/2)");
-        assert_eq!(phase_text(Manager::Native, "(0/0) installing small 100%", "Starting"), "Installing packages");
-    }
-
-    #[test]
-    fn native_totals_handle_parallel_lines_and_large_sizes() {
-        let mut downloads = NativeDownloads { packages: vec![("one".into(), u64::MAX, 0), ("two".into(), u64::MAX, 0)], ..Default::default() };
-        let mut observer = Observer::default();
-        observer.feed_observed(b"one 100%\r\x1b[1Atwo 50%\r", &mut || {}, &mut |line| downloads.observe(line));
-        assert_eq!(downloads.phase(Manager::Native, "two 50%", "Downloading packages"), "Downloading packages (75%)");
-    }
-    #[test]
-    fn ambiguous_truncated_names_do_not_invent_download_totals() {
-        let mut downloads = NativeDownloads { packages: vec![("same-one".into(), 10, 0), ("same-two".into(), 90, 0)], ..Default::default() };
-        assert_eq!(downloads.phase(Manager::Native, "same... 100%", "Downloading packages"), "Downloading packages");
-        assert_eq!(downloads.phase(Manager::Native, "Total (2/2) 60%", "Downloading packages"), "Downloading packages (60%)");
-        assert_eq!(downloads.phase(Manager::Native, "same... 100%", "Downloading packages"), "Downloading packages (60%)");
-        for width in [18, 24, 32] {
-            let text = native_footer("Installing packages (59%, 29/49)", width);
-            assert!(text.contains("59%"));
-            assert!(crate::ui::str_width(&text) <= width);
-        }
-    }
-    #[test]
-    fn short_footer_keeps_active_steps_and_recent_failures() {
-        let history = vec!["Pacman: ✔ Upgrade complete".into(), "Sources: ✔ Upgrade complete".into(), "AUR: ✗ Operation failed".into()];
-        let active = vec!["Review: Choosing orphan cleanup".into(), "Pacman: Downloading packages".into()];
-        let lines = fit_rows(history, active, 3);
-        assert_eq!(lines, ["AUR: ✗ Operation failed", "Review: Choosing orphan cleanup", "Pacman: Downloading packages"]);
-        assert_eq!(Manager::Refresh.label(), "Repositories");
-        assert_eq!(Manager::Restart.label(), "Restart");
-        assert_eq!(phase_text(Manager::Record, "arbitrary output", "Recording dependency reasons"), "Recording dependency reasons");
-    }
-
-    #[test]
-    fn native_interruption_marker_is_exact_and_survives_fragmented_output() {
-        let mut observer = Observer::default();
-        observer.feed(b"hook says: Interrupt signal received\n", &mut || {});
-        assert!(!observer.interrupted);
-        observer.feed(b"\x1b[31mInterrupt signal ", &mut || {});
-        observer.feed(b"received\x1b[0m\r\n", &mut || {});
-        assert!(observer.interrupted);
-    }
-    #[test]
-    fn housekeeping_phases_and_completion_describe_actual_operations() {
-        assert_eq!(phase_text(Manager::Orphans, "checking dependencies...", "Starting"), "Checking dependencies");
-        assert_eq!(phase_text(Manager::Orphans, "(2/6) removing ninja [###] 100%", "Starting"), "Removing packages (33%, 2/6)");
-        assert_eq!(phase_text(Manager::Orphans, "[sudo] password for user:", "Starting"), "Awaiting authorization");
-        assert_eq!(phase_text(Manager::Cache, "Do you want to remove ALL files from cache? [y/N]", "Starting"), "Awaiting confirmation");
-        assert_eq!(phase_text(Manager::Cache, "removing all files from cache...", "Starting"), "Cleaning package cache");
-        assert_eq!(phase_text(Manager::Cache, "error: could not remove directory", "Starting"), "Operation failed");
-        assert_eq!(Manager::Orphans.completion(), "Removal complete");
-        assert_eq!(Manager::Cache.completion(), "Cleanup complete");
-        assert_eq!(scoped_phase(Manager::Cache, "Cleaning native package cache", "Awaiting confirmation"), "Native: Awaiting confirmation");
-        assert_eq!(scoped_phase(Manager::Cache, "Cleaning AUR build cache", "Cleaning package cache"), "AUR: Cleaning package cache");
-    }
-
-    #[test]
-    fn prepared_cache_input_survives_shared_execution_and_real_failure_status() {
-        let _guard = crate::sandbox::CHILD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use std::io::Write;
-        let (input, mut output) = UnixStream::pair().unwrap();
-        output.write_all(b"y\nn\n").unwrap();
-        output.shutdown(std::net::Shutdown::Write).unwrap();
-        let status = run_with_stdin(Command::new("/bin/sh").args(["-c", "read first; read second; test \"$first:$second\" = y:n || exit 99; exit 7"]), Manager::Cache, "Cleaning package cache", Stdio::from(std::os::fd::OwnedFd::from(input))).unwrap();
-        assert_eq!(status.code(), Some(7));
-    }
-    #[test]
-    fn observed_lines_preserve_split_colored_failure_markers() {
-        let mut observer = Observer::default();
-        let mut lines = Vec::new();
-        for fragment in [b"\x1b[31m==> ER".as_slice(), b"ROR:\x1b[0m A failure occurred in build().\r\n:: Processing package changes...\n"] {
-            observer.feed_observed(fragment, &mut || {}, &mut |line| lines.push(line.to_owned()));
-        }
-        assert_eq!(lines, ["==> ERROR: A failure occurred in build().", ":: Processing package changes..."]);
-    }
-    #[test]
-    fn bounded_capture_drains_both_streams_and_preserves_failure() {
-        let _guard = crate::sandbox::CHILD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let output = capture_output(Command::new("/bin/sh").args(["-c", "head -c 16384 /dev/zero; head -c 16384 /dev/zero >&2; exit 7"])).unwrap();
-        assert_eq!(output.status.code(), Some(7));
-        assert_eq!(output.stdout.len(), 16384); assert_eq!(output.stderr.len(), 16384);
-        assert!(capture_output(Command::new("/bin/sh").args(["-c", "head -c 65536 /dev/zero"])).is_err());
-        let start = std::time::Instant::now();
-        assert!(capture_output_with_limit(Command::new("/bin/sh").args(["-c", "sleep 30 & wait"]), 1024, std::time::Duration::from_millis(50)).is_err());
-        assert!(start.elapsed() < std::time::Duration::from_secs(2));
-    }
-    #[test]
-    fn footer_describes_phases_without_echoing_prompts_or_hook_logs() {
-        assert_eq!(phase_text(Manager::Native, "(1/2) checking package integrity [###] 73%", "Installing packages"), "Verifying packages (73%, 1/2)");
-        assert_eq!(phase_text(Manager::Native, "(1/2) loading package files [###] 73%", "Verifying packages"), "Verifying packages (73%, 1/2)");
-        let mut observer = Observer::default();
-        let mut downloads = NativeDownloads::default();
-        let mut phase = "Installing packages".to_string();
-        observer.feed_observed(b":: Running post-transaction hooks...\n(1/1) pacpin UI test hook\nPACPIN_NATIVE_HOOK_1\n", &mut || {}, &mut |line| { phase = downloads.phase(Manager::Native, line, &phase); });
-        assert_eq!(phase, "Running post-install hooks");
-        assert_eq!(phase_text(Manager::Native, "[sudo] password for user:", "Starting"), "Awaiting authorization");
-        assert_eq!(phase_text(Manager::Native, "Proceed with installation? [Y/n]", "Starting"), "Awaiting confirmation");
-        assert_eq!(phase_text(Manager::Native, "PACPIN_NATIVE_HISTORY_01", "Running hooks"), "Running hooks");
-        assert_eq!(phase_text(Manager::Sources, ":: Packaging verified source", "Preparing"), "Packaging source");
-        assert_eq!(phase_text(Manager::Native, "(29/49) upgrading webkitgtk-6.0 [####] 100%", "Preparing"), "Installing packages (59%, 29/49)");
-        assert_eq!(phase_text(Manager::Native, "package-very-long-name [####] 80%", "Downloading packages (75%)"), "Downloading packages");
-        assert_eq!(phase_text(Manager::Native, "( 7/10) Install DKMS modules", "Preparing"), "Building kernel modules (70%, 7/10)");
-    }
-    #[test]
-    fn download_progress_handles_unknown_zero_and_overflowing_totals() {
-        assert!(download_text("app", 5_242_880, Some(10_485_760)).contains("50%"));
-        assert!(!download_text("app", 1, Some(0)).contains('%'));
-        assert!(download_text("app", 20, Some(10)).contains("100%"));
-    }
-
-    #[test]
-    fn long_source_filenames_keep_counts_and_percent_visible() {
-        let text = footer_download(
-            "codex-package-x86_64-unknown-linux-musl.tar.gz",
-            125 * 1_048_576,
-            Some(154 * 1_048_576),
-            70,
-        );
-        assert!(text.contains("125.0/154.0 MiB (81%)"));
-        assert!(crate::ui::str_width(&text) <= 70);
-        for width in [20, 22, 30] {
-            let text = footer_download("codex-package-x86_64-unknown-linux-musl.tar.gz", 125 * 1_048_576, Some(154 * 1_048_576), width);
-            assert!(text.contains("125/154MiB 81%"));
-            assert!(crate::ui::str_width(&text) <= width);
-        }
-    }
-
-    #[test]
-    fn native_footer_keeps_download_metrics_visible() {
-        let text = native_footer("long-package-name-with-version-and-architecture  125.0 MiB  10 MiB/s  00:12 [########-----] 80%", 67);
-        assert!(text.contains("125.0 MiB 10 MiB/s 00:12 80%"));
-        assert!(crate::ui::str_width(&text) <= 67);
-        assert_eq!(
-            native_footer("(7/10) Install DKMS modules", 67),
-            "(7/10) Install DKMS modules"
-        );
-    }
-    #[test]
-    fn prefetch_starts_once_after_downloads_and_handles_split_ansi() {
-        let mut observer = Observer::default();
-        let mut starts = 0;
-        observer.feed(b":: Retrieving packages...\rapp 20%\x1b[", &mut || {
-            starts += 1
-        });
-        assert_eq!(starts, 0);
-        observer.feed(b"32m\r(1/2) checking keys in key", &mut || starts += 1);
-        assert_eq!(starts, 0);
-        observer.feed(b"ring\x1b[0m\nchecking package integrity\n", &mut || {
-            starts += 1
-        });
-        assert_eq!(starts, 1);
-    }
-    #[test]
-    fn failed_download_does_not_start_prefetch() {
-        let mut observer = Observer::default();
-        observer.feed(
-            b"failed retrieving file\nerror: failed to commit transaction\n",
-            &mut || panic!("prefetch started"),
-        );
-        assert!(!observer.ready);
-    }
-    #[test]
-    fn terminal_text_strips_control_sequences() {
-        assert_eq!(clean_text("\x1b[32mverified\x1b[0m"), "verified");
-        assert_eq!(clean_text("\x1b]0;title\x07hello"), "hello");
-    }
-    #[test]
-    fn relay_preserves_exit_status_and_detects_phase_without_host_changes() {
-        let _serial = crate::sandbox::CHILD_TEST_LOCK.lock().unwrap();
-        let mut starts = 0;
-        let status = run(
-            Command::new("sh").args([
-                "-c",
-                "printf 'checking keys in keyring\\n'; printf 'stderr retained\\n' >&2; exit 7",
-            ]),
-            Manager::Native,
-            "Test",
-            || starts += 1,
-        )
-        .unwrap();
-        assert_eq!(status.code(), Some(7));
-        assert_eq!(starts, 1);
-    }
-
-    #[test]
-    fn background_wait_preserves_failure_and_clears_download_state() {
-        let _serial = crate::sandbox::CHILD_TEST_LOCK.lock().unwrap();
-        let child = start_background(Command::new("sh").args([
-            "-c", "printf 'Downloading fixture 25%%\\r'; sleep 0.2; exit 7",
-        ])).unwrap();
-        assert_eq!(child.wait().unwrap().code(), Some(7));
-        assert!(NATIVE_BACKGROUND.lock().unwrap().is_none());
-        assert!(TERMINAL.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn pty_preserves_prompt_output_footer_and_terminal_settings() {
-        const CHILD: &str = "PACPIN_PROGRESS_PTY_TEST";
-        if std::env::var_os(CHILD).is_some() {
-            let mut before: libc::termios = unsafe { std::mem::zeroed() };
-            assert_eq!(unsafe { libc::tcgetattr(0, &mut before) }, 0);
-            let session = unsafe { libc::getsid(0) }.to_string();
-            let tty = std::fs::read_link("/proc/self/fd/0").unwrap();
-            begin_transaction();
-            completed(Manager::Native);
-            failed(Manager::Aur);
-            let view = session_view();
-            for _ in 0..5 { println!("PHASE_ANCHOR_PADDING"); }
-            println!("PHASE_PADDING_START");
-            for (manager, label) in [
-                (Manager::Checks, "Checking update candidates"),
-                (Manager::Review, "Awaiting plan approval"),
-                (Manager::Record, "Saving upgrade history"),
-                (Manager::Restart, "Checking restart requirements"),
-            ] {
-                operation(manager, label, || {
-                    operation(Manager::Checks, "Nested check", || {});
-                    std::thread::sleep(std::time::Duration::from_millis(110));
-                });
-                assert!(TERMINAL.lock().unwrap().is_none());
-            }
-            println!("PHASE_PADDING_END");
-            drop(view);
-            assert!(VIEW.lock().unwrap().is_none());
-            context(Manager::Hooks, "Rebuilding triggered packages", || {
-                operation(Manager::Aur, "Building triggered packages", || {
-                    std::thread::sleep(std::time::Duration::from_millis(110));
-                });
-            });
-            assert!(CONTEXT.lock().unwrap().is_none());
-            let status = run(Command::new("sh").args(["-c",
-                "stty -echo; printf 'AUTH_WAIT_PROMPT: ' >/dev/tty; read -r answer; test \"$answer\" = fixture-secret || exit 8; printf '\\nresolving dependencies...\\n'; sleep .3; stty echo; printf 'AUTH_WAIT_COMPLETE\\n'",
-            ]), Manager::Refresh, "Awaiting authorization", || {}).unwrap();
-            assert!(status.success());
-            begin_transaction();
-            queued_sources();
-            let status = run(Command::new("sh").args(["-c",
-                "test -t 0 && test -t 1 || exit 2; test \"$(ps -o sid= -p $$ | tr -d ' ')\" = \"$PACPIN_TEST_SESSION\" || exit 4; test \"$(readlink /proc/$$/fd/0)\" = \"$PACPIN_TEST_TTY\" || exit 5; printf 'checking keys in keyring\\n'; printf 'Answer: '; read -r answer; test \"$answer\" = yes || exit 3; printf 'native output retained\\n'; printf 'stderr retained\\n' >&2"])
-                .env("PACPIN_TEST_SESSION", &session).env("PACPIN_TEST_TTY", &tty),
-                Manager::Native, "Test", || background(|| source_download("app.tar.gz", 5_242_880, Some(10_485_760)))).unwrap();
-            assert!(status.success());
-            // sudo can disable output processing on the inherited tty while
-            // relaying its own child. Output must still start each new line at
-            // column one rather than producing a staircase of indented lines.
-            let mut raw_output = before;
-            raw_output.c_oflag &= !libc::OPOST;
-            assert_eq!(unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw_output) }, 0);
-            let status = run(Command::new("sh").args(["-c",
-                "test \"$(ps -o sid= -p $$ | tr -d ' ')\" = \"$PACPIN_TEST_SESSION\" || exit 4; test \"$(readlink /proc/$$/fd/0)\" = \"$PACPIN_TEST_TTY\" || exit 5; printf 'source terminal retained\\nraw output line one\\nraw output line two\\n'"])
-                .env("PACPIN_TEST_SESSION", &session).env("PACPIN_TEST_TTY", &tty),
-                Manager::Sources, "Second operation", || {}).unwrap();
-            assert!(status.success());
-            assert_eq!(unsafe { libc::tcsetattr(0, libc::TCSANOW, &before) }, 0);
-            clear_sources();
-            queued_sources();
-            let download = start_background(Command::new("sh").args(["-c",
-                "test -t 1 || exit 9; printf 'Downloading fixture.pkg.tar.zst 25%%\\r'; sleep 1; printf 'Downloading fixture.pkg.tar.zst 75%%\\r'; sleep 1; exit 7",
-            ])).unwrap();
-            let selected = selection_operation(|| crate::ui::prompt_orphan_selection(&[
-                crate::db::OrphanPackage {
-                    name: "fixture-orphan".into(), version: "1-1".into(), isize: 1,
-                    desc: "No host package operations".into(), is_projected: false,
-                    dropped_by: Vec::new(), optional_for: Vec::new(),
-                },
-            ], true));
-            assert_eq!(selected, ["fixture-orphan"]);
-            assert_eq!(download.wait().unwrap().code(), Some(7));
-            assert!(NATIVE_BACKGROUND.lock().unwrap().is_none());
-            println!("BACKGROUND_WAIT_FINISHED");
-            println!("FINISHED_PREFETCH_BEFORE");
-            let mut finished = start_background(Command::new("sh").args(["-c", "exit 0"])).unwrap();
-            while finished.child.0.try_wait().unwrap().is_none() {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            assert!(finished.wait().unwrap().success());
-            println!("FINISHED_PREFETCH_AFTER");
-            let mut after: libc::termios = unsafe { std::mem::zeroed() };
-            assert_eq!(unsafe { libc::tcgetattr(0, &mut after) }, 0);
-            assert_eq!(before.c_lflag, after.c_lflag);
-            assert_eq!(before.c_oflag, after.c_oflag);
-            return;
-        }
-        let (mut master, mut slave) = (-1, -1);
-        let size = libc::winsize {
-            ws_row: 24,
-            ws_col: 80,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        assert_eq!(
-            unsafe {
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    &size,
-                )
-            },
-            0
-        );
-        let mut master = unsafe { File::from_raw_fd(master) };
-        let slave = unsafe { File::from_raw_fd(slave) };
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .args([
-                "--exact",
-                "progress::tests::pty_preserves_prompt_output_footer_and_terminal_settings",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("TERM", "xterm")
-            .stdin(Stdio::from(slave.try_clone().unwrap()))
-            .stdout(Stdio::from(slave.try_clone().unwrap()))
-            .stderr(Stdio::from(slave));
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = ChildGuard(command.spawn().unwrap());
-        command
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut output = Vec::new();
-        let mut answered = false;
-        let mut selection_confirmed = false;
-        let mut auth_started = None;
-        let mut auth_answered = false;
-        loop {
-            if !auth_answered && auth_started.is_some_and(|started: std::time::Instant| started.elapsed() >= std::time::Duration::from_millis(750)) {
-                let text = String::from_utf8_lossy(&output);
-                let waiting = text.split("AUTH_WAIT_PROMPT: ").nth(1).unwrap();
-                assert!(!waiting.contains("\x1b7"), "footer moved the authentication cursor: {waiting}");
-                master.write_all(b"fixture-secret\n").unwrap();
-                auth_answered = true;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "PTY relay hung: {}",
-                String::from_utf8_lossy(&output)
-            );
-            let mut fd = libc::pollfd {
-                fd: master.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            if unsafe { libc::poll(&mut fd, 1, 100) } <= 0 {
-                continue;
-            }
-            let mut bytes = [0u8; 4096];
-            match master.read(&mut bytes) {
-                Ok(0) => break,
-                Ok(n) => output.extend_from_slice(&bytes[..n]),
-                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-                Err(error) => panic!("PTY read failed: {error}"),
-            }
-            if !answered && String::from_utf8_lossy(&output).contains("Answer: ") {
-                master.write_all(b"yes\n").unwrap();
-                answered = true;
-                let resized = libc::winsize {
-                    ws_row: 30,
-                    ws_col: 100,
-                    ..size
-                };
-                assert_eq!(
-                    unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &resized) },
-                    0
-                );
-            }
-            if auth_started.is_none() && String::from_utf8_lossy(&output).contains("AUTH_WAIT_PROMPT: ") {
-                auth_started = Some(std::time::Instant::now());
-                let resized = libc::winsize { ws_row: 18, ws_col: 40, ..size };
-                assert_eq!(unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &resized) }, 0);
-            }
-            if !selection_confirmed && String::from_utf8_lossy(&output).contains("Enter confirms") {
-                master.write_all(b"\r").unwrap();
-                selection_confirmed = true;
-            }
-        }
-        assert!(
-            child.0.wait().unwrap().success(),
-            "{}",
-            String::from_utf8_lossy(&output)
-        );
-        let output = String::from_utf8_lossy(&output);
-        assert!(auth_answered && output.contains("AUTH_WAIT_COMPLETE"));
-        assert!(!output.contains("fixture-secret"), "authentication input was echoed");
-        let phases = output.split("PHASE_PADDING_START\r\n").nth(1).unwrap().split("PHASE_PADDING_END").next().unwrap();
-        assert!(!phases.contains('\n'), "footer phases inserted blank lines: {phases}");
-        let finished_wait = output.split("FINISHED_PREFETCH_BEFORE").nth(1).unwrap().split("FINISHED_PREFETCH_AFTER").next().unwrap();
-        assert!(!finished_wait.contains("Waiting for repository downloads"), "already-finished download displayed a wait: {output}");
-        assert!(!finished_wait.contains("Pacman:"), "already-finished download displayed an active footer: {output}");
-        assert!(output.contains("No host package operations\r\n\r\nPure orphans are pre-selected ([x]). Optional plugins are unchecked ([ ]).\r\n\r\n"), "selector sections have no blank line: {output}");
-        // A footer refresh may occur between a line and its newline. Remove
-        // only the DEC save/restore display updates before checking CRLF.
-        let mut normal_output = output.to_string();
-        while let Some(start) = normal_output.find("\x1b7") {
-            let Some(end) = normal_output[start..].find("\x1b8") else { break; };
-            normal_output.replace_range(start..start + end + 2, "");
-        }
-        assert!(normal_output.contains("raw output line one\r\nraw output line two\r\n"), "newline processing lost: {output}");
-        for text in [
-            "Checks: Checking update candidates",
-            "Review: Awaiting plan approval",
-            "Records: Saving upgrade history",
-            "Restart: Checking restart requirements",
-            "AUR: ✗ Operation failed",
-            "Pacman: ✔ Upgrade complete",
-            "Review: Choosing orphan cleanup",
-            "Hooks: Rebuilding triggered packages",
-            "Pacman:",
-            "Sources:",
-            "50%",
-            "native output retained",
-            "stderr retained",
-            "source terminal retained",
-            "Orphan review confirmed: 1 package selected",
-            "Waiting for repository downloads to finish...",
-            "Downloading packages",
-            "BACKGROUND_WAIT_FINISHED",
-        ] {
-            assert!(output.contains(text), "missing {text}: {output}");
-        }
-        assert!(
-            !output.contains(":: Downloading app.tar.gz"),
-            "worker printed into native output"
-        );
     }
 }

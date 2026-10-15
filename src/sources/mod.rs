@@ -4,6 +4,10 @@ mod catalog;
 mod direct;
 mod install;
 mod provider;
+mod build;
+mod git;
+pub use build::BuildRecipe;
+pub use git::Revision as GitRevision;
 
 use crate::config::Config;
 pub use provider::SourceProvider;
@@ -41,6 +45,7 @@ pub enum Format {
     Archive,
     Binary,
     Native,
+    Source,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +77,7 @@ pub struct Recipe {
     pub version_prefix: String,
     #[serde(default)]
     pub tag_pattern: Option<String>,
+    #[serde(default)]
     pub asset: String,
     pub format: Format,
     #[serde(default)]
@@ -89,6 +95,9 @@ pub struct Recipe {
     pub checksum_asset: Option<String>,
     #[serde(default)]
     pub tag: Option<String>,
+    /// Explicit local build instructions; never acquired from remote metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildRecipe>,
 }
 
 fn one_page() -> u32 {
@@ -126,6 +135,8 @@ pub struct Plan {
     pub tag: String,
     pub version: String,
     pub asset: Asset,
+    /// Immutable Git commit selected before approval, separate from SHA-256 assets.
+    pub git: Option<GitRevision>,
     /// A direct target is retained only after its verified transaction succeeds.
     pub persist_source: bool,
 }
@@ -181,7 +192,7 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
             if !(1..=20).contains(&recipe.release_pages) {
                 return Err("release_pages must be between 1 and 20".into());
             }
-            if !crate::utils::is_safe_pkg_name(name) || !safe_text(&recipe.asset) {
+            if !crate::utils::is_safe_pkg_name(name) || (!safe_text(&recipe.asset) && recipe.build.as_ref().is_none_or(|b| b.git.is_none())) {
                 return Err(format!("Invalid package recipe in '{alias}'"));
             }
             if matches!(source.kind, Kind::Github | Kind::Gitlab) && !safe_relative(&recipe.project)
@@ -194,6 +205,7 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
             if recipe.format != Format::Native && recipe.binaries.is_empty() {
                 return Err(format!("'{name}' needs at least one declared binary"));
             }
+            build::validate(recipe, source)?;
             for (binary, path) in &recipe.binaries {
                 if !crate::utils::is_safe_pkg_name(binary) || !safe_relative(path) {
                     return Err(format!("Invalid binary mapping for '{name}'"));
@@ -307,9 +319,12 @@ pub fn install_targets(
         .collect::<Result<_, _>>()?;
     for plan in &plans {
         println!(
-            ":: Source: {}/{} -> {} ({}, SHA-256 verified before installation)",
-            plan.alias, plan.name, plan.version, plan.tag
+            ":: Source: {}/{} -> {} ({}, {})",
+            plan.alias, plan.name, plan.version, plan.tag,
+            if plan.git.is_some() { "Git commit fixed before approval" } else { "SHA-256 verified before installation" }
         );
+        build::preview(plan);
+        build::check_prerequisites(config, plan, None)?;
     }
     if options.dry_run {
         if let Some(description) = crate::scratch::describe_plan(true, false) { println!("Dry-Run: {description}"); }
@@ -376,6 +391,8 @@ pub fn install_direct(
         plan.recipe.binaries,
         plan.recipe.depends.join(", ")
     );
+    build::preview(&plan);
+    build::check_prerequisites(config, &plan, None)?;
     if options.dry_run {
         if let Some(description) = crate::scratch::describe_plan(true, false) { println!("Dry-Run: {description}"); }
         return Ok(Vec::new());

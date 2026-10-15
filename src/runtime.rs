@@ -1,6 +1,24 @@
 //! Invocation-only controls; never persisted or forwarded to managers.
 use crate::scratch::Policy;
 
+/// Only positively identified capability gaps may be skipped by --keep-going.
+/// Invalid configuration, capacity and unknown failures remain fatal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OptionError {
+    Unsupported(String),
+    Invalid(String),
+}
+
+impl std::fmt::Display for OptionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(reason) | Self::Invalid(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for OptionError {}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UpgradeScope {
     #[default]

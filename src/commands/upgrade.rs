@@ -14,17 +14,13 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
 use std::process::{exit, Command, Stdio};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use alpm::vercmp;
 use colored::Colorize;
 
-use crate::aur;
 use crate::commands::check_pacman_lock;
 use crate::config::Config;
 use crate::db::{AlpmManager, OrphanPackage};
@@ -33,11 +29,21 @@ use crate::journal::TransactionJournal;
 use crate::orphans::OrphanManager;
 use crate::pm;
 use crate::preview::{
-    RequestedItem, RequestedStatus, prepare_native_preview, strip_repo,
+    RequestedStatus, prepare_native_preview, strip_repo,
 };
 use crate::resolver::{ResolveResult, ResolvedPackage, ResolverEngine};
 use crate::restart;
 use crate::ui::{self, print_banner};
+
+mod planning;
+mod preflight;
+#[cfg(test)]
+mod tests;
+
+use planning::{
+    collect_ignored_names, ignored_names, requested_aur_resolved_package,
+    requested_resolved_package, resolve_requested_targets, validate_upgrade_targets,
+};
 
 pub fn cmd_upgrade(
     config: &Config,
@@ -189,11 +195,6 @@ pub fn cmd_upgrade(
         res.held_packages
             .retain(|held| !ignored.contains(&held.name));
     }
-    let orphans = if scope.includes_native() && (config.features.smart_orphans || autoremove) {
-        crate::progress::operation(crate::progress::Manager::Checks, "Checking orphan candidates", || manager.get_orphans(&res.updates))
-    } else {
-        Vec::new()
-    };
     let checked = crate::progress::operation(crate::progress::Manager::Checks, "Checking external updates", || ext_handle.join());
     let mut external_updates = match checked {
         Ok(Ok(updates)) => updates, Ok(Err(error)) => { eprintln!("Error: {error}"); exit(1); },
@@ -222,7 +223,7 @@ pub fn cmd_upgrade(
         );
         exit(1);
     }
-    let requested_targets = match resolve_requested_targets(config, &manager, &res, requested, &ignored) {
+    let mut requested_targets = match resolve_requested_targets(config, &manager, &res, requested, &ignored) {
         Ok(targets) => targets,
         Err(error) => {
             eprintln!("{}", format!("Error: {error}").red());
@@ -233,6 +234,24 @@ pub fn cmd_upgrade(
         || !scope.includes_aur() && !requested_targets.aur.is_empty() {
         eprintln!("Error: requested targets do not belong to the selected upgrade scope"); exit(2);
     }
+    let no_cache = config.options.no_cache
+        || extra_flags.iter().any(|flag| flag == "--no-cache" || flag == "--clean-cache");
+    let manager_flags = crate::runtime::manager_flags(extra_flags);
+    let actionable = !res.updates.is_empty() || !external_updates.is_empty()
+        || requested_targets.items.iter().any(|item| item.status != RequestedStatus::AlreadyCurrent);
+    let aur_preflight = if actionable { preflight::aur_targets(&res, &requested_targets) } else { Vec::new() };
+    let eligibility = match preflight::prepare(config, &ext_providers, &external_updates, aur_preflight, &manager_flags,
+        preflight::Options { policy: crate::scratch::policy(), no_cache, keep_going }) {
+        Ok(plan) => plan,
+        Err(error) => { eprintln!("Error: {error}"); exit(2); }
+    };
+    eligibility.apply(&mut res, &mut requested_targets, &mut external_updates);
+    let orphans = if !eligibility.incomplete() && scope.includes_native() && (config.features.smart_orphans || autoremove) {
+        crate::progress::operation(crate::progress::Manager::Checks, "Checking orphan candidates", || manager.get_orphans(&res.updates))
+    } else {
+        Vec::new()
+    };
+
     let requested_names: HashSet<String> = requested_targets
         .items
         .iter()
@@ -256,7 +275,7 @@ pub fn cmd_upgrade(
         ui::render_requested_box(&requested_targets.items);
     }
     let updates = res_view.updates.clone();
-    let orphan_list_changed = if scope.includes_native() && config.features.smart_orphans {
+    let orphan_list_changed = if !eligibility.incomplete() && scope.includes_native() && config.features.smart_orphans {
         OrphanManager::needs_review(&orphans)
     } else {
         false
@@ -271,6 +290,12 @@ pub fn cmd_upgrade(
         && external_updates.is_empty()
         && (requested_targets.items.is_empty() || !actionable_requested)
     {
+        if eligibility.incomplete() {
+            eligibility.preview();
+            println!(":: No eligible package updates remain; no transaction will be started.");
+            eligibility.report_incomplete();
+            exit(2);
+        }
         ui::render_transaction_view(&res_view, &config.options.helper, &external_updates);
         if !requested_targets.items.is_empty() {
             println!(
@@ -398,6 +423,11 @@ pub fn cmd_upgrade(
         Ok(plan) => plan, Err(error) => { eprintln!("Error: {error}"); exit(1); }
     };
     hook_plan.preview();
+    eligibility.preview();
+    for provider in &ext_providers {
+        let updates: Vec<_> = external_updates.iter().filter(|u| u.runner == provider.name()).cloned().collect();
+        if !updates.is_empty() { provider.preview_upgrade(&updates); }
+    }
     ui::render_transaction_plan(&res_view, &config.options.helper, &external_updates, Some(ui::PlanDetails {
         preview: &preview,
         explicit_names: &explicit_names,
@@ -437,16 +467,6 @@ pub fn cmd_upgrade(
         );
     }
 
-    let no_cache = config.options.no_cache
-        || extra_flags.iter().any(|f| f == "--no-cache" || f == "--clean-cache");
-    if let Err(error) = IntegrationsManager::validate_options(&ext_providers, &external_updates, no_cache) {
-        eprintln!("Error: {error}"); exit(2);
-    }
-
-    let manager_flags = crate::runtime::manager_flags(extra_flags);
-    if !aur_targets.is_empty() {
-        if let Err(error) = pm::validate_aur_scratch(config, &manager_flags) { eprintln!("Error: {error}"); exit(2); }
-    }
     let forwarded_pacman_flags: Vec<&str> = manager_flags
         .iter()
         .filter(|f| {
@@ -534,7 +554,7 @@ pub fn cmd_upgrade(
     }
 
     if dry_run {
-        if keep_going { println!("Dry-Run: --keep-going permits independent Sources only after a verified AUR build failure; the overall run still fails."); }
+        if keep_going { println!("Dry-Run: --keep-going skips unsupported manager options and permits independent Sources after a verified AUR build failure; skipped or failed work keeps the run unsuccessful."); }
         let external_scratch: Vec<_> = ext_providers.iter().filter(|p| p.name() != "Sources" && external_updates.iter().any(|u| u.runner == p.name())).map(|p| p.name()).collect();
         if let Some(description) = crate::scratch::describe_managers(external_updates.iter().any(|u| u.runner == "Sources"), !aur_targets.is_empty() || hook_plan.has_aur(), &external_scratch) { println!("Dry-Run: {description}"); }
         println!("{}", "Dry-Run: Synthesized Upgrade Commands:".bold());
@@ -571,6 +591,7 @@ pub fn cmd_upgrade(
                 format!("{} pacman -Rn --noconfirm -- {}", config.options.privilege_tool, automatic_orphans.join(" ")).cyan()
             );
         }
+        if eligibility.incomplete() { eligibility.report_incomplete(); exit(2); }
         return;
     }
 
@@ -600,6 +621,11 @@ pub fn cmd_upgrade(
     let review_orphans = (autoremove || orphan_list_changed) && !orphans.is_empty();
     let mut selected_orphans = Vec::new();
     let mut prefetch = None;
+    let mut planned_managers = Vec::new();
+    if !pacman_targets.is_empty() { planned_managers.push(crate::progress::Manager::Native); }
+    if !aur_targets.is_empty() { planned_managers.push(crate::progress::Manager::Aur); }
+    planned_managers.extend(external_updates.iter().map(|u| crate::progress::integration_manager(&u.runner)));
+    let _pending_plan;
 
     if !noconfirm {
         if !io::stdin().is_terminal() {
@@ -624,6 +650,7 @@ pub fn cmd_upgrade(
             println!("Aborted.");
             return;
         }
+        _pending_plan = crate::progress::pending(&planned_managers);
 
         if review_orphans {
             if !pacman_targets.is_empty() && config.options.privilege_tool == "sudo" {
@@ -648,6 +675,7 @@ pub fn cmd_upgrade(
             selected_orphans = crate::progress::selection_operation(|| ui::prompt_orphan_selection(&orphans, true));
         }
     } else {
+        _pending_plan = crate::progress::pending(&planned_managers);
         selected_orphans = noconfirm_orphan_selection(&orphans, autoremove);
     }
 
@@ -870,6 +898,7 @@ pub fn cmd_upgrade(
         println!(":: External upgrades skipped because an earlier package transaction failed. Download verification does not mean installation succeeded.");
     }
 
+    if !all_success { crate::progress::stop_pending(); }
     crate::sources::clear_prefetched();
 
     // Journal any packages that were successfully applied to disk.
@@ -937,6 +966,10 @@ pub fn cmd_upgrade(
 
     let hook_outcome = hook_plan.run(config, all_success, noconfirm);
     all_success &= hook_outcome.success;
+    all_success &= !eligibility.incomplete();
+    if eligibility.incomplete() && scope.includes_native() && (config.features.smart_orphans || autoremove) {
+        println!(":: Orphan cleanup skipped because the upgrade plan is incomplete.");
+    }
 
     if all_success && scope.includes_native() && (config.features.smart_orphans || autoremove) {
         // Projected orphans may still be required, or no longer installed,
@@ -978,8 +1011,9 @@ pub fn cmd_upgrade(
     }
     all_success &= cleanup_ok && external_cleanup_ok;
     if !all_success {
+        if eligibility.incomplete() { eligibility.report_incomplete(); }
         match exit_status {
-            Ok(s) => exit(s.code().filter(|code| *code != 0).unwrap_or(1)),
+            Ok(s) => exit(s.code().filter(|code| *code != 0).unwrap_or(if eligibility.incomplete() { 2 } else { 1 })),
             Err(e) => {
                 eprintln!("{}", format!("Execution failed: {}", e).red());
                 exit(1);
@@ -1002,397 +1036,6 @@ fn repo_prefetch_command(targets: &[String], forwarded_flags: &[&str]) -> Comman
     command.arg("--").args(targets);
     command.stdin(Stdio::inherit()).stdout(Stdio::null()).stderr(Stdio::null());
     command
-}
-
-fn validate_upgrade_targets(pacman_targets: &[String], aur_targets: &[String]) -> Result<(), String> {
-    if let Some(target) = pacman_targets.iter().find(|t| !crate::utils::is_safe_install_target(t)) {
-        return Err(format!("Refusing unsafe pacman upgrade target '{}'.", target));
-    }
-    if let Some(target) = aur_targets.iter().find(|t| !crate::utils::is_safe_pkg_name(t)) {
-        return Err(format!("Refusing unsafe AUR upgrade target '{}'.", target));
-    }
-    Ok(())
-}
-
-/// Builds the journal/restart record for an explicitly requested native
-/// package from its approved preview entry.
-fn requested_resolved_package(
-    item: &RequestedItem,
-    entry: &crate::preview::PreviewPackage,
-) -> ResolvedPackage {
-    ResolvedPackage {
-        name: item.name.clone(),
-        state: "explicit".to_string(),
-        pinned_repo: None,
-        installed_ver: item.installed_version.clone().unwrap_or_default(),
-        installed_size: entry.old_isize,
-        installed_db: String::new(),
-        candidate: Some(crate::resolver::CandidatePackage {
-            name: item.name.clone(),
-            version: entry.version.clone(),
-            repo: entry.repo.clone(),
-            base: item.name.clone(),
-            csize: 0,
-            isize: entry.new_isize,
-            desc: String::new(),
-            builddate: 0,
-            is_aur: false,
-            depends: Vec::new(),
-        }),
-        natural_top_repo: None,
-        diverted_from_top: false,
-        needs_update: true,
-        update_type: "explicit".to_string(),
-        is_downgrade: item.status == RequestedStatus::Downgrade,
-        net_delta: Some(entry.net_delta()),
-        held: false,
-        hold_reason: String::new(),
-    }
-}
-
-/// Builds the journal record for an explicitly requested AUR package. Build
-/// sizes are unknown until the helper builds them.
-fn requested_aur_resolved_package(item: &RequestedItem) -> ResolvedPackage {
-    ResolvedPackage {
-        name: item.name.clone(),
-        state: "explicit".to_string(),
-        pinned_repo: None,
-        installed_ver: item.installed_version.clone().unwrap_or_default(),
-        installed_size: 0,
-        installed_db: String::new(),
-        candidate: Some(crate::resolver::CandidatePackage {
-            name: item.name.clone(),
-            version: item.candidate_version.clone(),
-            repo: "aur".to_string(),
-            base: item.name.clone(),
-            csize: 0,
-            isize: 0,
-            desc: String::new(),
-            builddate: 0,
-            is_aur: true,
-            depends: Vec::new(),
-        }),
-        natural_top_repo: None,
-        diverted_from_top: false,
-        needs_update: true,
-        update_type: "explicit".to_string(),
-        is_downgrade: item.status == RequestedStatus::Downgrade,
-        net_delta: None,
-        held: false,
-        hold_reason: String::new(),
-    }
-}
-
-struct RequestedTargets {
-    items: Vec<RequestedItem>,
-    native: Vec<String>,
-    aur: Vec<String>,
-}
-
-fn requested_status(installed: Option<&str>, candidate: &str) -> RequestedStatus {
-    match installed {
-        None => RequestedStatus::NewInstall,
-        Some(current) => match vercmp(current, candidate) {
-            Ordering::Less => RequestedStatus::Upgrade,
-            Ordering::Greater => RequestedStatus::Downgrade,
-            Ordering::Equal => RequestedStatus::AlreadyCurrent,
-        },
-    }
-}
-
-/// True when `--ignore <pkg>` / `--ignore=<pkg>` explicitly names this package.
-/// All package names named by `--ignore <pkg>` / `--ignore=<pkg>` (comma
-/// separated) plus `--ignoregroup` (expanded to current group members).
-/// Pacman skips these at execution, so they must never be recorded as applied
-/// afterwards.
-fn ignored_names(extra_flags: &[String]) -> HashSet<String> {
-    let mut ignored = HashSet::new();
-    let mut iter = extra_flags.iter();
-    while let Some(flag) = iter.next() {
-        if let Some(list) = flag.strip_prefix("--ignore=") {
-            ignored.extend(list.split(',').map(str::to_string));
-        } else if flag == "--ignore" {
-            if let Some(next) = iter.next() {
-                ignored.extend(next.split(',').map(str::to_string));
-            }
-        }
-    }
-    ignored.retain(|name| !name.is_empty());
-    ignored
-}
-
-/// Expands `--ignoregroup` entries to current sync-group members. Ignored
-/// updates are excluded from the plan entirely: pacman answers "Install
-/// anyway?" affirmatively for explicitly listed targets under --noconfirm,
-/// so merely forwarding the flags would silently void ignores.
-fn collect_ignored_names(manager: &AlpmManager, extra_flags: &[String]) -> HashSet<String> {
-    let mut ignored = ignored_names(extra_flags);
-    let mut groups = Vec::new();
-    let mut iter = extra_flags.iter();
-    while let Some(flag) = iter.next() {
-        if let Some(list) = flag.strip_prefix("--ignoregroup=") {
-            groups.extend(list.split(',').map(str::to_string));
-        } else if flag == "--ignoregroup" {
-            if let Some(next) = iter.next() {
-                groups.extend(next.split(',').map(str::to_string));
-            }
-        }
-    }
-    for group in groups.iter().filter(|g| !g.is_empty()) {
-        for db in manager.handle().syncdbs() {
-            if let Ok(g) = db.group(group.as_str()) {
-                ignored.extend(g.packages().into_iter().map(|p| p.name().to_string()));
-            }
-        }
-    }
-    ignored
-}
-
-fn check_requested_delay(name: &str, builddate: i64, config: &Config, now_epoch: i64) -> Result<(), String> {
-    if !config.features.stability_delays || builddate <= 0 {
-        return Ok(());
-    }
-    let glob_delays = ResolverEngine::compile_glob_delays(&config.delay);
-    if let Some(days) = ResolverEngine::match_delay_days(name, &config.delay, &glob_delays) {
-        let age_days = now_epoch.saturating_sub(builddate) / 86400;
-        if age_days < days as i64 {
-            return Err(format!(
-                "'{name}' is held by a stability delay ({days} days; {} remaining); it cannot be pulled into this upgrade.",
-                (days as i64 - age_days).max(0)
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Classifies explicitly requested upgrade targets (`pin -Syu <pkg...>`)
-/// into native repo targets, AUR targets, and display items. Source-owned and
-/// direct upstream targets are rejected with guidance instead of being
-/// silently ignored: they are already tracked by `pin -Syu`.
-fn resolve_requested_targets(
-    config: &Config,
-    manager: &AlpmManager,
-    res: &ResolveResult,
-    requested: &[String],
-    ignored: &HashSet<String>,
-) -> Result<RequestedTargets, String> {
-    let mut out = RequestedTargets {
-        items: Vec::new(),
-        native: Vec::new(),
-        aur: Vec::new(),
-    };
-    if requested.is_empty() {
-        return Ok(out);
-    }
-    let now_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    let held_by_name = |name: &str| res.held_packages.iter().any(|held| held.name == name);
-    let installed_version = |name: &str| {
-        manager
-            .handle()
-            .localdb()
-            .pkg(name)
-            .ok()
-            .map(|pkg| pkg.version().to_string())
-    };
-    let pins = if config.features.pinning {
-        config.pins.clone()
-    } else {
-        std::collections::BTreeMap::new()
-    };
-    let glob_pins = ResolverEngine::compile_glob_pins(&pins);
-
-    for target in requested {
-        // Silently repeated targets are shown and executed once; the first
-        // spelling wins so the Requested box never lists duplicates.
-        if out.items.iter().any(|item| item.name == strip_repo(target)) {
-            continue;
-        }
-        if crate::sources::is_direct_syntax(target) {            return Err(format!(
-                "Direct upstream source '{target}' cannot be combined with a system upgrade; it is already tracked by 'pin -Syu', or reinstall it separately with 'pin -S {target}'."
-            ));
-        }
-        if let Some((head, tail)) = target.split_once('/') {
-            if config.sources.contains_key(head) {
-                return Err(format!(
-                    "Upstream source '{target}' cannot be combined with a system upgrade; it is already tracked by 'pin -Syu', or reinstall it separately with 'pin -S {target}'."
-                ));
-            }
-            if !crate::utils::is_safe_install_target(target) {
-                return Err(format!("Refusing unsafe package target '{target}'."));
-            }
-            if head.eq_ignore_ascii_case("aur") {
-                if !crate::utils::is_safe_pkg_name(tail) {
-                    return Err(format!("Refusing unsafe AUR upgrade target '{tail}'."));
-                }
-                let found = aur::query_aur(std::slice::from_ref(&tail.to_string()));
-                let item = found.get(tail).ok_or_else(|| {
-                    format!("'{target}' was not found in the AUR.")
-                })?;
-                if held_by_name(tail) {
-                    return Err(format!("'{tail}' is currently held back and cannot be pulled into this upgrade."));
-                }
-                if ignored.contains(tail) {
-                    return Err(format!("'{tail}' is explicitly ignored; remove the matching --ignore/--ignoregroup entry to include it in this upgrade."));
-                }
-                out.aur.push(tail.to_string());
-                out.items.push(RequestedItem {
-                    name: tail.to_string(),
-                    manager: "aur".to_string(),
-                    repo: Some("aur".to_string()),
-                    installed_version: installed_version(tail),
-                    candidate_version: item.version.clone(),
-                    status: requested_status(installed_version(tail).as_deref(), &item.version),
-                });
-            } else if manager.repos().iter().any(|repo| repo == head) {
-                let db = manager
-                    .handle()
-                    .syncdbs()
-                    .into_iter()
-                    .find(|db| db.name() == head)
-                    .ok_or_else(|| {
-                        format!("Repository '[{head}]' is configured but has no loaded database; refresh with 'pin -Sy'.")
-                    })?;
-                let pkg = db.pkg(tail).map_err(|_| {
-                    format!("Package '{tail}' was not found in repository '[{head}]'.")
-                })?;
-                if held_by_name(tail) {
-                    return Err(format!("'{tail}' is currently held back and cannot be pulled into this upgrade."));
-                }
-                if ignored.contains(tail) {
-                    return Err(format!("'{tail}' is explicitly ignored; remove the matching --ignore/--ignoregroup entry to include it in this upgrade."));
-                }
-                if ResolverEngine::is_excluded(tail, head, &config.exclude) {
-                    return Err(format!("'{tail}' is excluded from [{head}] by configuration; remove the exclusion to include it in this upgrade."));
-                }
-                check_requested_delay(tail, pkg.build_date(), config, now_epoch)?;
-                let installed = installed_version(tail);
-                let candidate = pkg.version().to_string();
-                out.native.push(target.clone());
-                out.items.push(RequestedItem {
-                    name: tail.to_string(),
-                    manager: "repo".to_string(),
-                    repo: Some(head.to_string()),
-                    installed_version: installed.clone(),
-                    candidate_version: candidate.clone(),
-                    status: requested_status(installed.as_deref(), &candidate),
-                });
-            } else {
-                return Err(format!(
-                    "Repository '[{head}]' is not recognized. Configured repositories: {}",
-                    manager.repos().join(", ")
-                ));
-            }
-            continue;
-        }
-
-        if !crate::utils::is_safe_install_target(target) {
-            return Err(format!("Refusing unsafe package target '{target}'."));
-        }
-        if let Some(alias) = crate::sources::owner(config, target) {
-            return Err(format!(
-                "'{target}' is owned by upstream source '{alias}'; it is already tracked by 'pin -Syu'. To force a reinstall, run 'pin -S {alias}/{target}'."
-            ));
-        }
-        if ignored.contains(target) {
-            return Err(format!("'{target}' is explicitly ignored; remove the matching --ignore/--ignoregroup entry to include it in this upgrade."));
-        }
-        // Repository pins are policy: a bare requested target resolves from
-        // its pinned repository, exactly like a pinned update would. Without
-        // a pin, plain repository priority applies.
-        let pinned = ResolverEngine::match_pinned_package(target, &pins, &glob_pins);
-        if let Some(pinned_repo) = pinned.as_deref() {
-            if pinned_repo != "aur" {
-                let db = manager
-                    .handle()
-                    .syncdbs()
-                    .into_iter()
-                    .find(|db| db.name() == pinned_repo)
-                    .ok_or_else(|| {
-                        format!("'{target}' is pinned to '[{pinned_repo}]', which is not a registered repository.")
-                    })?;
-                let pkg = db.pkg(target.as_str()).map_err(|_| {
-                    format!("'{target}' is pinned to '[{pinned_repo}]', which does not carry it; adjust the pin or qualify another repository explicitly.")
-                })?;
-                if held_by_name(target) {
-                    return Err(format!("'{target}' is currently held back and cannot be pulled into this upgrade."));
-                }
-                if ResolverEngine::is_excluded(target, pinned_repo, &config.exclude) {
-                    return Err(format!("'{target}' is excluded from [{pinned_repo}] by configuration; remove the exclusion to include it in this upgrade."));
-                }
-                check_requested_delay(target, pkg.build_date(), config, now_epoch)?;
-                let installed = installed_version(target);
-                let candidate = pkg.version().to_string();
-                out.native.push(format!("{pinned_repo}/{target}"));
-                out.items.push(RequestedItem {
-                    name: target.clone(),
-                    manager: "repo".to_string(),
-                    repo: Some(pinned_repo.to_string()),
-                    installed_version: installed.clone(),
-                    candidate_version: candidate.clone(),
-                    status: requested_status(installed.as_deref(), &candidate),
-                });
-                continue;
-            }
-            // Pinned to the AUR: skip the sync databases and use the AUR
-            // lookup below, mirroring resolver policy for pinned packages.
-        }
-        // A pin to the AUR skips the sync databases (resolver policy);
-        // otherwise fall back to the AUR only when no sync package matches.
-        let mut handled_native = false;
-        if pinned.as_deref() != Some("aur") {
-            if let Some(sync_pkg) = manager
-            .handle()
-            .syncdbs()
-            .into_iter()
-            .find_map(|db| db.pkg(target.as_str()).ok().map(|pkg| (db.name().to_string(), pkg.version().to_string(), pkg.build_date(), pkg.isize().max(0))))
-        {
-            let (repo, candidate, builddate, _isize) = sync_pkg;
-            if held_by_name(target) {
-                return Err(format!("'{target}' is currently held back and cannot be pulled into this upgrade."));
-            }
-            if ResolverEngine::is_excluded(target, &repo, &config.exclude) {
-                return Err(format!("'{target}' is excluded from [{repo}] by configuration; remove the exclusion to include it in this upgrade."));
-            }
-            check_requested_delay(target, builddate, config, now_epoch)?;
-            let installed = installed_version(target);
-            // Qualify with the resolving repository so the executed command
-            // installs exactly what the preview approved.
-            out.native.push(format!("{repo}/{target}"));
-            out.items.push(RequestedItem {
-                name: target.clone(),
-                manager: "repo".to_string(),
-                repo: Some(repo),
-                installed_version: installed.clone(),
-                candidate_version: candidate.clone(),
-                status: requested_status(installed.as_deref(), &candidate),
-            });
-            handled_native = true;
-        }
-        }
-        if !handled_native {
-            let found = aur::query_aur(std::slice::from_ref(target));
-            let item = found.get(target).ok_or_else(|| {
-                format!("'{target}' was not found in the sync databases or the AUR.")
-            })?;
-            if held_by_name(target) {
-                return Err(format!("'{target}' is currently held back and cannot be pulled into this upgrade."));
-            }
-            out.aur.push(target.clone());
-            out.items.push(RequestedItem {
-                name: target.clone(),
-                manager: "aur".to_string(),
-                repo: Some("aur".to_string()),
-                installed_version: installed_version(target),
-                candidate_version: item.version.clone(),
-                status: requested_status(installed_version(target).as_deref(), &item.version),
-            });
-        }
-    }
-    Ok(out)
 }
 
 fn revalidate_orphan_selection(
@@ -1511,325 +1154,4 @@ fn validate_channel_flags(flags: &[String]) -> Result<(), String> {
         return Err("--channel must be stable, alpha, beta, or prerelease".into());
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn noconfirm_only_autoremoves_pure_orphans_when_requested() {
-        let make_orphan = |name: &str, optional_for: Vec<String>| OrphanPackage {
-            name: name.into(), version: "1".into(), isize: 1,
-            desc: String::new(), is_projected: false, dropped_by: Vec::new(), optional_for,
-        };
-        let orphans = vec![
-            make_orphan("pure", Vec::new()),
-            make_orphan("plugin", vec!["installed-parent".into()]),
-        ];
-        assert!(noconfirm_orphan_selection(&orphans, false).is_empty());
-        assert_eq!(noconfirm_orphan_selection(&orphans, true), vec!["pure"]);
-        let selected = vec!["pure".into(), "plugin".into(), "no-longer-orphan".into()];
-        assert_eq!(revalidate_orphan_selection(&selected, &orphans, false), vec!["pure", "plugin"]);
-        assert_eq!(revalidate_orphan_selection(&selected, &orphans, true), vec!["pure"]);
-    }
-
-    #[test]
-    fn upgrade_targets_reject_option_injection() {
-        assert!(validate_upgrade_targets(&["extra/git".into()], &["paru-bin".into()]).is_ok());
-        assert!(validate_upgrade_targets(&["--config".into()], &[]).is_err());
-        assert!(validate_upgrade_targets(&[], &["-evil".into()]).is_err());
-    }
-
-    #[test]
-    fn repo_prefetch_downloads_without_installing_or_refreshing() {
-        let targets = vec!["core/linux".into(), "extra/git".into()];
-        let command = repo_prefetch_command(&targets, &["--ignore", "linux-firmware"]);
-        let args: Vec<_> = command.get_args().map(|arg| arg.to_str().unwrap()).collect();
-        assert_eq!(args, [
-            "-n", "pacman", "-Sw", "--needed", "--noconfirm",
-            "--ignore", "linux-firmware", "--", "core/linux", "extra/git",
-        ]);
-    }
-
-    #[test]
-    fn requested_status_compares_versions() {
-        assert_eq!(requested_status(None, "1.0-1"), RequestedStatus::NewInstall);
-        assert_eq!(
-            requested_status(Some("1.0-1"), "2.0-1"),
-            RequestedStatus::Upgrade
-        );
-        assert_eq!(
-            requested_status(Some("2.0-1"), "1.0-1"),
-            RequestedStatus::Downgrade
-        );
-        assert_eq!(
-            requested_status(Some("1.0-1"), "1.0-1"),
-            RequestedStatus::AlreadyCurrent
-        );
-    }
-
-    #[test]
-    fn ignored_names_collects_comma_lists() {
-        let flags = vec![
-            "--ignore=a,b".to_string(),
-            "--ignore".to_string(),
-            "c".to_string(),
-            "--noconfirm".to_string(),
-        ];
-        let got = ignored_names(&flags);
-        assert!(got.contains("a") && got.contains("b") && got.contains("c"));
-        assert_eq!(got.len(), 3);
-    }
-
-    #[test]
-    fn collect_ignored_names_expands_groups() {
-        use crate::db::test_support::{AlpmFixture, FixturePackage};
-        let mut member = FixturePackage::new("member", "1-1");
-        member.groups = &["mygroup"];
-        let sync = [member, FixturePackage::new("other", "1-1")];
-        let fixture = AlpmFixture::new(&[], &[("extra", &sync)]);
-        let flags = vec![
-            "--ignore=solo".to_string(),
-            "--ignoregroup".to_string(),
-            "mygroup".to_string(),
-            "--ignoregroup=bogusgroup".to_string(),
-        ];
-        let got = collect_ignored_names(&fixture.manager, &flags);
-        assert!(got.contains("solo"));
-        assert!(got.contains("member"));
-        assert!(!got.contains("other"));
-        assert!(!got.contains(""));
-    }
-
-    #[test]
-    fn ignored_names_matches_exact_entries() {
-        let flags = vec![
-            "--ignore=linux,linux-firmware".to_string(),
-            "--ignore".to_string(),
-            "foo".to_string(),
-        ];
-        let got = ignored_names(&flags);
-        assert!(got.contains("linux"));
-        assert!(got.contains("linux-firmware"));
-        assert!(got.contains("foo"));
-        assert!(!got.contains("bar"));
-        assert!(!got.contains("linux-firm"));
-    }
-
-    #[test]
-    fn requested_targets_classify_native_and_fail_closed() {
-        use crate::db::test_support::{AlpmFixture, FixturePackage};
-        use std::collections::HashMap;
-
-        let local = [FixturePackage::new("old", "1.0-1")];
-        let sync = [
-            FixturePackage::new("newpkg", "1.0-1"),
-            FixturePackage::new("old", "2.0-1"),
-        ];
-        let fixture = AlpmFixture::new(&local[..], &[("extra", &sync[..])]);
-        let config = Config::default();
-        let res = ResolveResult {
-            check_errors: Vec::new(),
-            installed_count: 0,
-            repos: Vec::new(),
-            packages: HashMap::new(),
-            updates: Vec::new(),
-            held_packages: Vec::new(),
-            unresolved_pins: Vec::new(),
-        };
-
-        let out = resolve_requested_targets(
-            &config,
-            &fixture.manager,
-            &res,
-            &["newpkg".to_string(), "old".to_string()],
-            &HashSet::new(),
-        )
-        .expect("native requested targets resolve");
-        assert_eq!(
-            out.native,
-            vec!["extra/newpkg".to_string(), "extra/old".to_string()]
-        );
-        assert!(out.aur.is_empty());
-        let statuses: Vec<(String, RequestedStatus)> = out
-            .items
-            .iter()
-            .map(|item| (item.name.clone(), item.status.clone()))
-            .collect();
-        assert!(statuses.contains(&("newpkg".to_string(), RequestedStatus::NewInstall)));
-        assert!(statuses.contains(&("old".to_string(), RequestedStatus::Upgrade)));
-
-        // Repeated targets are shown and executed once.
-        let out = resolve_requested_targets(
-            &config,
-            &fixture.manager,
-            &res,
-            &["newpkg".to_string(), "extra/newpkg".to_string()],
-            &HashSet::new(),
-        )
-        .expect("repeated targets resolve");
-        assert_eq!(out.items.len(), 1);
-        assert_eq!(out.native.len(), 1);
-
-        // Unknown repos, unsafe targets, ignored packages, and upstream
-        // source targets fail closed without network access.
-        assert!(resolve_requested_targets(
-            &config,
-            &fixture.manager,
-            &res,
-            &["extra/nope".to_string()],
-            &HashSet::new(),
-        )
-        .is_err());
-        assert!(resolve_requested_targets(
-            &config,
-            &fixture.manager,
-            &res,
-            &["bogus/pkg".to_string()],
-            &HashSet::new(),
-        )
-        .is_err());
-        assert!(resolve_requested_targets(
-            &config,
-            &fixture.manager,
-            &res,
-            &["--config".to_string()],
-            &HashSet::new(),
-        )
-        .is_err());
-        let mut ignore_old = HashSet::new();
-        ignore_old.insert("old".to_string());
-        assert!(resolve_requested_targets(
-            &config,
-            &fixture.manager,
-            &res,
-            &["old".to_string()],
-            &ignore_old,
-        )
-        .is_err());
-        assert!(resolve_requested_targets(
-            &config,
-            &fixture.manager,
-            &res,
-            &["github:owner/repo".to_string()],
-            &HashSet::new(),
-        )
-        .is_err());
-
-        let mut alias_config = config.clone();
-        alias_config.sources.insert(
-            "myalias".to_string(),
-            crate::sources::Source {
-                kind: crate::sources::Kind::Github,
-                url: String::new(),
-                token_env: None,
-                packages: Default::default(),
-            },
-        );
-        assert!(resolve_requested_targets(
-            &alias_config,
-            &fixture.manager,
-            &res,
-            &["myalias/pkg".to_string()],
-            &HashSet::new(),
-        )
-        .is_err());
-    }
-
-    fn empty_resolve_result() -> ResolveResult {
-        ResolveResult {
-            check_errors: Vec::new(),
-            installed_count: 0,
-            repos: Vec::new(),
-            packages: std::collections::HashMap::new(),
-            updates: Vec::new(),
-            held_packages: Vec::new(),
-            unresolved_pins: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn requested_targets_honor_repo_pins() {
-        use crate::db::test_support::{AlpmFixture, FixturePackage};
-
-        let local = [FixturePackage::new("dup", "1.0-1")];
-        let repo_a = [FixturePackage::new("dup", "2.0-1")];
-        let repo_b = [FixturePackage::new("dup", "1.0-1")];
-        let fixture =
-            AlpmFixture::new(&local[..], &[("repo-a", &repo_a[..]), ("repo-b", &repo_b[..])]);
-        let res = empty_resolve_result();
-
-        // Without a pin, plain repository priority (first sync db) wins.
-        let out = resolve_requested_targets(
-            &Config::default(),
-            &fixture.manager,
-            &res,
-            &["dup".to_string()],
-            &HashSet::new(),
-        )
-        .expect("unpinned request resolves");
-        assert_eq!(out.native, vec!["repo-a/dup".to_string()]);
-        assert_eq!(out.items[0].status, RequestedStatus::Upgrade);
-
-        // With a pin, the pinned repository wins even when it is not first.
-        let mut pinned_config = Config::default();
-        pinned_config.pins.insert("dup".to_string(), "repo-b".to_string());
-        let out = resolve_requested_targets(
-            &pinned_config,
-            &fixture.manager,
-            &res,
-            &["dup".to_string()],
-            &HashSet::new(),
-        )
-        .expect("pinned request resolves");
-        assert_eq!(out.native, vec!["repo-b/dup".to_string()]);
-        assert_eq!(out.items[0].status, RequestedStatus::AlreadyCurrent);
-
-        // Glob pins apply too.
-        pinned_config.pins.clear();
-        pinned_config
-            .pins
-            .insert("du*".to_string(), "repo-b".to_string());
-        let out = resolve_requested_targets(
-            &pinned_config,
-            &fixture.manager,
-            &res,
-            &["dup".to_string()],
-            &HashSet::new(),
-        )
-        .expect("glob-pinned request resolves");
-        assert_eq!(out.native, vec!["repo-b/dup".to_string()]);
-
-        // A pin to a repository that does not carry the package fails
-        // closed instead of silently installing from elsewhere.
-        pinned_config.pins.clear();
-        pinned_config
-            .pins
-            .insert("dup".to_string(), "repo-b".to_string());
-        let mut missing_config = Config::default();
-        missing_config
-            .pins
-            .insert("dup".to_string(), "repo-missing".to_string());
-        assert!(resolve_requested_targets(
-            &missing_config,
-            &fixture.manager,
-            &res,
-            &["dup".to_string()],
-            &HashSet::new(),
-        )
-        .is_err());
-
-        // Disabled pinning restores plain priority.
-        pinned_config.features.pinning = false;
-        let out = resolve_requested_targets(
-            &pinned_config,
-            &fixture.manager,
-            &res,
-            &["dup".to_string()],
-            &HashSet::new(),
-        )
-        .expect("unpinned request resolves");
-        assert_eq!(out.native, vec!["repo-a/dup".to_string()]);
-    }
 }

@@ -16,11 +16,12 @@ pub(super) fn is_paru(helper: &str) -> bool {
         .is_some_and(|name| name == "paru")
 }
 pub(super) fn validate(helper: &str, policy: Policy, forwarded: &[String]) -> Result<(), String> {
+    check_options(helper, policy, forwarded).map_err(|error| error.to_string())
+}
+pub(super) fn check_options(helper: &str, policy: Policy, forwarded: &[String]) -> Result<(), crate::runtime::OptionError> {
+    use crate::runtime::OptionError;
     if policy == Policy::Auto {
         return Ok(());
-    }
-    if !is_paru(helper) {
-        return Err("Explicit scratch policy currently supports Paru and Sources; this AUR helper is unsupported".into());
     }
     if forwarded.iter().any(|flag| {
         matches!(
@@ -28,10 +29,13 @@ pub(super) fn validate(helper: &str, policy: Policy, forwarded: &[String]) -> Re
             "--clonedir" | "--makepkg" | "--mflags" | "--chroot" | "--localrepo"
         )
     }) {
-        return Err(
+        return Err(OptionError::Invalid(
             "Scratch policy conflicts with custom clone, makepkg, chroot or local-repository flags"
                 .into(),
-        );
+        ));
+    }
+    if !is_paru(helper) {
+        return Err(OptionError::Unsupported("Explicit scratch policy currently supports Paru and Sources; this AUR helper is unsupported".into()));
     }
     Ok(())
 }
@@ -54,7 +58,7 @@ impl AurWorkspace {
             return Err(io::Error::last_os_error());
         }
         let path = PathBuf::from(std::ffi::OsStr::from_bytes(&template[..template.len() - 1]));
-        crate::sandbox::register_cleanup_target(path.clone());
+        crate::execution::register_cleanup_target(path.clone());
         let work = Self {
             path,
             preserve: false,
@@ -87,7 +91,7 @@ impl AurWorkspace {
     pub fn finish(&mut self, success: bool) {
         self.preserve = !success;
         if self.preserve {
-            crate::sandbox::unregister_cleanup_target(&self.path);
+            crate::execution::unregister_cleanup_target(&self.path);
             eprintln!(":: AUR build failed; workspace retained for inspection: {} (RAM workspaces do not survive reboot)", self.path.display());
         }
     }
@@ -103,7 +107,7 @@ impl Drop for AurWorkspace {
                     );
                 }
             }
-            crate::sandbox::unregister_cleanup_target(&self.path);
+            crate::execution::unregister_cleanup_target(&self.path);
         }
     }
 }

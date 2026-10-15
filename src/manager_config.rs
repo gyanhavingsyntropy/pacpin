@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 pub const DEFAULT_MANAGERS: &str = include_str!("../docs/managers.toml");
-pub const DEFAULT_SOURCES: &str = "# Release recipes; same [sources.alias] schema as config.toml.\n# Existing recipes in config.toml remain supported. Duplicate aliases are errors.\n[sources]\n";
+pub const DEFAULT_SOURCES: &str = "# Release and source-build recipes; same [sources.alias] schema as config.toml.\n# Existing recipes in config.toml remain supported. Duplicate aliases are errors.\n# format='source' uses a per-package [sources.ALIAS.packages.PACKAGE.build] table.\n# build.optimization defaults to inherited makepkg settings; native CPU, level\n# and LTO overrides are opt-in. See docs/sources.md for complete recipes.\n[sources]\n";
 pub const DEFAULT_HOOKS: &str = "# Post-update actions; same [hooks.name] schema as config.toml.\n# Runs only after verified installed version changes in a successful upgrade.\n# [hooks.example]\n# watch = [\"mutter\", \"gnome-shell\"]\n# action = \"script\"\n# command = [\"/absolute/path/rebuild-blur\"]\n[hooks]\n";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,6 +74,16 @@ pub fn validate(file: &ManagerFile) -> Result<(), String> {
     if file.version != 1 { return Err("Unsupported managers.toml version; expected 1".into()); }
     if file.managers.len() > 64 { return Err("At most 64 managers can be configured".into()); }
     for (name, definition) in &file.managers {
+        // Configuration keys choose typed adapters; display aliases must not
+        // introduce a second external provider with a built-in identity.
+        if matches!(name.as_str(), "pacman" | "aur" | "flatpak" | "nix" | "pipx")
+            && definition.adapter != *name
+        {
+            return Err(format!("{name}: this reserved manager key must use adapter '{name}'"));
+        }
+        if definition.adapter == "command" && matches!(name.as_str(), "Flatpak" | "Nix" | "Pipx") {
+            return Err(format!("{name}: this external manager display name is reserved"));
+        }
         if name.len() > 64 || !crate::utils::is_safe_pkg_name(name) || name == "Sources" {
             return Err(format!("Invalid or reserved manager name '{name}'"));
         }
@@ -233,5 +243,17 @@ mod tests {
         assert_eq!(std::fs::read_to_string(directory.join("hooks.toml")).unwrap(), "# user's hooks\n");
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 3);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn manager_keys_and_builtin_display_names_cannot_shadow_typed_adapters() {
+        for name in ["pacman", "aur", "flatpak", "nix", "pipx", "Flatpak", "Nix", "Pipx"] {
+            let body = format!("[managers.{name}]\nadapter='command'\ncheck=['tool','check']\nupgrade=['tool','upgrade','{{id}}']\nverify=['tool','verify','{{id}}']");
+            let file: ManagerFile = toml::from_str(&body).unwrap();
+            assert!(validate(&file).is_err(), "reserved identity {name} accepted");
+        }
+        // Core AUR and an external namesake have distinct stage identities.
+        let file: ManagerFile = toml::from_str("[managers.AUR]\nadapter='command'\ncheck=['tool','check']\nupgrade=['tool','upgrade','{id}']\nverify=['tool','verify','{id}']").unwrap();
+        assert!(validate(&file).is_ok());
     }
 }

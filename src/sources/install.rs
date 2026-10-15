@@ -1,5 +1,5 @@
 use super::*;
-use crate::sandbox::{register_cleanup_target, unregister_cleanup_target};
+use crate::execution::{register_cleanup_target, unregister_cleanup_target};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
@@ -87,7 +87,7 @@ fn select_scratch_base(
 pub struct Workdir(pub PathBuf);
 impl Workdir {
     pub fn new_with_base(base: &Path) -> Result<Self, String> {
-        crate::sandbox::init_signal_handlers();
+        crate::execution::init_signal_handlers();
         let template = base.join("pacpin-source-XXXXXX");
         use std::os::unix::ffi::OsStrExt;
         let mut bytes = template.as_os_str().as_bytes().to_vec();
@@ -150,7 +150,10 @@ impl Workdir {
     pub fn new_for_plan(_plan: &Plan, expected_bytes: Option<u64>) -> Result<Self, String> {
         // Only the download is needed initially. Its length and the expanded
         // payload are checked separately as soon as they become known.
-        let base = choose_scratch_base(expected_bytes.unwrap_or(64 * 1024), 1)?;
+        let (bytes, inodes) = if let Some(build) = &_plan.recipe.build {
+            (build.initial_bytes().saturating_add(expected_bytes.unwrap_or(64 * 1024)), build.scratch_inodes.saturating_add(32))
+        } else { (expected_bytes.unwrap_or(64 * 1024), 1) };
+        let base = choose_scratch_base(bytes, inodes)?;
         let work = Self::new_with_base(&base)?;
         if crate::scratch::policy() != crate::scratch::Policy::Auto {
             crate::progress::source_message(format!(":: Sources temporary workspace: {} ({:?})", work.0.display(), crate::scratch::policy()));
@@ -160,7 +163,9 @@ impl Workdir {
 }
 impl Drop for Workdir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if let Err(error) = crate::execution::remove_owned_tree(&self.0) {
+            eprintln!("Warning: Cannot remove source workspace {}: {error}", self.0.display());
+        }
         unregister_cleanup_target(&self.0);
     }
 }
@@ -170,6 +175,8 @@ pub fn prefetch(plan: &Plan) -> Result<(), String> {
 }
 
 fn prefetch_inner(plan: &Plan) -> Result<(), String> {
+    // Git subprocesses retain normal foreground progress/input ownership.
+    if plan.git.is_some() { return Ok(()); }
     let key = format!("{}/{}/{}", plan.alias, plan.name, plan.tag);
     if let Ok(lock) = PREFETCH_CACHE.lock() {
         if let Some(map) = lock.as_ref() {
@@ -231,6 +238,7 @@ pub fn confirm(noconfirm: bool) -> Result<(), String> {
 }
 
 fn download(plan: &Plan, work: &mut Workdir) -> Result<PathBuf, String> {
+    if let Some(revision) = &plan.git { return super::git::fetch(plan, revision, &work.0); }
     crate::progress::source_operation(|| download_inner(plan, work))
 }
 
@@ -368,7 +376,11 @@ fn download_inner(plan: &Plan, work: &mut Workdir) -> Result<PathBuf, String> {
 
 fn prepare_build(plan: &Plan, work: &mut Workdir) -> Result<PathBuf, String> {
     let artifact = work.0.join("artifact");
-    let (bytes, entries) = if plan.recipe.format == Format::Archive {
+    if plan.git.is_some() {
+        super::build::check_capacity(plan, &work.0)?;
+        return Ok(work.0.join("git-source"));
+    }
+    let (bytes, entries) = if matches!(plan.recipe.format, Format::Archive | Format::Source) {
         crate::archive::footprint(&artifact)?
     } else {
         (fs::metadata(&artifact).map_err(|e| e.to_string())?.len(), 1)
@@ -376,13 +388,13 @@ fn prepare_build(plan: &Plan, work: &mut Workdir) -> Result<PathBuf, String> {
     // The validated payload is moved into pkgdir, not copied. It coexists
     // with a worst-case compressed package. Keep room for package metadata.
     work.ensure_capacity(
-        bytes.saturating_mul(2).saturating_add(BUILD_RESERVE),
-        entries.saturating_add(16),
+        bytes.saturating_mul(2).saturating_add(BUILD_RESERVE).saturating_add(plan.recipe.build.as_ref().map_or(0, |b| b.headroom_bytes())),
+        entries.saturating_add(16).saturating_add(plan.recipe.build.as_ref().map_or(0, |b| b.scratch_inodes)),
     )?;
     Ok(work.0.join("artifact"))
 }
 
-fn pkgbuild(plan: &Plan, payload: &Path) -> String {
+pub(super) fn pkgbuild(plan: &Plan, payload: &Path) -> String {
     let quote = crate::utils::shell_quote;
     let pkgver = plan.version.strip_suffix("-1").unwrap_or(&plan.version);
     let depends = plan
@@ -406,7 +418,7 @@ fn pkgbuild(plan: &Plan, payload: &Path) -> String {
     text
 }
 
-fn verify_elf(path: &Path, required: bool) -> Result<(), String> {
+pub(super) fn verify_elf(path: &Path, required: bool) -> Result<(), String> {
     let mut file = File::open(path).map_err(|_| "Cannot read declared executable")?;
     let mut header = [0u8; 20];
     let count = file
@@ -442,6 +454,7 @@ fn verify_elf(path: &Path, required: bool) -> Result<(), String> {
 }
 
 fn build(plan: &Plan, work: &Path, artifact: &Path) -> Result<PathBuf, String> {
+    if plan.recipe.format == Format::Source { return super::build::execute(plan, work, artifact); }
     if unsafe { libc::geteuid() } == 0 {
         return Err("Source packaging must run unprivileged, not through sudo/pkexec".into());
     }
@@ -543,6 +556,7 @@ fn execute_inner(config: &mut Config, plan: &Plan, needed: bool, permit: Option<
         return Err("Source configuration changed after planning; check again".into());
     }
     crate::pm::check_lock()?;
+    super::build::check_prerequisites(config, plan, permit)?;
     if let Some(permit) = permit {
         permit.validate()?;
         let manager = crate::db::AlpmManager::with_repo_order(&config.repo_order).map_err(|e| e.to_string())?;
@@ -649,7 +663,7 @@ fn execute_inner(config: &mut Config, plan: &Plan, needed: bool, permit: Option<
         Ok(())
     })
     .map_err(|e| format!("Package installed, but saving source ownership failed: {e}"))?;
-    let record = serde_json::json!({"name":plan.name,"from_version":before,"to_version":plan.version,"source":plan.alias,"tag":plan.tag,"sha256":plan.asset.sha256});
+    let record = serde_json::json!({"name":plan.name,"from_version":before,"to_version":plan.version,"source":plan.alias,"tag":plan.tag,"sha256":plan.asset.sha256,"git":plan.git,"build_recipe_sha256":super::build::recipe_digest(plan)});
     if let Err(e) = crate::journal::TransactionJournal::record_transaction(
         "install",
         vec![record],
@@ -701,6 +715,7 @@ mod tests {
                 url: "app.tar".into(),
                 sha256: Some(digest),
             },
+            git: None,
             persist_source: false,
         }
     }

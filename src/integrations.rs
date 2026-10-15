@@ -132,6 +132,8 @@ pub struct ExternalUpdate {
 }
 
 pub trait IntegrationProvider: Send + Sync {
+    /// Optional recipe detail from the exact approved snapshot, before approval.
+    fn preview_upgrade(&self, _updates: &[ExternalUpdate]) {}
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
     fn refresh_metadata(&self) -> Result<(), std::io::Error>;
@@ -139,7 +141,10 @@ pub trait IntegrationProvider: Send + Sync {
     fn check_updates(&self) -> std::io::Result<Vec<ExternalUpdate>>;
     fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String;
     fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> Result<bool, std::io::Error>;
-    fn validate_options(&self, _no_cache: bool) -> Result<(), String> { Ok(()) }
+    fn check_options(&self, policy: crate::scratch::Policy, no_cache: bool) -> Result<(), crate::runtime::OptionError>;
+    fn validate_options(&self, no_cache: bool) -> Result<(), String> {
+        self.check_options(crate::scratch::policy(), no_cache).map_err(|error| error.to_string())
+    }
     fn configure_no_cache(&self, _no_cache: bool) {}
     fn cache_command_str(&self) -> Option<String> { None }
     fn execute_cache_cleanup(&self) -> std::io::Result<bool> { Ok(true) }
@@ -165,6 +170,15 @@ macro_rules! builtin_provider {
             fn is_available(&self) -> bool { crate::is_command_available($adapter) }
             fn refresh_metadata(&self) -> std::io::Result<()> { builtin::refresh($adapter, &BTreeMap::new()) }
             fn supports_refresh(&self) -> bool { $adapter == "flatpak" }
+            fn check_options(&self, policy: crate::scratch::Policy, no_cache: bool) -> Result<(), crate::runtime::OptionError> {
+                if policy != crate::scratch::Policy::Auto {
+                    return Err(crate::runtime::OptionError::Unsupported(format!("{} does not support {policy:?} scratch", $name)));
+                }
+                if no_cache {
+                    return Err(crate::runtime::OptionError::Unsupported(format!("{} does not support --no-cache", $name)));
+                }
+                Ok(())
+            }
             fn check_updates(&self) -> std::io::Result<Vec<ExternalUpdate>> { builtin::check($adapter, &BTreeMap::new()) }
             fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String { builtin::preview($adapter, updates) }
             fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> std::io::Result<bool> { builtin::execute($adapter, updates) }
@@ -257,7 +271,11 @@ impl IntegrationsManager {
 
         for p in providers {
             let provider = Arc::clone(p);
-            handles.push((p.name().to_string(), thread::spawn(move || provider.refresh_metadata())));
+            let activity = crate::progress::activity(crate::progress::integration_manager(p.name()), "Refreshing metadata");
+            handles.push((p.name().to_string(), thread::spawn(move || {
+                let _activity = activity;
+                provider.refresh_metadata()
+            })));
         }
 
         let mut errors = Vec::new();
@@ -281,7 +299,11 @@ impl IntegrationsManager {
 
         for p in providers {
             let provider = Arc::clone(p);
-            handles.push((p.name().to_string(), thread::spawn(move || provider.check_updates())));
+            let activity = crate::progress::activity(crate::progress::integration_manager(p.name()), "Checking updates");
+            handles.push((p.name().to_string(), thread::spawn(move || {
+                let _activity = activity;
+                provider.check_updates()
+            })));
         }
 
         let mut all_updates = Vec::new();
@@ -411,15 +433,6 @@ impl IntegrationsManager {
         outcomes
     }
 
-    pub fn validate_options(providers: &[Arc<dyn IntegrationProvider>], updates: &[ExternalUpdate], no_cache: bool) -> Result<(), String> {
-        for provider in providers {
-            if updates.iter().any(|u| u.runner == provider.name()) {
-                provider.validate_options(no_cache)?;
-                provider.configure_no_cache(no_cache);
-            }
-        }
-        Ok(())
-    }
 
     pub fn transaction_cache_cleanup(providers: &[Arc<dyn IntegrationProvider>], outcomes: &[(String, bool)], no_cache: bool) -> bool {
         if !no_cache { return true; }
@@ -593,6 +606,7 @@ mod tests {
     }
 
     impl IntegrationProvider for MockProvider {
+        fn check_options(&self, _: crate::scratch::Policy, _: bool) -> Result<(), crate::runtime::OptionError> { Ok(()) }
         fn name(&self) -> &'static str { self.label }
         fn is_available(&self) -> bool {
             let count = self.active.fetch_add(1, Ordering::SeqCst) + 1;

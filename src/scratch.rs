@@ -33,14 +33,14 @@ impl Workspace {
         if unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) }.is_null() { return Err(io::Error::last_os_error().to_string()); }
         template.pop();
         let path = PathBuf::from(std::ffi::OsString::from_vec(template));
-        crate::sandbox::register_cleanup_target(path.clone());
+        crate::execution::register_cleanup_target(path.clone());
         Ok(Self { path })
     }
 }
 impl Drop for Workspace {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
-        crate::sandbox::unregister_cleanup_target(&self.path);
+        crate::execution::unregister_cleanup_target(&self.path);
     }
 }
 pub fn describe_plan(has_sources: bool, has_aur: bool) -> Option<String> {

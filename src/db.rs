@@ -160,7 +160,7 @@ impl AlpmManager {
         let mut paths = Vec::new();
         for file in package.files().files() {
             let Ok(name) = std::str::from_utf8(file.name()) else { continue; };
-            if !crate::sandbox::is_package_entry_point(std::path::Path::new(name)) { continue; }
+            if !crate::utils::is_package_entry_point(std::path::Path::new(name)) { continue; }
             let path = std::path::Path::new("/").join(name);
             if crate::utils::is_executable_file(&path) { paths.push(path); }
         }

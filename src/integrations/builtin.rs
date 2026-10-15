@@ -16,7 +16,7 @@ fn command(executable: &str, env: &Environment) -> Command {
 
 pub(super) fn capture(command: &mut Command) -> io::Result<std::process::Output> {
     command.env("LC_ALL", "C");
-    let output = crate::progress::capture_output_with_limit(command, MAX_METADATA_BYTES as usize, std::time::Duration::from_secs(120))?;
+    let output = crate::execution::capture_output_with_limit(command, MAX_METADATA_BYTES as usize, std::time::Duration::from_secs(120))?;
     if !output.status.success() {
         let diagnostic = crate::utils::sanitize_display_text(&String::from_utf8_lossy(&output.stderr));
         return Err(io::Error::other(format!("Metadata command exited with {}: {}", output.status, diagnostic.chars().take(512).collect::<String>())));

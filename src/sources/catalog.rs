@@ -474,6 +474,12 @@ pub fn select(
     {
         return Err("Ambiguous releases with identical version precedence".into());
     }
+    let git = recipe.build.as_ref().filter(|_| recipe.format == Format::Source)
+        .and_then(|build| build.git.as_ref().map(|_| build))
+        .map(|build| super::git::resolve(source, build, &release.tag)).transpose()?;
+    let asset = if let Some(revision) = &git {
+        Asset { name: "Git source".into(), url: revision.repository.clone(), sha256: None }
+    } else {
     let asset_pattern = recipe
         .asset
         .replace("{arch}", std::env::consts::ARCH)
@@ -515,6 +521,8 @@ pub fn select(
         }
         https_url(&asset.url)?;
     }
+    asset
+    };
     let package_version = release
         .package_version
         .clone()
@@ -537,6 +545,7 @@ pub fn select(
         tag: release.tag.clone(),
         version: package_version,
         asset,
+        git,
         persist_source: false,
     })
 }
@@ -546,6 +555,7 @@ mod tests {
     use super::*;
     fn recipe() -> Recipe {
         Recipe {
+            build: None,
             release_pages: 1,
             project: "owner/app".into(),
             channel: Channel::Alpha,

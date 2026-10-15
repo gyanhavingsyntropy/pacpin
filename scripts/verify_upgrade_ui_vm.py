@@ -224,7 +224,7 @@ package() {{
                 path.unlink()
         run("sudo", "-n", "pacman", "-Syy", "--noconfirm")
 
-    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello", orphan_choice=None, expect_no_orphan_prompt=False, orphans=None, cache=None, cancel_manager=None, completed_before_cache=None, cancel_marker=None, password_prompt="PACPIN_AUTH_PASSWORD:", resize_password=False, cwd=None):
+    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello", orphan_choice=None, expect_no_orphan_prompt=False, orphans=None, cache=None, cancel_manager=None, completed_before_cache=None, cancel_marker=None, password_prompt="PACPIN_AUTH_PASSWORD:", resize_password=False, cwd=None, confirm_action=None, source_package="pacpin-ui-source", source_version="2.0.0-1"):
         result = self.root / f"{name}.status"
         result.unlink(missing_ok=True)
         raw = self.root / f"{name}.raw.txt"
@@ -294,6 +294,8 @@ package() {{
                 self.rc("send-key", "ctrl+c")
                 raise AssertionError(f"{name}: sudo requested authentication again in the same transaction")
             if confirm and not confirmed and "Proceed with installation?" in screen:
+                if confirm_action is not None:
+                    confirm_action()
                 self.rc("send-text", "--stdin", input="y\n")
                 confirmed = True
             if orphan_choice is not None and selection_started is None and "Showing " in screen and "Enter confirms" in screen:
@@ -331,7 +333,7 @@ package() {{
                 self.rc("send-key", "ctrl+c")
                 cancelled = True
             if cancel_manager and not cancelled and re.search(rf"(?:^|\n){cancel_manager}: (?!✔)", screen) and (cancel_marker is None or cancel_marker in screen):
-                if cancel_marker and not (self.root / "db/db.lck").exists():
+                if cancel_marker and cancel_manager != "Sources" and not (self.root / "db/db.lck").exists():
                     raise AssertionError("Cancellation fixture did not hold the ALPM database lock")
                 self.rc("send-key", "ctrl+c")
                 cancelled = True
@@ -383,8 +385,8 @@ package() {{
             failures.append(f"completed {completed_before_cache} row absent during cleanup")
         if source and (success or source_completed) and not native and not any(re.search(r"(?:^|\n)Sources:", frame) for frame in snapshots):
             failures.append("source-only progress missing")
-        if not source and any(re.search(r"(?:^|\n)Sources:", frame) for frame in snapshots):
-            failures.append("Sources shown although it was never invoked")
+        if not source and any(re.search(r"(?:^|\n)Sources: (?!Checking updates|Refreshing metadata)", frame) for frame in snapshots):
+            failures.append("Sources upgrade shown although it was never planned/invoked")
         before, after = [self.root / f"{name}.term-{part}" for part in ["before", "after"]]
         if before.read_text() != after.read_text():
             failures.append("terminal settings not restored")
@@ -419,7 +421,7 @@ package() {{
             failures.append(f"expected exactly one sudo password prompt per run ({repeat} runs)")
         if password and re.search(re.escape(password_prompt) + r" *garuda", raw_text):
             failures.append("sudo password echoed into the transcript")
-        if source and args[0] == "-Su" and not self.baseline and "Unknown" not in raw_text and "+ unknown" not in raw_text:
+        if source and args[0] == "-Su" and not self.baseline and "External Package Transactions" in raw_text and "Unknown" not in raw_text and "+ unknown" not in raw_text:
             failures.append("unknown source sizes shown as a complete total")
         final_screen = self.rc("get-text", "--extent", "screen")
         if re.search(r"(?:^|\n)(?:Pacman|AUR|Sources|Flatpak|Nix|Pipx|Hooks|Orphans|Cache):", final_screen):
@@ -439,8 +441,9 @@ package() {{
         if query.returncode not in [0, 1]:
             raise RuntimeError(query.stderr)
         versions = query.stdout.strip().splitlines()
-        if (success or source_completed) and source and not any(line == "pacpin-ui-source 2.0.0-1" for line in versions):
-            failures.append("source installed version is not 2.0.0-1")
+        if (success or source_completed) and source and not any(
+                line == f"{source_package} {source_version}" if source_version is not None else line.startswith(source_package + " ") for line in versions):
+            failures.append(f"source installed identity/version differs from {source_package} {source_version}")
         if success and native and not any(line == "pacpin-ui-native 2.0.0-1" for line in versions):
             failures.append("native installed version is not 2.0.0-1")
         if aur and success and not any(line.startswith(f"{aur_package} 2.") for line in versions):

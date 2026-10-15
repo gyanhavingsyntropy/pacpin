@@ -172,7 +172,7 @@ fn inspect_payload(archive_path: &Path, collect_executables: bool) -> Result<(u6
             "Open package archive",
         )?;
         loop {
-            if crate::sandbox::is_terminating() {
+            if crate::execution::is_terminating() {
                 return Err("Archive inspection interrupted".into());
             }
             let mut entry = ptr::null_mut();
@@ -203,7 +203,7 @@ fn inspect_payload(archive_path: &Path, collect_executables: bool) -> Result<(u6
                 header_text(la::archive_entry_pathname(entry))?.ok_or("Missing archive path")?;
             let path = relative_path(&name)?;
             let kind = la::archive_entry_filetype(entry);
-            if collect_executables && crate::sandbox::is_package_entry_point(&path)
+            if collect_executables && crate::utils::is_package_entry_point(&path)
                 && (kind == la::AE_IFLNK || kind == la::AE_IFREG && la::archive_entry_perm(entry) & 0o111 != 0)
             {
                 executables.push(path.clone());
@@ -300,7 +300,7 @@ pub(crate) fn extract(
         let mut actual_total = 0u64;
         let mut extracted_files = HashSet::new();
         loop {
-            if crate::sandbox::is_terminating() {
+            if crate::execution::is_terminating() {
                 return Err("Extraction interrupted".into());
             }
             let mut entry = ptr::null_mut();
@@ -392,7 +392,7 @@ pub(crate) fn extract(
                 "Create archive entry",
             )?;
             loop {
-                if crate::sandbox::is_terminating() {
+                if crate::execution::is_terminating() {
                     return Err("Extraction interrupted".into());
                 }
                 let mut block = ptr::null();

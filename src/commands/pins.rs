@@ -14,7 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{self, IsTerminal, Write};
 use std::process::exit;
 
 use colored::Colorize;
@@ -480,5 +481,118 @@ pub fn cmd_unpin(pattern: &str) {
             "{}",
             format!("Pattern '{}' was not pinned.", pattern).yellow()
         );
+    }
+}
+
+pub fn find_matching_pin(
+    pkg: &str,
+    pins: &BTreeMap<String, String>,
+) -> Option<(String, String, bool)> {
+    let glob_pins = ResolverEngine::compile_glob_pins(pins);
+    ResolverEngine::find_matching_pin_rule(pkg, pins, &glob_pins)
+}
+
+pub(crate) fn check_and_prompt_smart_unpin(mut config: Config, removed_pkgs: &[String], noconfirm: bool) {
+    let mut removed_pins = BTreeMap::new();
+    let mut removed_delays = BTreeMap::new();
+    let interactive = io::stdin().is_terminal();
+
+    for pkg in removed_pkgs {
+        if let Some((pattern, repo, is_exact)) = find_matching_pin(pkg, &config.pins) {
+            let should_remove = if noconfirm {
+                // A non-interactive removal may clean up a direct pin, but a
+                // wildcard rule can apply to many packages and must survive.
+                is_exact
+            } else if interactive {
+                if is_exact {
+                    print!(
+                        "\n:: Package '{}' is pinned to repository [{}]. Remove this pin rule from config? [Y/n] ",
+                        pkg.cyan().bold(),
+                        repo.green()
+                    );
+                } else {
+                    print!(
+                        "\n:: Package '{}' matched wildcard pin '{}' ➔ [{}]. Remove this pin rule from config? [Y/n] ",
+                        pkg.cyan().bold(),
+                        pattern.yellow(),
+                        repo.green()
+                    );
+                }
+                io::stdout().flush().unwrap();
+                let mut input = String::new();
+                if io::stdin().read_line(&mut input).is_ok() {
+                    let trimmed = input.trim().to_lowercase();
+                    trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if should_remove {
+                config.pins.remove(&pattern);
+                println!(
+                    "{}",
+                    format!("✔ Removed pin rule '{}' ➔ [{}].", pattern, repo).green()
+                );
+                removed_pins.insert(pattern, repo);
+            }
+        }
+
+        if let Some(days) = config.delay.get(pkg).copied() {
+            let should_remove = if noconfirm {
+                true
+            } else if interactive {
+                print!(
+                    "\n:: Package '{}' has an active {}-day stability delay. Remove this delay rule? [Y/n] ",
+                    pkg.cyan().bold(),
+                    days
+                );
+                io::stdout().flush().unwrap();
+                let mut input = String::new();
+                if io::stdin().read_line(&mut input).is_ok() {
+                    let trimmed = input.trim().to_lowercase();
+                    trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if should_remove {
+                config.delay.remove(pkg);
+                println!(
+                    "{}",
+                    format!("✔ Removed {}-day stability delay on '{}'.", days, pkg).green()
+                );
+                removed_delays.insert(pkg.clone(), days);
+            }
+        }
+    }
+
+    if !removed_pins.is_empty() || !removed_delays.is_empty() {
+        if let Err(e) = mutate_config(|current| {
+            // A concurrently changed rule was not the one the user approved removing.
+            for (pattern, repo) in &removed_pins {
+                if current.pins.get(pattern) == Some(repo) {
+                    current.pins.remove(pattern);
+                }
+            }
+            for (pkg, days) in &removed_delays {
+                if current.delay.get(pkg) == Some(days) {
+                    current.delay.remove(pkg);
+                }
+            }
+            Ok(())
+        }) {
+            eprintln!(
+                "{}",
+                format!("Warning: Failed to save updated config: {}", e).yellow()
+            );
+        } else {
+            println!("{}", ":: Configuration updated successfully.".dimmed());
+        }
     }
 }

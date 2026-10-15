@@ -118,7 +118,7 @@ pub fn build_recipe(input: RecipeInput, project: String, channel: Channel) -> Re
     if input.binaries.iter().any(|(name, path)| !crate::utils::is_safe_pkg_name(name) || !safe_relative(path)) || input.depends.iter().any(|dep| !crate::utils::is_safe_pkg_name(dep)) { return Err("Invalid executable mapping or dependency".into()); }
     if input.sha256.as_ref().is_some_and(|digest| !valid_digest(digest) || input.tag.is_none()) { return Err("A fixed sha256 needs a fixed tag and 64 hex digits".into()); }
     if input.tag_pattern.as_ref().is_some_and(|pattern| glob::Pattern::new(pattern).is_err()) || input.checksum_asset.as_ref().is_some_and(|pattern| !safe_text(pattern) || glob::Pattern::new(pattern).is_err()) { return Err("Invalid tag or checksum glob".into()); }
-    Ok(Recipe { release_pages: 1, project, channel, version_prefix: if input.version_prefix.is_empty() { "v".into() } else { input.version_prefix }, tag_pattern: input.tag_pattern, asset: input.asset, format, root: input.root, binaries: input.binaries, depends: input.depends, sha256: input.sha256, checksum_asset: input.checksum_asset, tag: input.tag })
+    Ok(Recipe { build: None, release_pages: 1, project, channel, version_prefix: if input.version_prefix.is_empty() { "v".into() } else { input.version_prefix }, tag_pattern: input.tag_pattern, asset: input.asset, format, root: input.root, binaries: input.binaries, depends: input.depends, sha256: input.sha256, checksum_asset: input.checksum_asset, tag: input.tag })
 }
 
 pub fn known_recipe(target: &DirectTarget, channel: Channel) -> Option<(String, Source, Recipe)> {
@@ -130,6 +130,7 @@ pub fn known_recipe(target: &DirectTarget, channel: Channel) -> Option<(String, 
     }
     let name = "openai-codex".to_string();
     let recipe = Recipe {
+        build: None,
         release_pages: 1,
         project: project.clone(),
         channel: channel.clone(),

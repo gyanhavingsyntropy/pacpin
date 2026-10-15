@@ -13,6 +13,11 @@ their adapters retain ALPM planning, lock checks, elevation and unprivileged
 builds. Configure `[managers.pacman].privilege_tool` or
 `[managers.aur].helper` here; runtime `--sudo`/`--pkexec` still overrides for one run.
 
+The keys `pacman`, `aur`, `flatpak`, `nix` and `pipx` must keep their matching
+adapter type. Custom command managers cannot use the external display names
+`Flatpak`, `Nix`, `Pipx` or the reserved `Sources` name. Choose a distinct manager
+key so metadata, scope, progress and cleanup refer to one external adapter.
+
 Separate recipe/hook files use the same `[sources.alias]` and `[hooks.name]`
 tables accepted inline. You can move existing tables there manually. An alias
 or hook name defined in both places is an error. Automatic pin changes preserve
@@ -124,7 +129,12 @@ An incorrect footprint declaration can still exhaust space during execution.
 `cache_cleanup` runs after successful work, even when a later manager fails.
 It is previewed and its real status is reported. Failed/skipped managers keep
 their caches for recovery. With neither mapping, the combination is rejected
-before package installation. Pipx has a default cache-disabling mapping.
+before package installation. With upgrade `--keep-going`, an explicitly unsupported
+scratch/cache mapping instead skips that manager before approval, displays its
+packages and reason, and lets eligible managers proceed. The invocation remains
+incomplete (exit 2), and skipped managers perform no prefetch, actions or cleanup.
+Malformed configuration, missing executables and capacity failures remain fatal.
+Pipx has a default cache-disabling mapping.
 Flatpak pruning and Nix garbage collection are not silently used for no-cache.
 
 ## Custom flags

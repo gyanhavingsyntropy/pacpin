@@ -90,7 +90,7 @@ struct NativePaths {
 }
 impl NativePaths {
     fn configured() -> Result<Self, String> {
-        let out = crate::progress::capture_output(
+        let out = crate::execution::capture_output(
             Command::new("pacman-conf").args(["RootDir", "DBPath", "LogFile"]),
         )
         .map_err(|e| format!("Cannot inspect native configuration: {e}"))?;

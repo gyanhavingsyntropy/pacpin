@@ -24,7 +24,7 @@ pub fn compute_sha256(path: &Path) -> Result<String, String> {
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        if crate::sandbox::is_terminating() {
+        if crate::execution::is_terminating() {
             return Err("Checksum verification interrupted".into());
         }
         let count = file.read(&mut buffer).map_err(|e| format!("Cannot read checksum input: {e}"))?;
@@ -234,7 +234,7 @@ pub fn fetch_package_archive(
     // 3. Download with automatic mirror failover and SHA256 integrity verification
     let mut last_err = String::new();
     for (i, url) in candidate_urls.iter().enumerate() {
-        if crate::sandbox::is_terminating() {
+        if crate::execution::is_terminating() {
             return Err("Download interrupted during shutdown".into());
         }
         if i > 0 {
@@ -254,14 +254,14 @@ pub fn fetch_package_archive(
             &format!("pacpin-download-{}", pkg),
             ext,
         )?;
-        crate::sandbox::register_cleanup_target(temp_download.clone());
+        crate::execution::register_cleanup_target(temp_download.clone());
         downloaded_tarballs.push(temp_download.clone());
 
         // -f (--fail) ensures curl fails on HTTP 4xx/5xx rather than writing HTML error pages
-        let curl_status = crate::sandbox::run_tracked_command(
+        let curl_status = crate::execution::run_tracked_command(
             &mut package_download_command(url, &temp_download)
         );
-        if crate::sandbox::is_terminating() {
+        if crate::execution::is_terminating() {
             return Err("Download interrupted during shutdown".into());
         }
 

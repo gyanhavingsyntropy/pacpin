@@ -1,4 +1,4 @@
-# Upstream release sources (experimental)
+# Upstream release sources and builds (experimental)
 
 GitHub, GitLab, HTTPS catalogs, and local catalogs share one release-selection,
 verification, packaging, and installation pipeline. A configured alias is used
@@ -6,6 +6,11 @@ in `pin -S alias/package`. Direct provider targets use the same `provider:target
 shape as `flatpak:remote`: no hand-written alias is needed for reviewed recipes.
 Signed Arch repositories still use pacman.conf/ALPM,
 regardless of hosting; organizational distribution should prefer that route.
+
+For actual compilation from verified source archives or release-tagged Git,
+see [source builds and per-package optimization settings](source-builds.md).
+Compilation is explicitly selected with `format = "source"`; defaults inherit
+makepkg without extra optimization flags.
 
 ## GitHub: Codex alpha example
 
@@ -155,6 +160,8 @@ adapter; no company-specific updater is necessary.
 - `format = "native"`: Arch package; name, version, and architecture are checked
   before pacman installs it. A manifest may specify `package_version` for an
   Arch version differing from the semantic upstream version.
+- `format = "source"`: compile upstream code with a local `build` table;
+  see [the build recipe reference](source-builds.md).
 - Channels: `stable` (default), `alpha`, `beta`, `prerelease`. Selection uses
   semantic version precedence, not tag string order. `version_prefix` defaults
   to `"v"`; manifests can supply `version` for unconventional tag spelling.

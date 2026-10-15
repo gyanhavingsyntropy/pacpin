@@ -179,6 +179,34 @@ pub fn sanitize_display_text(s: &str) -> String {
     out
 }
 
+pub fn is_command_available(cmd: &str) -> bool {
+    let p = std::path::Path::new(cmd);
+    if p.is_absolute() {
+        return crate::utils::is_executable_file(p);
+    }
+
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(cmd);
+            if crate::utils::is_executable_file(&candidate) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+
+
+pub(crate) fn is_package_entry_point(path: &std::path::Path) -> bool {
+    if path.is_absolute() || path.components().any(|part| !matches!(part, std::path::Component::Normal(_)))
+        || path.to_string_lossy().chars().any(char::is_control) { return false; }
+    let Some(parent) = path.parent() else { return false; };
+    parent == std::path::Path::new("usr/bin") || parent == std::path::Path::new("usr/sbin")
+        || (path.starts_with("usr/lib") || path.starts_with("opt")) && parent.file_name().is_some_and(|name| name == "bin" || name == "sbin")
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,4 +306,3 @@ mod tests {
         assert!(!is_safe_pattern("/etc/*"));
     }
 }
-

@@ -28,7 +28,7 @@
 11. **Companion Cascade Detection**: Automatically detects split packages (sharing `%BASE%`) and prefix-related dependencies when pinning or installing to prevent version desynchronization.
 12. **Transaction Snapshots & Rollback**: Logs transaction state to `~/.local/state/pacpin/history.jsonl` and enables 1-click package rollback (`pacpin rollback`) directly from the local pacman cache.
 13. **Single-Confirmation**: Prompts once before execution; passes `--noconfirm` to low-level runners (`pacman` and `paru`).
-14. **Upstream Release Sources (experimental)**: GitHub, GitLab, HTTPS catalogs, and local/company catalogs share declarative recipes and the same verified native-install pipeline. Use `pin -S alias/package`; [configuration and trust limits](docs/sources.md).
+14. **Upstream Sources (experimental)**: GitHub, GitLab, HTTPS catalogs, and local/company catalogs share declarative recipes and the same verified native-install pipeline. Recipes can package prebuilt releases or compile verified source archives/release-tagged Git unprivileged. Optimization inherits makepkg by default; CPU, level and LTO overrides are opt-in per recipe in sources.toml. Use `pin -S alias/package`; [recipes and trust limits](docs/sources.md), [source compilation and optimization](docs/source-builds.md).
 
 ---
 
@@ -120,7 +120,7 @@ Confirmed orphan cleanup is recorded separately from the known-package inventory
 
 Removal checks the entire selection against the installed dependency graph. Dependencies needed by a retained package, including an unchecked optional orphan, are kept with an explanation. Removal is limited to the confirmed targets; unchecked dependencies remain installed. Orphan removal and cache cleanup appear as separate footer steps; completed upgrades remain checked while cleanup runs. `--keep-going` does not enable orphan removal after an upgrade failure.
 
-The shared footer also describes repository refresh, update/dependency/space checks, plan approval, orphan review, source extraction, saved records, hook rebuilds and restart inspection. Orphan review has its own row even without downloads; concurrent repository downloads remain visible alongside it. Failed managers stay marked during continuation. Short terminals prioritize active work and recent failures over older completed rows.
+The shared footer also describes repository refresh, update/dependency/space checks, plan approval, orphan review, source extraction, saved records, hook rebuilds and restart inspection. Approved AUR and external upgrades stay visible as **Pending** while earlier managers run. Flatpak, Nix and other configured managers get separate rows for their actual checks and operations; checking for updates never marks an upgrade complete. Orphan review has its own row even without downloads; concurrent repository downloads remain visible alongside it. Failed managers stay marked during continuation. Short terminals prioritize active work and recent failures over older completed rows and summarize extra pending stages.
 
 The final plan summary follows dependency and removal details. Its native counts and sizes include the prepared transaction's additional packages: for example, `41 upgrades + 7 new dependencies`, with no `+ 0` when there are none. Sources and other managers retain unknown sizes rather than appearing to add zero bytes.
 
@@ -139,6 +139,18 @@ Use `pin clean -Scc --repo` for native caches or `pin clean -Scc --aur` for AUR 
 
 ### Choose upgrade managers and temporary storage
 
+Native/AUR installs create repository pins only for explicit `repo/package`
+targets and companions you select for that repository. An unqualified
+`pin -S package` that falls back to AUR does not create a pin, and dependencies
+discovered by Paru do not inherit one. Existing exact or wildcard pins still
+apply. Sources retain their separate ownership rules.
+
+For AUR VCS packages (standard `-git`, `-svn`, `-hg`, `-bzr`, `-darcs`, `-cvs`,
+or `-fossil` suffix in the package name or base), older advertised metadata does
+not request a downgrade, even with an AUR pin: the built version is determined
+by `pkgver()`. Newer advertised versions can still be offered. This does not
+implement upstream commit discovery when the advertised version is unchanged.
+
 ```sh
 pin upgrade --sources-only                 # configured upstream Sources only
 pin upgrade --aur-only                     # AUR targets only
@@ -148,7 +160,7 @@ pin upgrade --aur-only --use-ram            # Paru clones / downloads / builds i
 TMPDIR=/path/to/disk/scratch pin upgrade --sources-only --use-storage
 pin -S aur/antigravity --use-ram            # one AUR package
 pin -S source-alias/package --use-storage   # one Source package
-pin -Syu --keep-going                      # guarded Sources continuation after AUR failure
+pin -Syu --keep-going                      # skip unsupported managers; guarded Sources continuation
 pin run --use-ram extra/jq -- . input.json  # downloads + extracted files in RAM; host execution
 pin try --use-storage extra/jq -- . input.json # disk files; Bubblewrap isolation
 pin run --dry-run --use-ram extra/jq        # inspect the workspace policy without downloading
@@ -161,7 +173,9 @@ pin rebuild --use-storage --no-cache --dry-run # preview declared native/AUR/Sou
 
 Paru receives a private clone directory and makepkg directory environment overrides. Successful temporary workspaces are removed; failed AUR workspaces are retained with their path for inspection (RAM contents disappear on reboot). Custom clone/makepkg/chroot/local-repository flags conflict with this policy; other helpers fail explicitly rather than ignoring the request. Sources retain their automatic temporary-workspace cleanup.
 
-`--keep-going` is opt-in and limited to recognized makepkg build failures under the default native/dependency policy with Paru. It requires no observed native installation, an unchanged pacman database and log, an unlocked database, and satisfied installed dependencies. AUR build-dependency installations therefore conservatively disable continuation. Unknown failures, interruptions and native extraction/commit failures stop the run. Only Sources opt in: each exact approved package is checked independently, including transitive installed dependencies, actual archive dependencies, a prepared ALPM transaction with no extra packages/removals, and root/scratch capacity. Packages with scriptlets, conflicts or replacements are excluded. Successful Sources are recorded individually; the AUR failure still produces a nonzero exit, skips orphan cleanup and preserves failed AUR caches. This is not a recovery command for damaged packages.
+`--keep-going` also skips managers whose requested upgrade scratch/cache options are explicitly unsupported, before approval or installation. It previews their names, packages and reasons, continues eligible managers, keeps the overall result incomplete (exit 2), and defers orphan cleanup. Invalid configuration, insufficient capacity and uncertain failures remain fatal. Skipped managers perform no upgrade, prefetch or cache cleanup; successful invoked managers can still clean their own caches.
+
+Runtime continuation is opt-in and limited to recognized makepkg build failures under the default native/dependency policy with Paru. It requires no observed native installation, an unchanged pacman database and log, an unlocked database, and satisfied installed dependencies. AUR build-dependency installations therefore conservatively disable continuation. Unknown failures, interruptions and native extraction/commit failures stop the run. Only Sources opt in: each exact approved package is checked independently, including transitive installed dependencies, actual archive dependencies, a prepared ALPM transaction with no extra packages/removals, and root/scratch capacity. Packages with scriptlets, conflicts or replacements are excluded. Successful Sources are recorded individually; the AUR failure still produces a nonzero exit, skips orphan cleanup and preserves failed AUR caches. This is not a recovery command for damaged packages.
 
 For an eligible continuation run, Paru uses `/usr/bin/pacman` and `/usr/bin/makepkg` without chroot or local-repository installation. Custom forwarded helper flags disable continuation. Any attempted Sources installation without verified completion blocks later packages even if the pacman log has not changed.
 
@@ -279,6 +293,13 @@ incompatible upstream recipe build successfully.
 `pacpin` serves as a complete drop-in wrapper. Any native pacman flag sequence (`-Syu`, `-S -y -u`, `-Ss`, `-Si`, `-Sc`, `-Sp`, `-Sl`, `-Sg`, `-Sw`, `-T`, `-Q`, `-Qi`, `-Ql`, `-Qo`, `-F`, `-Fy`, `-U`, `-D`, etc.) passed to `pacpin` or `pin` is transparently handled with proper permission routing (non-root for queries, `sudo` for modifications).
 
 ---
+
+## Development architecture
+
+See [module ownership, affected-module checks and the refactoring plan](docs/architecture.md)
+and [design principles with professional references](docs/development/design.md)
+for where features belong and which related paths to review. [AGENTS.md](AGENTS.md)
+records the development and verification contracts.
 
 ## Building from Source
 

@@ -16,6 +16,16 @@ impl SourceProvider {
     }
 }
 impl IntegrationProvider for SourceProvider {
+    fn check_options(&self, _policy: crate::scratch::Policy, _no_cache: bool) -> Result<(), crate::runtime::OptionError> {
+        // Sources own temporary workspaces under either policy. Their actual
+        // recipe/archive capacity remains checked before download/build/install.
+        for plan in self.approved.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|p| p.recipe.build.is_some()) {
+            super::build::check_prerequisites(&self.config, plan, None).map_err(crate::runtime::OptionError::Invalid)?;
+            let build = plan.recipe.build.as_ref().unwrap();
+            crate::scratch::choose(_policy, build.initial_bytes(), build.scratch_inodes.saturating_add(32)).map_err(crate::runtime::OptionError::Invalid)?;
+        }
+        Ok(())
+    }
     fn name(&self) -> &str {
         "Sources"
     }
@@ -143,7 +153,10 @@ impl IntegrationProvider for SourceProvider {
             }
         });
     }
-    fn supports_prefetch(&self) -> bool { true }
+    fn supports_prefetch(&self) -> bool {
+        let plans = self.approved.lock().unwrap_or_else(|e| e.into_inner());
+        plans.is_empty() || plans.iter().any(|plan| plan.git.is_none())
+    }
     fn supports_aur_failure_continuation(&self) -> bool { true }
     fn execute_after_aur_failure(&self, update: &ExternalUpdate, permit: &mut crate::pm::AurBuildFailurePermit) -> Result<bool, io::Error> {
         let plans = self.approved.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -153,5 +166,11 @@ impl IntegrationProvider for SourceProvider {
         install::execute_independent(&mut config, plan, permit).map_err(io::Error::other)?;
         permit.source_completed().map_err(|e| io::Error::other(format!("{} installed, but further continuation is blocked: {e}", plan.name)))?;
         Ok(true)
+    }
+    fn preview_upgrade(&self, updates: &[ExternalUpdate]) {
+        for plan in self.approved.lock().unwrap_or_else(|e| e.into_inner()).iter()
+            .filter(|plan| updates.iter().any(|u| u.id == format!("{}/{}", plan.alias, plan.name))) {
+            super::build::preview(plan);
+        }
     }
 }

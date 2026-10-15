@@ -47,7 +47,7 @@ pub fn prepare(tool: &str) -> io::Result<()> {
                 .name("sudo-session".into())
                 .spawn(|| loop {
                     std::thread::sleep(Duration::from_secs(60));
-                    let _ = crate::sandbox::run_tracked_command(
+                    let _ = crate::execution::run_tracked_command(
                         renewal_command()
                             // Keep the same input tty for sudo's timestamp lookup.
                             // -n guarantees this validation cannot read a password.
@@ -72,7 +72,7 @@ fn renewal_command() -> Command {
 /// A noninteractive validation can show a phase immediately when no password
 /// is needed. Unknown privilege tools retain the deferred-prompt display.
 pub fn authenticated(tool: &std::ffi::OsStr) -> bool {
-    tool == "sudo" && crate::sandbox::run_tracked_command(
+    tool == "sudo" && crate::execution::run_tracked_command(
         renewal_command()
             .stdin(Stdio::inherit())
             .stdout(Stdio::null())

@@ -40,7 +40,43 @@ pub struct CandidatePackage {
     pub depends: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionChange {
+    Current,
+    Upgrade,
+    Downgrade,
+    PinSync,
+}
+
+impl VersionChange {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "up_to_date",
+            Self::Upgrade => "upgrade",
+            Self::Downgrade => "downgrade",
+            Self::PinSync => "pin_sync",
+        }
+    }
+}
+
 impl CandidatePackage {
+    fn version_change(&self, installed: &str, pinned: bool) -> VersionChange {
+        // VCS pkgver() runs during building. AUR metadata is not a reliable
+        // downgrade target, even when the user explicitly chose the AUR.
+        // Split packages may carry the VCS suffix only in their package base.
+        let vcs = self.is_aur
+            && ["-git", "-svn", "-hg", "-bzr", "-darcs", "-cvs", "-fossil"]
+                .iter()
+                .any(|suffix| self.name.ends_with(suffix) || self.base.ends_with(suffix));
+        let synchronize = pinned && !vcs;
+        match vercmp(self.version.as_str(), installed) {
+            Ordering::Greater => VersionChange::Upgrade,
+            Ordering::Less if synchronize => VersionChange::Downgrade,
+            Ordering::Equal if synchronize && self.version != installed => VersionChange::PinSync,
+            _ => VersionChange::Current,
+        }
+    }
+
     pub fn from_aur(aur_pkg: &crate::aur::AurItem) -> Self {
         let cleaned_deps: Vec<String> = aur_pkg
             .depends
@@ -273,8 +309,14 @@ impl<'a> ResolverEngine<'a> {
         let mut foreign_pkgs = Vec::new();
         if !skip_aur {
             for pkg in alpm.localdb().pkgs() {
-                if crate::sources::owner(config, pkg.name()).is_some() { continue; }
-                if Self::match_pinned_package(pkg.name(), &pins, &glob_pins).is_some_and(|repo| repo != "aur") { continue; }
+                if crate::sources::owner(config, pkg.name()).is_some() {
+                    continue;
+                }
+                if Self::match_pinned_package(pkg.name(), &pins, &glob_pins)
+                    .is_some_and(|repo| repo != "aur")
+                {
+                    continue;
+                }
                 if !syncdbs.iter().any(|db| db.pkg(pkg.name()).is_ok()) {
                     let name = pkg.name().to_string();
                     if foreign_pkgs_set.insert(name.clone()) {
@@ -288,8 +330,14 @@ impl<'a> ResolverEngine<'a> {
                 }
                 if let Ok(glob) = Pattern::new(pattern) {
                     for pkg in alpm.localdb().pkgs() {
-                        if crate::sources::owner(config, pkg.name()).is_some() { continue; }
-                        if Self::match_pinned_package(pkg.name(), &pins, &glob_pins).is_some_and(|repo| repo != "aur") { continue; }
+                        if crate::sources::owner(config, pkg.name()).is_some() {
+                            continue;
+                        }
+                        if Self::match_pinned_package(pkg.name(), &pins, &glob_pins)
+                            .is_some_and(|repo| repo != "aur")
+                        {
+                            continue;
+                        }
                         if glob.matches(pkg.name()) {
                             let name = pkg.name().to_string();
                             if foreign_pkgs_set.insert(name.clone()) {
@@ -309,9 +357,7 @@ impl<'a> ResolverEngine<'a> {
         }
 
         let aur_handle = if !skip_aur && !foreign_pkgs.is_empty() {
-            Some(thread::spawn(move || {
-                aur::query_aur_checked(&foreign_pkgs)
-            }))
+            Some(thread::spawn(move || aur::query_aur_checked(&foreign_pkgs)))
         } else {
             None
         };
@@ -353,7 +399,9 @@ impl<'a> ResolverEngine<'a> {
 
         for inst_pkg in local_pkgs {
             let pkg_name = inst_pkg.name();
-            if crate::sources::owner(config, pkg_name).is_some() { continue; }
+            if crate::sources::owner(config, pkg_name).is_some() {
+                continue;
+            }
             let inst_ver = inst_pkg.version();
             let inst_size = inst_pkg.isize();
 
@@ -475,7 +523,8 @@ impl<'a> ResolverEngine<'a> {
                         continue;
                     } else if let Some(&db) = syncdb_map.get(installed_db.as_str()) {
                         if let Ok(p) = db.pkg(pkg_name) {
-                            let is_needed = state == "custom" || vercmp(p.version().as_str(), inst_ver) == Ordering::Greater;
+                            let is_needed = state == "custom"
+                                || vercmp(p.version().as_str(), inst_ver) == Ordering::Greater;
                             candidate = Some(CandidatePackage {
                                 name: p.name().to_string(),
                                 version: p.version().to_string(),
@@ -483,7 +532,11 @@ impl<'a> ResolverEngine<'a> {
                                 base: p.base().unwrap_or(p.name()).to_string(),
                                 csize: p.size(),
                                 isize: p.isize(),
-                                desc: if is_needed { p.desc().unwrap_or("").to_string() } else { String::new() },
+                                desc: if is_needed {
+                                    p.desc().unwrap_or("").to_string()
+                                } else {
+                                    String::new()
+                                },
                                 builddate: p.build_date(),
                                 is_aur: false,
                                 depends: if is_needed {
@@ -506,7 +559,9 @@ impl<'a> ResolverEngine<'a> {
                                 let is_excl = config.features.pinning
                                     && Self::is_excluded(pkg_name, r, &config.exclude);
                                 if !is_excl && candidate.is_none() {
-                                    let is_needed = state == "custom" || vercmp(p.version().as_str(), inst_ver) == Ordering::Greater;
+                                    let is_needed = state == "custom"
+                                        || vercmp(p.version().as_str(), inst_ver)
+                                            == Ordering::Greater;
                                     candidate = Some(CandidatePackage {
                                         name: p.name().to_string(),
                                         version: p.version().to_string(),
@@ -514,7 +569,11 @@ impl<'a> ResolverEngine<'a> {
                                         base: p.base().unwrap_or(p.name()).to_string(),
                                         csize: p.size(),
                                         isize: p.isize(),
-                                        desc: if is_needed { p.desc().unwrap_or("").to_string() } else { String::new() },
+                                        desc: if is_needed {
+                                            p.desc().unwrap_or("").to_string()
+                                        } else {
+                                            String::new()
+                                        },
                                         builddate: p.build_date(),
                                         is_aur: false,
                                         depends: if is_needed {
@@ -551,32 +610,12 @@ impl<'a> ResolverEngine<'a> {
                 }
             }
 
-            let mut needs_update = false;
-            let mut update_type = "up_to_date".to_string();
-            let mut is_downgrade = false;
-
-            if let Some(ref cand) = candidate {
-                let cmp = vercmp(cand.version.as_str(), inst_ver);
-                match cmp {
-                    Ordering::Greater => {
-                        needs_update = true;
-                        update_type = "upgrade".to_string();
-                    }
-                    Ordering::Less => {
-                        if state == "custom" {
-                            needs_update = true;
-                            update_type = "downgrade".to_string();
-                            is_downgrade = true;
-                        }
-                    }
-                    Ordering::Equal => {
-                        if state == "custom" && cand.version != inst_ver.as_str() {
-                            needs_update = true;
-                            update_type = "pin_sync".to_string();
-                        }
-                    }
-                }
-            }
+            let change = candidate.as_ref().map_or(VersionChange::Current, |cand| {
+                cand.version_change(inst_ver, state == "custom")
+            });
+            let needs_update = change != VersionChange::Current;
+            let update_type = change.as_str().to_string();
+            let is_downgrade = change == VersionChange::Downgrade;
 
             let net_delta = candidate
                 .as_ref()
@@ -620,9 +659,16 @@ impl<'a> ResolverEngine<'a> {
         // Join the concurrent AUR query thread
         let mut check_errors = Vec::new();
         let aur_data = match aur_handle.map(|h| h.join()) {
-            None => HashMap::new(), Some(Ok(Ok(data))) => data,
-            Some(Ok(Err(error))) => { check_errors.push(error); HashMap::new() },
-            Some(Err(_)) => { check_errors.push("AUR update worker failed".into()); HashMap::new() },
+            None => HashMap::new(),
+            Some(Ok(Ok(data))) => data,
+            Some(Ok(Err(error))) => {
+                check_errors.push(error);
+                HashMap::new()
+            }
+            Some(Err(_)) => {
+                check_errors.push("AUR update worker failed".into());
+                HashMap::new()
+            }
         };
 
         // Resolve pending packages requiring AUR inspection
@@ -647,32 +693,12 @@ impl<'a> ResolverEngine<'a> {
                 candidate = Some(CandidatePackage::from_aur(aur_pkg));
             }
 
-            let mut needs_update = false;
-            let mut update_type = "up_to_date".to_string();
-            let mut is_downgrade = false;
-
-            if let Some(ref cand) = candidate {
-                let cmp = vercmp(cand.version.as_str(), p.inst_ver.as_str());
-                match cmp {
-                    Ordering::Greater => {
-                        needs_update = true;
-                        update_type = "upgrade".to_string();
-                    }
-                    Ordering::Less => {
-                        if p.state == "custom" {
-                            needs_update = true;
-                            update_type = "downgrade".to_string();
-                            is_downgrade = true;
-                        }
-                    }
-                    Ordering::Equal => {
-                        if p.state == "custom" && cand.version != p.inst_ver.as_str() {
-                            needs_update = true;
-                            update_type = "pin_sync".to_string();
-                        }
-                    }
-                }
-            }
+            let change = candidate.as_ref().map_or(VersionChange::Current, |cand| {
+                cand.version_change(&p.inst_ver, p.state == "custom")
+            });
+            let needs_update = change != VersionChange::Current;
+            let update_type = change.as_str().to_string();
+            let is_downgrade = change == VersionChange::Downgrade;
 
             let net_delta = candidate
                 .as_ref()
@@ -798,6 +824,98 @@ impl<'a> ResolverEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn version_candidate(name: &str, base: &str, version: &str, is_aur: bool) -> CandidatePackage {
+        CandidatePackage {
+            name: name.into(),
+            base: base.into(),
+            version: version.into(),
+            is_aur,
+            repo: if is_aur { "aur" } else { "extra" }.into(),
+            csize: 0,
+            isize: 0,
+            desc: String::new(),
+            builddate: 0,
+            depends: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pinned_mcpelauncher_git_metadata_does_not_request_downgrades() {
+        for (name, advertised, installed) in [
+            (
+                "mcpelauncher-linux-git",
+                "1.2.0.r0.gfe07760-1",
+                "1.8.0.r0.gef9ceb8-1",
+            ),
+            (
+                "mcpelauncher-ui-git",
+                "0.15.0.r0.g8ba3a05-1",
+                "1.8.4.r0.g779d057-1",
+            ),
+        ] {
+            let candidate = version_candidate(name, name, advertised, true);
+            for pinned in [false, true] {
+                assert_eq!(
+                    candidate.version_change(installed, pinned),
+                    VersionChange::Current
+                );
+                assert_eq!(
+                    candidate.version_change("0.0.1-1", pinned),
+                    VersionChange::Upgrade
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aur_vcs_detection_covers_split_package_bases_and_standard_suffixes() {
+        for suffix in ["git", "svn", "hg", "bzr", "darcs", "cvs", "fossil"] {
+            let vcs = format!("app-{suffix}");
+            for (name, base) in [(vcs.as_str(), "app"), ("app-cli", vcs.as_str())] {
+                let candidate = version_candidate(name, base, "1-1", true);
+                assert_eq!(
+                    candidate.version_change("2-1", true),
+                    VersionChange::Current
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stable_aur_and_native_pins_keep_intentional_version_synchronization() {
+        for candidate in [
+            version_candidate("app-bin", "app-bin", "1-1", true),
+            version_candidate("app-git", "app-git", "1-1", false),
+        ] {
+            assert_eq!(
+                candidate.version_change("2-1", true),
+                VersionChange::Downgrade
+            );
+            assert_eq!(
+                candidate.version_change("2-1", false),
+                VersionChange::Current
+            );
+            assert_eq!(
+                candidate.version_change("0.5-1", true),
+                VersionChange::Upgrade
+            );
+            assert_eq!(
+                candidate.version_change("1-1", true),
+                VersionChange::Current
+            );
+        }
+    }
+
+    #[test]
+    fn equivalent_vcs_versions_do_not_trigger_a_pin_sync_rebuild() {
+        assert_eq!(vercmp("0:2.0", "2.0"), Ordering::Equal);
+        let vcs = version_candidate("app-git", "app-git", "0:2.0", true);
+        assert_eq!(vcs.version_change("2.0", true), VersionChange::Current);
+        let stable = version_candidate("app", "app", "0:2.0", true);
+        assert_eq!(stable.version_change("2.0", true), VersionChange::PinSync);
+        assert_eq!(stable.version_change("2.0", false), VersionChange::Current);
+    }
 
     #[test]
     fn test_is_pinned_exact_and_glob() {

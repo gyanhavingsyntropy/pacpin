@@ -17,7 +17,10 @@ impl Provider {
         Self { name, definition, approved: Mutex::new(Vec::new()), no_cache: AtomicBool::new(false) }
     }
     fn template(&self) -> &[String] {
-        match crate::scratch::policy() {
+        self.template_for(crate::scratch::policy())
+    }
+    fn template_for(&self, policy: crate::scratch::Policy) -> &[String] {
+        match policy {
             crate::scratch::Policy::Ram => &self.definition.upgrade_ram,
             crate::scratch::Policy::Storage => &self.definition.upgrade_storage,
             crate::scratch::Policy::Auto => &self.definition.upgrade,
@@ -94,16 +97,18 @@ impl IntegrationProvider for Provider {
         *self.approved.lock().unwrap_or_else(|e| e.into_inner()) = updates.clone();
         Ok(updates)
     }
-    fn validate_options(&self, no_cache: bool) -> Result<(), String> {
-        if self.template().is_empty() { return Err(format!("{} does not support {:?} scratch; declare a matching upgrade variant in managers.toml", self.name, crate::scratch::policy())); }
+    fn check_options(&self, policy: crate::scratch::Policy, no_cache: bool) -> Result<(), crate::runtime::OptionError> {
+        use crate::runtime::OptionError;
+        if self.template_for(policy).is_empty() { return Err(OptionError::Unsupported(format!("{} does not support {policy:?} scratch; declare a matching upgrade variant in managers.toml", self.name))); }
         if no_cache && self.definition.no_cache_args.is_empty() && self.definition.cache_cleanup.is_empty() {
-            return Err(format!("{} does not support --no-cache; declare no_cache_args or cache_cleanup in managers.toml. Unused installed packages/generations are not caches.", self.name));
+            return Err(OptionError::Unsupported(format!("{} does not support --no-cache; declare no_cache_args or cache_cleanup in managers.toml. Unused installed packages/generations are not caches.", self.name)));
         }
-        if crate::scratch::policy() != crate::scratch::Policy::Auto {
-            crate::scratch::choose(crate::scratch::policy(), self.definition.scratch_mib.ok_or("Missing scratch_mib")? * 1_048_576, 128)?;
+        if policy != crate::scratch::Policy::Auto {
+            let footprint = self.definition.scratch_mib.ok_or_else(|| OptionError::Invalid("Missing scratch_mib".into()))? * 1_048_576;
+            crate::scratch::choose(policy, footprint, 128).map_err(OptionError::Invalid)?;
         }
-        for command in [&self.definition.upgrade, self.template(), &self.definition.verify, &self.definition.cache_cleanup] {
-            if !command.is_empty() && !crate::is_command_available(&command[0]) { return Err(format!("{} executable '{}' is unavailable", self.name, command[0])); }
+        for command in [&self.definition.upgrade, self.template_for(policy), &self.definition.verify, &self.definition.cache_cleanup] {
+            if !command.is_empty() && !crate::is_command_available(&command[0]) { return Err(OptionError::Invalid(format!("{} executable '{}' is unavailable", self.name, command[0]))); }
         }
         Ok(())
     }
