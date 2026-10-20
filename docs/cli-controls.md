@@ -20,9 +20,13 @@ forwarded to every backend. Application arguments belong after `--`.
 
 `--sources-only`, `--aur-only` and `--external-only` apply to upgrades, exclude
 unrelated checks/refresh/cleanup, and are mutually exclusive. `--keep-going`
-skips managers with explicitly unsupported upgrade options before approval and
-continues eligible work with an incomplete/nonzero result. Invalid configuration
-and capacity failures remain fatal. Its runtime continuation still uses the
+skips managers whose metadata refresh/update checks failed or whose upgrade
+options are explicitly unsupported. Successful check results are retained;
+eligible work continues with an incomplete/nonzero result, even with no remaining
+updates. Orphan cleanup stays pending; hooks follow verified successful changes
+and typed AUR rebuilds require an eligible AUR stage. Counts for failed checks
+remain unknown. Read-only `check` requires complete discovery. Native refresh,
+dependency, configuration and capacity failures remain fatal. Runtime continuation uses the
 verified AUR build-failure-to-Sources contract. It is not a general ignore-errors
 switch; pending orphan cleanup is preserved after a skip. Namespaced flags apply to their configured manager's
 upgrade or separately approved standalone actions.

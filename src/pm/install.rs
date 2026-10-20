@@ -382,10 +382,7 @@ pub fn install(
                 }
             }
         } else {
-            let exists_in_sync = manager.handle().syncdbs().into_iter().any(|db| {
-                db.pkg(target.as_str()).is_ok()
-                    || db.pkgs().find_satisfier(target.as_str()).is_some()
-            });
+            let exists_in_sync = manager.has_repository_target(target);
 
             if exists_in_sync {
                 verify_target_and_dependencies_delay(
@@ -449,7 +446,25 @@ pub fn install(
 
     let full_cmd = command_strs.join(" && ");
 
+    let native_preview = if !pacman_targets.is_empty() && !sysupgrade {
+        let preview = crate::preview::prepare_native_preview_with_needed(&mut manager, &pacman_targets, options.needed)?;
+        if !options.dry_run { crate::preview::check_native_capacity(&preview)?; }
+        Some(preview)
+    } else { None };
+
     if options.dry_run {
+        if let Some(preview) = &native_preview {
+            let explicit_names: std::collections::HashSet<String> = pacman_targets.iter()
+                .filter_map(|target| crate::db::find_sync_package(manager.handle(), target).ok())
+                .map(|package| package.name().to_string()).collect();
+            println!("\nDry-Run: Native package targets:");
+            for package in preview.adds.iter().filter(|package| explicit_names.contains(&package.name)) {
+                println!("  • {}/{} {}", package.repo, package.name, package.version);
+            }
+            crate::ui::render_preview_boxes(preview, &explicit_names);
+        } else if sysupgrade && !pacman_targets.is_empty() {
+            println!("Dry-Run: Full native system transaction is delegated to pacman; dependencies are not expanded here.");
+        }
         if let Some(description) = crate::scratch::describe_plan(false, !aur_targets.is_empty()) { println!("Dry-Run: {description}"); }
         println!("\n{}", "Dry-Run: Synthesized Installation Commands:".bold());
         println!("  ➔ {}", full_cmd.cyan());
@@ -470,11 +485,6 @@ pub fn install(
         return Ok(targets.to_vec());
     }
 
-    let native_preview = if !pacman_targets.is_empty() && !sysupgrade {
-        let preview = crate::preview::prepare_native_preview(&mut manager, &pacman_targets)?;
-        crate::preview::check_native_capacity(&preview)?;
-        Some(preview)
-    } else { None };
     let mut planned_managers = Vec::new();
     if !pacman_targets.is_empty() { planned_managers.push(crate::progress::Manager::Native); }
     if !aur_targets.is_empty() { planned_managers.push(crate::progress::Manager::Aur); }

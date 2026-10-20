@@ -493,8 +493,9 @@ pub fn select(
         .collect();
     if assets.len() != 1 {
         return Err(format!(
-            "Expected exactly one asset for '{alias}/{name}', found {}",
-            assets.len()
+            "Expected exactly one asset for '{alias}/{name}', found {} (release '{}', asset pattern '{}'; upstream assets may still be publishing or the recipe may need updating)",
+            assets.len(), crate::utils::sanitize_display_text(&release.tag),
+            crate::utils::sanitize_display_text(&asset_pattern)
         ));
     }
     let mut asset = assets[0].clone();

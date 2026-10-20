@@ -81,7 +81,7 @@ pub(super) fn footer_download(name: &str, downloaded: u64, total: Option<u64>, w
 
 pub(super) fn native_footer(text: &str, width: usize) -> String {
     let clean = clean_text(text);
-    if let Some((phase, metrics)) = clean.split_once(" (").filter(|(_, metrics)| metrics.ends_with(')') && metrics.contains('%')) {
+    if let Some((phase, metrics)) = clean.rsplit_once(" (").filter(|(_, metrics)| metrics.ends_with(')') && metrics.contains('%')) {
         let suffix = format!(" ({metrics}");
         if crate::ui::str_width(&suffix) + 2 <= width {
             return format!("{}{suffix}", crate::ui::truncate_str(phase, width - crate::ui::str_width(&suffix)));
@@ -117,14 +117,44 @@ pub(super) fn native_footer(text: &str, width: usize) -> String {
 
 pub(super) fn phase_text(manager: Manager, text: &str, previous: &str) -> String {
     if manager == Manager::Hooks { return previous.into(); }
+    if let Some(transfer) = super::transfers::footer(manager, text) { return transfer; }
     let clean = clean_text(text);
     let lower = clean.to_lowercase();
+    if matches!(manager, Manager::Aur | Manager::Sources) {
+        if lower.starts_with("==> starting build()") || lower.starts_with("==> starting check()") {
+            return "Building packages".into();
+        }
+        if ["==> starting package()", "==> entering fakeroot", "==> creating package", "==> compressing package"].iter().any(|marker| lower.starts_with(marker)) {
+            return "Packaging source".into();
+        }
+        if lower.starts_with("==> finished making:") { return "Build complete; awaiting installation".into(); }
+        // Configure/compiler output is not a package-manager lifecycle signal.
+        // In particular, "checking ...", optional feature failures and password
+        // checks must not replace Building or suspend the footer for sudo.
+        if matches!(previous, "Building packages" | "Packaging source") {
+            let counter = lower.strip_prefix('(').and_then(|rest| rest.split_once(')'))
+                .and_then(|(counter, _)| counter.split_once('/'))
+                .is_some_and(|(done, total)| done.trim().parse::<u64>().is_ok() && total.trim().parse::<u64>().is_ok());
+            let native = ["checking keys in keyring", "checking keyring", "checking package integrity", "loading package files", "checking for file conflicts", "checking available disk space", "resolving dependencies", "looking for conflicting packages"]
+                .iter().any(|marker| lower.starts_with(marker));
+            if !clean.starts_with("==>") && !clean.starts_with("::") && !counter && !native && !lower.starts_with("error:") && !lower.starts_with("pacpin_progress ") {
+                return previous.into();
+            }
+        }
+    }
+    match lower.as_str() {
+        "pacpin_progress phase=build" => return "Building packages".into(),
+        "pacpin_progress phase=install" => return "Installing packages".into(),
+        "pacpin_progress phase=verify" => return "Verifying packages".into(),
+        _ => {},
+    }
+    if manager == Manager::Nix && lower.contains("copying path") { return "Downloading store paths".into(); }
     if lower.contains("waiting for repository downloads") { return "Queued; waiting for repository downloads".into(); }
     if lower.contains("prefetch failed") { return "Prefetch failed; retry pending".into(); }
     if lower.contains("enter a number") || lower.contains("enter a selection") { return "Awaiting package selection".into(); }
     if lower.contains("password") || lower.contains("authentication") { return "Awaiting authorization".into(); }
     if lower.contains("[y/n]") || lower.contains("[y/n") || lower.contains("proceed with") { return "Awaiting confirmation".into(); }
-    if lower.starts_with("error:") || lower.contains("failed") { return "Operation failed".into(); }
+    if lower.starts_with("error:") || lower.starts_with("==> error:") || lower.contains("failed") { return "Operation failed".into(); }
     let stage = |phase: &str| phase_with_metrics(manager, &clean, phase);
     if manager == Manager::Refresh { return stage("Refreshing repositories"); }
     if manager == Manager::Record { return previous.into(); }
@@ -147,7 +177,7 @@ pub(super) fn phase_text(manager: Manager, text: &str, previous: &str) -> String
     if lower.contains("completed download") || lower.contains("prefetched artifact") { return "Download verified; ready to package".into(); }
     if lower.contains("fetching") || lower.contains("prefetching") || lower.contains("downloading") || lower.contains("retrieving packages") { return stage("Downloading packages"); }
     if lower.contains("creating package") || lower.contains("compressing package") || lower.contains("packaging") { return "Packaging source".into(); }
-    if lower.contains("building") || lower.contains("makepkg") { return stage("Building packages"); }
+    if lower.contains("building") || lower.contains("makepkg") || lower.contains("starting build()") || lower.contains("starting check()") || lower.contains("starting package()") { return stage("Building packages"); }
     if lower.contains("upgrading") || lower.contains("installing") || lower.contains("processing package changes") { return stage("Installing packages"); }
     if matches!(manager, Manager::Native | Manager::Aur) && clean.contains('%') {
         return stage(previous.split(" (").next().unwrap_or(previous));

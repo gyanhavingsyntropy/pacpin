@@ -147,6 +147,7 @@ impl Plan {
         before: BTreeMap<String, String>,
         expected: BTreeMap<String, String>,
         scope: crate::runtime::UpgradeScope,
+        aur_available: bool,
     ) -> Result<Self, String> {
         validate(config)?;
         if std::env::var_os("PACPIN_HOOK").is_some() {
@@ -177,9 +178,9 @@ impl Plan {
                 continue;
             }
             if matches!(hook.action, Action::RebuildAur { .. })
-                && scope == crate::runtime::UpgradeScope::Sources
+                && (scope == crate::runtime::UpgradeScope::Sources || !aur_available)
             {
-                println!(":: Hook {name} skipped: AUR rebuilding is outside --sources-only.");
+                println!(":: Hook {name} skipped: AUR rebuilding is outside scope or AUR is ineligible for this run.");
                 continue;
             }
             match &hook.action {
@@ -425,6 +426,7 @@ mod tests {
             before.clone(),
             expected,
             crate::runtime::UpgradeScope::All,
+            true,
         )
         .unwrap();
         assert_eq!(plan.entries.len(), 1);
@@ -436,13 +438,24 @@ mod tests {
                 &config,
                 before.clone(),
                 before,
-                crate::runtime::UpgradeScope::All
+                crate::runtime::UpgradeScope::All,
+                true,
             )
             .unwrap()
             .entries
             .is_empty()
         );
     }
+    #[test]
+    fn ineligible_aur_blocks_rebuilds_but_preserves_verified_script_actions() {
+        let config: Config = toml::from_str("[hooks.script]\nwatch=['app']\naction='script'\ncommand=['/bin/true']\n[hooks.rebuild]\nwatch=['app']\naction='rebuild-aur'\npackages=['uninstalled-aur-package']").unwrap();
+        let plan = Plan::new(&config, BTreeMap::from([("app".into(), "1-1".into())]),
+            BTreeMap::from([("app".into(), "2-1".into())]), crate::runtime::UpgradeScope::All, false).unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].0, "script");
+        assert!(!plan.has_aur());
+    }
+
     #[test]
     fn any_all_and_unless_conditions_combine() {
         let config: Config = toml::from_str("[hooks.example]\nwatch=['a','b']\nwatch_all=['c','d']\nunless_updated=['e']\naction='script'\ncommand=['/bin/true']").unwrap();

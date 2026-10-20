@@ -84,3 +84,21 @@ fn wait_for_test_file(path: &Path) {
         assert!(capture_output_with_limit(Command::new("/bin/sh").args(["-c", "sleep 30 & wait"]), 1024, std::time::Duration::from_millis(50)).is_err());
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
+
+    #[test]
+    fn observed_capture_delivers_both_streams_before_child_exit() {
+        let _guard = CHILD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || capture_output_observed(
+            Command::new("/bin/sh").args(["-c", "printf 'out'; printf 'err' >&2; sleep 0.3; exit 7"]),
+            1024, std::time::Duration::from_secs(5), std::sync::Arc::new(move |stderr, bytes| { send.send((stderr, bytes.to_vec())).unwrap(); })));
+        let mut chunks = [Vec::new(), Vec::new()];
+        for _ in 0..2 {
+            let (stderr, bytes) = receive.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            chunks[usize::from(stderr)].extend(bytes);
+        }
+        assert!(!worker.is_finished());
+        let output = worker.join().unwrap().unwrap();
+        assert_eq!(chunks, [b"out".to_vec(), b"err".to_vec()]);
+        assert_eq!(output.status.code(), Some(7));
+    }

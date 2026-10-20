@@ -19,6 +19,10 @@ impl Observer {
                     self.escape = match byte {
                         b'[' => 2,
                         b']' => 3,
+                        // tput sgr0 commonly includes ESC(B before SGR.
+                        // Charset/encoding designation consumes one more byte;
+                        // leaking its 'B' breaks exact makepkg phase markers.
+                        b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'%' => 5,
                         _ => 0,
                     };
                     continue;
@@ -39,6 +43,10 @@ impl Observer {
                 }
                 4 => {
                     self.escape = if byte == b'\\' { 0 } else { 3 };
+                    continue;
+                }
+                5 => {
+                    self.escape = 0;
                     continue;
                 }
                 _ => {}

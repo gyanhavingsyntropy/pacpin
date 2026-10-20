@@ -20,6 +20,9 @@ adapter = "flatpak"
 # These are the adapter's default commands. Upgrade runs once per approved ref.
 upgrade = ["flatpak", "update", "-y", "{scope}", "--commit={revision}", "--", "{id}"]
 clean = ["flatpak", "uninstall", "--unused", "-y"]
+# With this canonical upgrade command, Auto scratch prepares the exact ref/commit
+# using update --no-deploy --no-deps --no-related --noninteractive before its stage.
+# Custom upgrade commands/flags need an explicit prepare mapping to opt in.
 # --use-ram/--use-storage/--no-cache are unsupported until a mapping is declared.
 # Pruning installed runtimes is NOT cache cleanup; no cache_cleanup default.
 
@@ -42,6 +45,11 @@ no_cache_args = ["--pip-args=--no-cache-dir"]
 # check = ["/absolute/path/my-manager-check"]
 # verify = ["/absolute/path/my-manager-verify", "{id}", "{version}"] # exit 0 only for the installed target
 # upgrade = ["my-manager", "upgrade", "--", "{id}", "{version}"]
+# prepare = ["my-manager", "download", "--", "{id}", "{version}"]
+# Optional download-only command: requires {id}; runs before its own stage in
+# Auto scratch. Forced scratch omits it; --no-cache requires cache_cleanup.
+# Its failure retries the ordinary upgrade; it must not install/build packages.
+# Nix/Pipx have no preparation default. Core pacman/AUR commands stay typed.
 # upgrade_ram = ["my-manager", "upgrade", "--", "{id}", "{version}"]
 # upgrade_storage = ["my-manager", "upgrade", "--", "{id}", "{version}"]
 # scratch_mib = 256 # declared temporary footprint; final installation needs space

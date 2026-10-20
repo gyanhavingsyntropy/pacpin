@@ -13,20 +13,7 @@ use crate::resolver::{ResolvedPackage, ResolverEngine};
 /// Inspects candidate packages against installed packages to identify potential conflicts.
 pub fn check_package_conflicts(manager: &AlpmManager, targets: &[String]) -> Vec<(String, String)> {
     let candidates: Vec<&alpm::Package> = targets.iter().filter_map(|target| {
-        let (requested_repo, pkg_clean) = match target.split_once('/') {
-            Some((repo, pkg)) => (Some(repo), pkg),
-            None => (None, target.as_str()),
-        };
-
-        // Let ALPM search all repositories for an exact package before considering
-        // providers. A provider in an earlier repository is not the upgrade target.
-        let syncdbs = manager.handle().syncdbs();
-        if let Some(repo) = requested_repo {
-            syncdbs.into_iter().find(|db| db.name() == repo)
-                .and_then(|db| db.pkgs().find_satisfier(pkg_clean))
-        } else {
-            syncdbs.find_satisfier(pkg_clean)
-        }
+        crate::db::find_sync_package(manager.handle(), target).ok()
     }).collect();
     check_candidate_conflicts(manager, &candidates)
 }
@@ -149,32 +136,17 @@ pub(super) fn verify_target_and_dependencies_delay(
             let aur_map = aur::query_aur(&[target_pkg.to_string()]);
             if let Some(item) = aur_map.get(target_pkg) {
                 for d in &item.depends {
-                    direct_deps.push(aur::clean_dep_name(d).to_string());
+                    direct_deps.push(d.to_string());
                 }
             }
-        } else if let Some(db) = manager.handle().syncdbs().iter().find(|d| d.name() == r) {
-            let pkg_obj = db
-                .pkg(target_pkg)
-                .ok()
-                .or_else(|| db.pkgs().find_satisfier(target_pkg));
-            if let Some(pkg) = pkg_obj {
-                for d in pkg.depends() {
-                    direct_deps.push(d.name().to_string());
-                }
+        } else if let Ok(pkg) = crate::db::find_sync_package(manager.handle(), &format!("{r}/{target_pkg}")) {
+            for d in pkg.depends() {
+                direct_deps.push(d.to_string());
             }
         }
-    } else {
-        for db in manager.handle().syncdbs() {
-            let pkg_obj = db
-                .pkg(target_pkg)
-                .ok()
-                .or_else(|| db.pkgs().find_satisfier(target_pkg));
-            if let Some(pkg) = pkg_obj {
-                for d in pkg.depends() {
-                    direct_deps.push(d.name().to_string());
-                }
-                break;
-            }
+    } else if let Ok(pkg) = crate::db::find_sync_package(manager.handle(), target_pkg) {
+        for d in pkg.depends() {
+            direct_deps.push(d.to_string());
         }
     }
 
@@ -222,40 +194,28 @@ fn check_single_pkg_delay(
 ) -> Result<(), String> {
     // If already installed locally or satisfied by virtual provide, skip
     let local_db = manager.handle().localdb();
-    if local_db.pkg(pkg).is_ok() || local_db.pkgs().find_satisfier(pkg).is_some() {
+    if local_db.pkgs().find_satisfier(pkg).is_some() {
         return Ok(());
     }
 
-    let req_days = match ResolverEngine::match_delay_days(pkg, &config.delay, glob_delays) {
+    let package_name = aur::clean_dep_name(pkg);
+    let req_days = match ResolverEngine::match_delay_days(package_name, &config.delay, glob_delays) {
         Some(d) => d,
         None => return Ok(()),
     };
 
     let build_date: Option<i64> = if let Some(r) = repo {
         if r.eq_ignore_ascii_case("aur") {
-            let aur_map = aur::query_aur(&[pkg.to_string()]);
-            aur_map.get(pkg).and_then(|item| item.last_modified)
+            let aur_map = aur::query_aur(&[package_name.to_string()]);
+            aur_map.get(package_name).and_then(|item| item.last_modified)
         } else {
-            manager
-                .handle()
-                .syncdbs()
-                .iter()
-                .find(|d| d.name() == r)
-                .and_then(|d| d.pkg(pkg).ok())
+            crate::db::find_sync_package(manager.handle(), &format!("{r}/{pkg}"))
+                .ok()
                 .map(|p| p.build_date())
         }
     } else {
-        manager
-            .repos()
-            .iter()
-            .find_map(|r| {
-                manager
-                    .handle()
-                    .syncdbs()
-                    .iter()
-                    .find(|d| d.name() == r.as_str())
-                    .and_then(|d| d.pkg(pkg).ok())
-            })
+        crate::db::find_sync_package(manager.handle(), pkg)
+            .ok()
             .map(|p| p.build_date())
     };
 

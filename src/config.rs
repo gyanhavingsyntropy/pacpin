@@ -22,6 +22,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub(crate) mod setup;
+
 pub const SAFE_AUR_HELPERS: &[&str] = &["paru", "yay", "pikaur", "aurman", "pakku", "trizen"];
 
 pub fn validate_helper(helper: &str) -> Result<String, String> {
@@ -346,14 +348,6 @@ fn load_supplements(config: &mut Config, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn supplemental_defaults() -> Result<Config, String> {
-    let mut config = Config::default();
-    load_supplements(&mut config, &get_config_path())?;
-    crate::hooks::validate(&config)?;
-    crate::sources::validate_config(&config)?;
-    Ok(config)
-}
-
 pub fn save_config(config: &Config) -> Result<(), std::io::Error> {
     let path = get_config_path();
     save_config_to_path(config, &path)
@@ -382,21 +376,6 @@ where
     write_config_unlocked(&cfg, path)
         .map_err(|e| format!("Failed to save configuration: {}", e))?;
     Ok(res)
-}
-
-/// Interactive setup must not overwrite edits made while its prompts were open.
-pub fn save_config_if_unchanged(previous: &Config, updated: &Config) -> Result<(), String> {
-    save_config_if_unchanged_at(&get_config_path(), previous, updated)
-}
-
-fn save_config_if_unchanged_at(path: &Path, previous: &Config, updated: &Config) -> Result<(), String> {
-    mutate_config_at(path, |current| {
-        if current != previous {
-            return Err("Configuration changed during setup. Run setup again to include those changes.".into());
-        }
-        *current = updated.clone();
-        Ok(())
-    })
 }
 
 // The returned file owns the flock; closing it releases the lock on every path.
@@ -529,6 +508,7 @@ mod tests {
         let mut initial = Config::default();
         initial.packages.pacman.push("git".into());
         save_config_to_path(&initial, &path).unwrap();
+        let snapshot = setup::Snapshot::load(&path, false).unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         let workers: Vec<_> = (0..8).map(|i| {
             let path = path.clone();
@@ -550,7 +530,7 @@ mod tests {
         assert_eq!(result.delay["counter"], 40);
         assert_eq!(result.packages, initial.packages);
         // An interactive editor with an old snapshot must not lose these changes.
-        assert!(save_config_if_unchanged_at(&path, &initial, &Config::default()).is_err());
+        assert!(snapshot.save(&Config::default()).is_err());
         let unchanged: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(unchanged, result);
         fs::remove_dir_all(dir).unwrap();

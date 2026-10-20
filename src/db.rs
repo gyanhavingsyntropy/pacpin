@@ -19,6 +19,23 @@ use glob::Pattern;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
+/// Resolve native repository targets in configured priority order. ALPM checks
+/// exact names across all eligible repositories before considering providers.
+/// A qualified target is confined to its named repository.
+pub(crate) fn find_sync_package<'a>(
+    alpm: &'a Alpm,
+    target: &str,
+) -> Result<&'a alpm::Package, String> {
+    let package = if let Some((repo, name)) = target.split_once('/') {
+        let db = alpm.syncdbs().into_iter().find(|db| db.name() == repo)
+            .ok_or_else(|| format!("Repository '[{repo}]' is not registered."))?;
+        db.pkgs().find_satisfier(name)
+    } else {
+        alpm.syncdbs().find_satisfier(target)
+    };
+    package.ok_or_else(|| format!("Package '{target}' was not found in the selected repositories."))
+}
+
 #[derive(Debug, Clone)]
 pub struct DownloadTarget {
     pub name: String,
@@ -148,7 +165,7 @@ impl AlpmManager {
     }
 
     pub fn has_repository_target(&self, pkg_name: &str) -> bool {
-        self.handle.syncdbs().into_iter().any(|db| db.pkg(pkg_name).is_ok() || db.pkgs().find_satisfier(pkg_name).is_some())
+        find_sync_package(&self.handle, pkg_name).is_ok()
     }
 
     /// Executable paths owned by this exact installed package, never PATH guesses.
@@ -172,41 +189,9 @@ impl AlpmManager {
         repo: Option<&str>,
         pkg_name: &str,
     ) -> Result<Vec<DownloadTarget>, String> {
-        let syncdbs_list: Vec<&alpm::Db> = self.handle.syncdbs().into_iter().collect();
-        let syncdb_map: HashMap<&str, &alpm::Db> =
-            syncdbs_list.iter().map(|d| (d.name(), *d)).collect();
-
-        // Find target package or virtual provide satisfier
-        let (target_db_name, target_pkg) = if let Some(r) = repo {
-            let db = syncdb_map
-                .get(r)
-                .ok_or_else(|| format!("Repository '{}' not found", r))?;
-            let p = db
-                .pkg(pkg_name)
-                .ok()
-                .or_else(|| db.pkgs().find_satisfier(pkg_name))
-                .ok_or_else(|| format!("Package '{}' not found in repository '{}'", pkg_name, r))?;
-            (r.to_string(), p)
-        } else {
-            let mut found = None;
-            for r in &self.repos {
-                if let Some(db) = syncdb_map.get(r.as_str()) {
-                    if let Ok(p) = db.pkg(pkg_name) {
-                        found = Some((r.clone(), p));
-                        break;
-                    } else if let Some(p) = db.pkgs().find_satisfier(pkg_name) {
-                        found = Some((r.clone(), p));
-                        break;
-                    }
-                }
-            }
-            found.ok_or_else(|| {
-                format!(
-                    "Package '{}' not found in any configured repository",
-                    pkg_name
-                )
-            })?
-        };
+        let target = repo.map(|repo| format!("{repo}/{pkg_name}")).unwrap_or_else(|| pkg_name.to_string());
+        let target_pkg = find_sync_package(&self.handle, &target)?;
+        let target_db_name = target_pkg.db().expect("sync package has a database").name();
 
         let mut server_cache: HashMap<String, Vec<String>> = HashMap::new();
         let mut get_servers = |repo_name: &str| -> Result<Vec<String>, String> {
@@ -226,11 +211,9 @@ impl AlpmManager {
         let mut visited_pkgs = HashSet::new();
         let mut ordered_targets = Vec::new();
 
-        #[allow(clippy::too_many_arguments)]
         fn resolve_deps(
             pkg: &alpm::Package,
             manager: &AlpmManager,
-            syncdb_map: &HashMap<&str, &alpm::Db>,
             local_db: &alpm::Db,
             visited_deps: &mut HashSet<String>,
             visited_pkgs: &mut HashSet<String>,
@@ -249,25 +232,16 @@ impl AlpmManager {
                     continue;
                 }
 
-                // Search syncdbs in priority order
-                let mut found = None;
-                for r in &manager.repos {
-                    if let Some(db) = syncdb_map.get(r.as_str()) {
-                        if let Some(p) = db.pkgs().find_satisfier(dep_spec.as_str()) {
-                            found = Some((r.clone(), p));
-                            break;
-                        }
-                    }
-                }
-
-                if let Some((sdb_name, dep_pkg)) = found {
+                // Match target selection: exact names across repositories
+                // precede virtual providers, with version constraints intact.
+                if let Ok(dep_pkg) = find_sync_package(&manager.handle, &dep_spec) {
+                    let sdb_name = dep_pkg.db().expect("sync package has a database").name();
                     let real_name = dep_pkg.name().to_string();
                     if visited_pkgs.insert(real_name.clone()) {
                         // Recurse first so dependencies precede this package
                         resolve_deps(
                             dep_pkg,
                             manager,
-                            syncdb_map,
                             local_db,
                             visited_deps,
                             visited_pkgs,
@@ -278,7 +252,7 @@ impl AlpmManager {
                         let filename = dep_pkg.filename().ok_or_else(|| {
                             format!("No filename found for package '{}'", real_name)
                         })?;
-                        let servers = get_servers(&sdb_name)?;
+                        let servers = get_servers(sdb_name)?;
                         let candidate_urls: Vec<String> = servers
                             .iter()
                             .map(|s| format!("{}/{}", s.trim_end_matches('/'), filename))
@@ -308,7 +282,6 @@ impl AlpmManager {
         resolve_deps(
             target_pkg,
             self,
-            &syncdb_map,
             local_db,
             &mut visited_deps,
             &mut visited_pkgs,
@@ -319,7 +292,7 @@ impl AlpmManager {
         let target_filename = target_pkg
             .filename()
             .ok_or_else(|| format!("No filename found for package '{}'", target_pkg.name()))?;
-        let target_servers = get_servers(&target_db_name)?;
+        let target_servers = get_servers(target_db_name)?;
         let target_candidate_urls: Vec<String> = target_servers
             .iter()
             .map(|s| format!("{}/{}", s.trim_end_matches('/'), target_filename))
@@ -647,6 +620,33 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::test_support::{AlpmFixture, FixturePackage};
+
+    #[test]
+    fn shared_lookup_prefers_exact_names_and_preserves_repository_scope() {
+        let mut provider = FixturePackage::new("variant", "1-1");
+        provider.provides = &["app=1"];
+        let earlier = [provider];
+        let later = [FixturePackage::new("app", "2-1")];
+        let fixture = AlpmFixture::new(&[], &[("earlier", &earlier), ("later", &later)]);
+        let alpm = fixture.manager.handle();
+        assert_eq!(find_sync_package(alpm, "app").unwrap().name(), "app");
+        assert_eq!(find_sync_package(alpm, "app>=2").unwrap().version().as_str(), "2-1");
+        assert_eq!(find_sync_package(alpm, "earlier/app").unwrap().name(), "variant");
+        assert!(find_sync_package(alpm, "earlier/app>=2").is_err());
+        assert!(find_sync_package(alpm, "missing/app").is_err());
+        assert!(find_sync_package(alpm, "absent").is_err());
+    }
+
+    #[test]
+    fn shared_lookup_preserves_priority_between_exact_candidates() {
+        let earlier = [FixturePackage::new("app", "1-1")];
+        let later = [FixturePackage::new("app", "2-1")];
+        let fixture = AlpmFixture::new(&[], &[("earlier", &earlier), ("later", &later)]);
+        let alpm = fixture.manager.handle();
+        assert_eq!(find_sync_package(alpm, "app").unwrap().version().as_str(), "1-1");
+        assert_eq!(find_sync_package(alpm, "later/app").unwrap().version().as_str(), "2-1");
+    }
 
     #[test]
     fn test_order_repos_empty_override() {

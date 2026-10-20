@@ -57,7 +57,11 @@ class SlowRepository(http.server.SimpleHTTPRequestHandler):
 
     def copyfile(self, source, output):
         while chunk := source.read(64 * 1024):
-            output.write(chunk)
+            try:
+                output.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                # Expected when an interruption fixture cancels its download.
+                return
             if self.path.endswith((".pkg.tar.zst", "source.tar")):
                 time.sleep(self.download_delay)
 
@@ -237,17 +241,20 @@ package() {{
             # Consecutive runs share script's controlling tty and sudo ticket.
             # pacpin itself must require fresh authentication for the next run.
             command = "export SUDO_PROMPT=" + shlex.quote(password_prompt + " ") + "; " + " && ".join([command] * repeat)
-        scratch_before = {str(path) for base in ["/tmp", "/var/tmp"] for path in Path(base).glob("pacpin-source-*")}
+        # Workdir uses mkdtemp("pacpin-source-XXXXXX"). Match that owned name,
+        # excluding verifier logs/evidence whose descriptive prefix is similar.
+        scratch_before = {str(path) for base in ["/tmp", "/var/tmp"] for path in Path(base).glob("pacpin-source-*")
+                          if re.fullmatch(r"pacpin-source-[A-Za-z0-9]{6}", path.name)}
         shell = self.root / f"{name}.sh"
         # Resize cases exercise Kitty's own tty. An extra script(1) PTY can
         # delay forwarding its new dimensions while the display already shrank.
         direct_terminal = getattr(self, "direct_terminal", resize and not password)
         if direct_terminal:
-            assert not password, "Authentication checks need live raw prompt recording"
             execution = f"{command}\nstatus=$?\nkitty @ --to {shlex.quote(self.socket)} get-text --extent all > {shlex.quote(str(raw))}"
         else:
             execution = f"script -qef -c {shlex.quote(command)} {shlex.quote(str(raw))}\nstatus=$?"
-        shell.write_text(f"#!/bin/bash\nprintf '\\033[2J\\033[3J\\033[H'\nprintf 'PACPIN_BEFORE_TRANSACTION\\n'\nstty -g > {shlex.quote(str(self.root / (name + '.term-before')))}\n{execution}\nstty -g > {shlex.quote(str(self.root / (name + '.term-after')))}\nprintf 'PACPIN_AFTER_TRANSACTION\\n'\nprintf '%s' \"$status\" > {shlex.quote(str(result))}\n")
+        job_control = "set -m\n" if getattr(self, "job_control", False) else ""
+        shell.write_text(f"#!/bin/bash\n{job_control}printf '\\033[2J\\033[3J\\033[H'\nprintf 'PACPIN_BEFORE_TRANSACTION\\n'\nstty -g > {shlex.quote(str(self.root / (name + '.term-before')))}\n{execution}\nstty -g > {shlex.quote(str(self.root / (name + '.term-after')))}\nprintf 'PACPIN_AFTER_TRANSACTION\\n'\nprintf '%s' \"$status\" > {shlex.quote(str(result))}\n")
         self.rc("resize-os-window", "--width", str(width), "--height", "30", "--unit", "cells")
         resize_deadline = time.monotonic() + 3
         while True:
@@ -266,11 +273,19 @@ package() {{
         deadline = time.monotonic() + (timeout or (600 if aur else 60))
         while not result.exists():
             if time.monotonic() > deadline:
+                (self.root / f"{name}.timeout.screen.txt").write_text(self.rc("get-text", "--extent", "all"))
+                (self.root / f"{name}.frames.json").write_text(json.dumps(snapshots))
+                details = subprocess.run(["ps", "-e", "-o", "pid,ppid,pgid,sid,tpgid,tty,stat,wchan:28,args"], capture_output=True, text=True)
+                (self.root / f"{name}.timeout.log").write_text(details.stdout + details.stderr)
                 self.rc("send-key", "ctrl+c")
+                cancel_deadline = time.monotonic() + 5
+                while not result.exists() and time.monotonic() < cancel_deadline:
+                    time.sleep(.05)
                 raise AssertionError(f"{name} timed out")
             screen = self.rc("get-text", "--extent", "screen")
             snapshots.append(screen)
-            prompts = transcript(raw).count(password_prompt) if password and raw.exists() else 0
+            prompt_text = self.rc("get-text", "--extent", "all") if password and direct_terminal else transcript(raw) if password and raw.exists() else ""
+            prompts = prompt_text.count(password_prompt)
             if password and prompts > answered_passwords and prompts <= repeat:
                 if pending_password_since is None:
                     pending_password_since = time.monotonic()
@@ -290,13 +305,14 @@ package() {{
             if password and prompts > repeat:
                 (self.root / f"{name}.screen.txt").write_text(self.rc("get-text", "--extent", "all"))
                 (self.root / f"{name}.frames.json").write_text(json.dumps(snapshots))
-                self.results.append({"case": name, "status": None, "failures": ["sudo requested authentication again in the same transaction"], "password_prompts": transcript(raw).count(password_prompt)})
+                self.results.append({"case": name, "status": None, "failures": ["sudo requested authentication again in the same transaction"], "password_prompts": prompts})
                 self.rc("send-key", "ctrl+c")
                 raise AssertionError(f"{name}: sudo requested authentication again in the same transaction")
             if confirm and not confirmed and "Proceed with installation?" in screen:
                 if confirm_action is not None:
                     confirm_action()
-                self.rc("send-text", "--stdin", input="y\n")
+                self.rc("send-text", "--stdin", input="y")
+                self.rc("send-key", "enter")
                 confirmed = True
             if orphan_choice is not None and selection_started is None and "Showing " in screen and "Enter confirms" in screen:
                 if isinstance(orphan_choice, str):
@@ -305,7 +321,7 @@ package() {{
                     for key in orphan_choice:
                         self.rc("send-key", key)
                 selection_started = time.monotonic()
-            if orphan_choice is not None and selection_started and not selection_enter and time.monotonic() - selection_started > 0.3:
+            if orphan_choice is not None and selection_started and not selection_enter and time.monotonic() - selection_started > getattr(self, "orphan_enter_delay", 0.3):
                 self.rc("send-key", "enter")
                 selection_enter = True
             if selection and selection_started is None and "Showing " in screen and "Enter confirms" in screen:
@@ -318,7 +334,7 @@ package() {{
             if repo_menu and not cancelled and "Repository priority" in screen:
                 self.rc("send-text", "--stdin", input="q")
                 cancelled = True
-            if selection_started and not selection_enter and time.monotonic() - selection_started > selection_delay:
+            if selection and selection_started and not selection_enter and time.monotonic() - selection_started > selection_delay:
                 # A single Enter while search is active must confirm too.
                 self.rc("send-text", "--stdin", input="/pacpin-ui-orphan")
                 self.rc("send-key", "enter")
@@ -367,7 +383,7 @@ package() {{
                 failures.append("native output indented by missing carriage returns")
             if any("PACPIN_NATIVE_HISTORY_" in line and not re.fullmatch(r"PACPIN_NATIVE_HISTORY_\d{2}", line) for line in all_text.splitlines()):
                 failures.append("native history contains leftover footer text")
-        if any("Native/AUR:" in frame for frame in snapshots) or (not aur and any(re.search(r"(?:^|\n)AUR:", frame) for frame in snapshots)):
+        if any("Native/AUR:" in frame for frame in snapshots) or (not aur and any(re.search(r"(?:^|\n)AUR: (?!Checking updates|Refreshing metadata|⚠ Skipped)", frame) for frame in snapshots)):
             failures.append("AUR shown although it was never invoked")
         if aur and not any(re.search(r"(?:^|\n)AUR:", frame) for frame in snapshots):
             failures.append("invoked AUR helper progress missing")
@@ -385,7 +401,7 @@ package() {{
             failures.append(f"completed {completed_before_cache} row absent during cleanup")
         if source and (success or source_completed) and not native and not any(re.search(r"(?:^|\n)Sources:", frame) for frame in snapshots):
             failures.append("source-only progress missing")
-        if not source and any(re.search(r"(?:^|\n)Sources: (?!Checking updates|Refreshing metadata)", frame) for frame in snapshots):
+        if not source and any(re.search(r"(?:^|\n)Sources: (?!Checking updates|Refreshing metadata|⚠)", frame) for frame in snapshots):
             failures.append("Sources upgrade shown although it was never planned/invoked")
         before, after = [self.root / f"{name}.term-{part}" for part in ["before", "after"]]
         if before.read_text() != after.read_text():
@@ -434,7 +450,8 @@ package() {{
             failures.append("orphan confirmation did not print the empty selection result")
         if not success and ":: Sources: Waiting for repository downloads to finish" in raw_text:
             failures.append("queued source work still reported as waiting after native failure")
-        scratch_after = {str(path) for base in ["/tmp", "/var/tmp"] for path in Path(base).glob("pacpin-source-*")}
+        scratch_after = {str(path) for base in ["/tmp", "/var/tmp"] for path in Path(base).glob("pacpin-source-*")
+                         if re.fullmatch(r"pacpin-source-[A-Za-z0-9]{6}", path.name)}
         if scratch_after - scratch_before:
             failures.append(f"source scratch leaked: {sorted(scratch_after - scratch_before)}")
         query = subprocess.run(["pacman", "-Q"], capture_output=True, text=True)

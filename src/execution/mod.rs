@@ -11,6 +11,7 @@ mod capture;
 mod resources;
 pub use resources::remove_owned_tree;
 pub(crate) use capture::{capture_output, capture_output_with_limit};
+pub(crate) use capture::capture_output_observed;
 #[cfg(test)]
 mod tests;
 

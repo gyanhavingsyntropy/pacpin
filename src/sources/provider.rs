@@ -38,60 +38,13 @@ impl IntegrationProvider for SourceProvider {
     fn refresh_metadata(&self) -> Result<(), io::Error> {
         Ok(())
     }
-    fn check_updates(&self) -> io::Result<Vec<ExternalUpdate>> {
-        let manager = crate::db::AlpmManager::with_repo_order(&self.config.repo_order).map_err(io::Error::other)?;
-        let native_config = crate::pacman_config::snapshot().map_err(io::Error::other)?;
-        let ignore_flags: Vec<String> = {
-                native_config.option("IgnorePkg").iter().flat_map(|s| s.split_whitespace())
-                    .map(|pattern| format!("--ignore={pattern}"))
-                    .collect()
-            };
-        let targets: Vec<_> = manager
-            .handle()
-            .localdb()
-            .pkgs()
-            .into_iter()
-            .filter_map(|p| {
-                if ignored(p.name(), &ignore_flags) {
-                    return None;
-                }
-                owner(&self.config, p.name())
-                    .map(|alias| (format!("{alias}/{}", p.name()), p.version().to_string()))
-            })
-            .collect();
-        drop(manager);
-        let mut plans = Vec::new();
-        let mut errors = Vec::new();
-        // Bound HTTP pressure independently of core count. All source checks run
-        // concurrently with native ALPM/AUR/external-manager checks.
-        for batch in targets.chunks(4) {
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = batch.iter().map(|(target, installed)| scope.spawn(move || {
-                    let plan = plan(&self.config, target).map_err(|e| format!("Source '{target}': {e}"))?;
-                    Ok::<_, String>(if alpm::vercmp(plan.version.as_str(), installed.as_str()).is_gt() { Some(plan) } else { None })
-                })).collect();
-                for handle in handles {
-                    match handle.join() {
-                        Ok(Ok(Some(plan))) => plans.push(plan), Ok(Ok(None)) => {},
-                        Ok(Err(error)) => errors.push(error), Err(_) => errors.push("Source check worker failed".into()),
-                    }
-                }
-            });
+    fn check_updates(&self) -> crate::discovery::Report<ExternalUpdate> {
+        self.approved.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let result = self.discover_updates();
+        match result {
+            Ok(report) => report,
+            Err(error) => crate::discovery::Report::updates(self.name(), Err(error)),
         }
-        if !errors.is_empty() { self.approved.lock().unwrap_or_else(|e| e.into_inner()).clear(); return Err(io::Error::other(errors.join("; "))); }
-        let updates = plans
-            .iter()
-            .map(|p| ExternalUpdate {
-                runner: self.name().into(),
-                id: format!("{}/{}", p.alias, p.name),
-                name: p.name.clone(),
-                repo: p.alias.clone(),
-                version: p.version.clone(),
-                ..ExternalUpdate::default()
-            })
-            .collect();
-        *self.approved.lock().unwrap_or_else(|e| e.into_inner()) = plans;
-        Ok(updates)
     }
     fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String {
         format!(
@@ -132,7 +85,11 @@ impl IntegrationProvider for SourceProvider {
     fn supports_clean(&self) -> bool {
         false
     }
-    fn prefetch(&self, updates: &[ExternalUpdate]) {
+    fn preparation_policy(&self) -> crate::integrations::preparation::Policy {
+        if self.approved.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|plan| plan.git.is_none()) { crate::integrations::preparation::Policy::Background }
+        else { crate::integrations::preparation::Policy::Unsupported("Git source builds fetch during their foreground build stage") }
+    }
+    fn prefetch(&self, updates: &[ExternalUpdate]) -> io::Result<()> {
         crate::progress::background(|| {
             let plans = self
                 .approved
@@ -143,19 +100,11 @@ impl IntegrationProvider for SourceProvider {
                 if let Some(plan) = plans.iter().find(|p| {
                     update.id == format!("{}/{}", p.alias, p.name) && update.version == p.version
                 }) {
-                    if let Err(e) = install::prefetch(plan) {
-                        crate::progress::source_warning(format!(
-                            ":: Warning: Background prefetch for {}/{} failed: {e}; will retry during install.",
-                            plan.alias, plan.name
-                        ));
-                    }
+                    install::prefetch(plan).map_err(io::Error::other)?;
                 }
             }
-        });
-    }
-    fn supports_prefetch(&self) -> bool {
-        let plans = self.approved.lock().unwrap_or_else(|e| e.into_inner());
-        plans.is_empty() || plans.iter().any(|plan| plan.git.is_none())
+            Ok(())
+        })
     }
     fn supports_aur_failure_continuation(&self) -> bool { true }
     fn execute_after_aur_failure(&self, update: &ExternalUpdate, permit: &mut crate::pm::AurBuildFailurePermit) -> Result<bool, io::Error> {
@@ -172,5 +121,53 @@ impl IntegrationProvider for SourceProvider {
             .filter(|plan| updates.iter().any(|u| u.id == format!("{}/{}", plan.alias, plan.name))) {
             super::build::preview(plan);
         }
+    }
+}
+
+impl SourceProvider {
+    fn discover_updates(&self) -> io::Result<crate::discovery::Report<ExternalUpdate>> {
+        let manager = crate::db::AlpmManager::with_repo_order(&self.config.repo_order).map_err(io::Error::other)?;
+        let native_config = crate::pacman_config::snapshot().map_err(io::Error::other)?;
+        let ignore_flags: Vec<String> = {
+                native_config.option("IgnorePkg").iter().flat_map(|s| s.split_whitespace())
+                    .map(|pattern| format!("--ignore={pattern}"))
+                    .collect()
+            };
+        let targets: Vec<_> = manager
+            .handle()
+            .localdb()
+            .pkgs()
+            .into_iter()
+            .filter_map(|p| {
+                if ignored(p.name(), &ignore_flags) {
+                    return None;
+                }
+                owner(&self.config, p.name())
+                    .map(|alias| (format!("{alias}/{}", p.name()), p.version().to_string()))
+            })
+            .collect();
+        drop(manager);
+        let checked = super::discovery::check_targets(&targets, |target, installed| {
+            let plan = plan(&self.config, target)?;
+            Ok(if alpm::vercmp(plan.version.as_str(), installed).is_gt() { Some(plan) } else { None })
+        });
+        let (plans, failures) = checked.into_parts();
+        let updates = plans
+            .iter()
+            .map(|p| ExternalUpdate {
+                runner: self.name().into(),
+                id: format!("{}/{}", p.alias, p.name),
+                name: p.name.clone(),
+                repo: p.alias.clone(),
+                version: p.version.clone(),
+                ..ExternalUpdate::default()
+            })
+            .collect();
+        *self.approved.lock().unwrap_or_else(|e| e.into_inner()) = plans;
+        let mut report = crate::discovery::Report::updates(self.name(), Ok(updates));
+        for failure in failures {
+            report.record(failure.manager, failure.phase, Err(failure.detail));
+        }
+        Ok(report)
     }
 }

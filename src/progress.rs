@@ -3,6 +3,7 @@
 mod metrics;
 mod observer;
 mod stages;
+pub(crate) mod transfers;
 pub use stages::{activity, pending, stop_pending};
 #[cfg(test)]
 mod tests;
@@ -21,7 +22,6 @@ use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
-#[cfg(test)]
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Mutex;
@@ -31,13 +31,11 @@ struct SourceState {
     text: String,
     downloaded: u64,
     total: Option<u64>,
-    notices: Vec<String>,
 }
 static SOURCE: Mutex<SourceState> = Mutex::new(SourceState {
     text: String::new(),
     downloaded: 0,
     total: None,
-    notices: Vec::new(),
 });
 thread_local! { static BACKGROUND: Cell<bool> = const { Cell::new(false) }; }
 thread_local! { static SOURCE_DISPLAY: RefCell<Option<Footer>> = const { RefCell::new(None) }; }
@@ -63,9 +61,55 @@ impl Drop for SessionView {
 }
 static COMPLETED: Mutex<Vec<Manager>> = Mutex::new(Vec::new());
 static FAILED: Mutex<Vec<Manager>> = Mutex::new(Vec::new());
-static SKIPPED: Mutex<Vec<Manager>> = Mutex::new(Vec::new());
+static SKIPPED: Mutex<Vec<(Manager, SkipReason)>> = Mutex::new(Vec::new());
+static SOURCE_CHECK_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn source_checks_failed(count: usize) {
+    SOURCE_CHECK_FAILURES.store(count, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SkipReason {
+    UnsupportedOptions,
+    UpdateCheck,
+    MetadataRefresh,
+}
+
+impl SkipReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UnsupportedOptions => "unsupported options",
+            Self::UpdateCheck => "update check failed",
+            Self::MetadataRefresh => "metadata refresh failed",
+        }
+    }
+    fn footer(self, manager: Manager) -> String {
+        format!("{}: ⚠ Skipped ({})", manager.label(), self.label())
+    }
+}
 static NATIVE_BACKGROUND: Mutex<Option<String>> = Mutex::new(None);
 static CONTEXT: Mutex<Option<(Manager, String)>> = Mutex::new(None);
+static PREPARING: Mutex<Vec<(Manager, String)>> = Mutex::new(Vec::new());
+
+/// Download-only children use bounded tracked capture and never own the tty.
+pub(crate) fn capture_preparation(command: &mut Command, manager: Manager) -> io::Result<()> {
+    command.env("LC_ALL", "C");
+    struct Reset(Manager);
+    impl Drop for Reset { fn drop(&mut self) { PREPARING.lock().unwrap_or_else(|e| e.into_inner()).retain(|(m, _)| *m != self.0); } }
+    PREPARING.lock().unwrap_or_else(|e| e.into_inner()).push((manager, "Preparing downloads".into()));
+    let _reset = Reset(manager);
+    let observers = std::sync::Arc::new(Mutex::new([Observer::default(), Observer::default()]));
+    let output = crate::execution::capture_output_observed(command, 1_048_576, std::time::Duration::from_secs(600), std::sync::Arc::new(move |stderr, bytes| {
+        let mut observers = observers.lock().unwrap_or_else(|e| e.into_inner());
+        let observer = &mut observers[usize::from(stderr)];
+        observer.feed(bytes, &mut || {});
+        if let Some((_, value)) = PREPARING.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|(m, _)| *m == manager) {
+            *value = phase_text(manager, &observer.display(), value);
+        }
+    }))?;
+    if output.status.success() { Ok(()) }
+    else { Err(io::Error::other(format!("download-only command exited with {}: {}", output.status, crate::utils::sanitize_display_text(&String::from_utf8_lossy(&output.stderr)).chars().take(512).collect::<String>()))) }
+}
 thread_local! { static SELECTION_DISPLAY: RefCell<Option<Footer>> = const { RefCell::new(None) }; }
 thread_local! { static NATIVE_DOWNLOADS: RefCell<Vec<(String, u64)>> = const { RefCell::new(Vec::new()) }; }
 
@@ -81,6 +125,7 @@ pub fn native_downloads<T>(targets: Vec<(String, u64)>, work: impl FnOnce() -> T
 }
 
 pub fn begin_transaction() {
+    source_checks_failed(0);
     stages::clear();
     COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAILED.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -88,7 +133,7 @@ pub fn begin_transaction() {
 }
 pub fn completed(manager: Manager) {
     stages::finished(manager);
-    SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&m| m != manager);
+    SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(m, _)| m != manager);
     FAILED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&m| m != manager);
     let mut completed = COMPLETED.lock().unwrap_or_else(|e| e.into_inner());
     if !completed.contains(&manager) { completed.push(manager); }
@@ -96,18 +141,19 @@ pub fn completed(manager: Manager) {
 
 pub fn failed(manager: Manager) {
     stages::finished(manager);
-    SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&m| m != manager);
+    SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(m, _)| m != manager);
     COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&m| m != manager);
     let mut failed = FAILED.lock().unwrap_or_else(|e| e.into_inner());
     if !failed.contains(&manager) { failed.push(manager); }
 }
 
-pub fn skipped(manager: Manager) {
+pub(crate) fn skipped(manager: Manager, reason: SkipReason) {
     stages::finished(manager);
     COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&m| m != manager);
     FAILED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&m| m != manager);
     let mut skipped = SKIPPED.lock().unwrap_or_else(|e| e.into_inner());
-    if !skipped.contains(&manager) { skipped.push(manager); }
+    if let Some(entry) = skipped.iter_mut().find(|(m, _)| *m == manager) { entry.1 = reason; }
+    else { skipped.push((manager, reason)); }
 }
 
 /// An outer operation may own work performed by another manager (an AUR
@@ -279,7 +325,7 @@ pub fn source_message(text: String) {
     if BACKGROUND.get() {
         let mut state = SOURCE.lock().unwrap_or_else(|e| e.into_inner());
         state.text = text
-            .strip_prefix(":: [Background] ")
+            .strip_prefix(":: Sources: ")
             .unwrap_or(&text)
             .to_owned();
         state.downloaded = 0;
@@ -294,18 +340,6 @@ pub fn source_message(text: String) {
                 println!("{text}");
             }
         });
-    }
-}
-
-pub fn source_warning(text: String) {
-    if BACKGROUND.get() {
-        let mut state = SOURCE.lock().unwrap_or_else(|e| e.into_inner());
-        state.text = "Prefetch failed; will retry during source installation".into();
-        state.downloaded = 0;
-        state.total = None;
-        state.notices.push(text);
-    } else {
-        eprintln!("{text}");
     }
 }
 
@@ -332,7 +366,8 @@ pub fn source_download(name: &str, downloaded: u64, total: Option<u64>) {
     }
 }
 
-pub fn queued_sources() {
+#[cfg(test)]
+fn queued_sources() {
     let mut state = SOURCE.lock().unwrap_or_else(|e| e.into_inner());
     *state = SourceState {
         text: "Waiting for repository downloads to finish".into(),
@@ -344,9 +379,6 @@ pub fn finish_sources() {
     let mut state = SOURCE.lock().unwrap_or_else(|e| e.into_inner());
     if !state.text.is_empty() {
         println!(":: Sources: {}", state.text);
-    }
-    for notice in state.notices.drain(..) {
-        eprintln!("{notice}");
     }
     *state = SourceState::default();
 }
@@ -505,8 +537,8 @@ impl Footer {
             .map(|manager| format!("{}: ✔ {}", manager.label(), manager.completion())).collect();
         history.extend(FAILED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&m| m != self.manager)
             .map(|manager| format!("{}: ✗ Operation failed", manager.label())));
-        history.extend(SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&m| m != self.manager)
-            .map(|manager| format!("{}: ⚠ Skipped (unsupported options)", manager.label())));
+        history.extend(SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&(m, _)| m != self.manager)
+            .map(|&(manager, reason)| reason.footer(manager)));
         let stages = stages::snapshot();
         let generic_check = matches!(self.manager, Manager::Checks | Manager::Metadata)
             && matches!(native, "Checking external updates" | "Refreshing external metadata")
@@ -529,11 +561,16 @@ impl Footer {
                 visible.push(Manager::Native);
             }
         }
-        if matches!(self.manager, Manager::Native | Manager::Aur) && !state.text.is_empty() {
+        if self.manager != Manager::Sources && !state.text.is_empty() {
             active.push(format!("Sources: {source}"));
             visible.push(Manager::Sources);
         }
+        for (manager, phase) in PREPARING.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            if !visible.contains(manager) { active.push(format!("{}: {phase}", manager.label())); visible.push(*manager); }
+        }
         stages.append(&mut active, &mut visible);
+        let failed_checks = SOURCE_CHECK_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+        annotate_source_checks(&mut history, &mut active, failed_checks);
         fit_rows(history, active, rows.saturating_sub(5) as usize).into_iter()
             .map(|line| crate::ui::truncate_str(&clean_text(&line), width)).collect()
     }
@@ -557,6 +594,18 @@ impl Footer {
         }
         write!(out, "\x1b8")?;
         out.flush()
+    }
+}
+
+/// A failed package check must not mark the whole Sources adapter skipped or
+/// erase the healthy packages' live progress/completion.
+fn annotate_source_checks(history: &mut Vec<String>, active: &mut [String], count: usize) {
+    if count == 0 { return; }
+    let warning = format!("⚠ {count} check(s) skipped");
+    if let Some(line) = active.iter_mut().chain(history.iter_mut()).find(|line| line.starts_with("Sources: ")) {
+        line.push_str(&format!(" · {warning}"));
+    } else {
+        history.push(format!("Sources: {warning}"));
     }
 }
 
@@ -716,6 +765,7 @@ fn run_observed_with_stdin(
         .stderr(Stdio::inherit());
     let mut observer = Observer::default();
     let mut downloads = NativeDownloads::current();
+    transfers::emit(manager, transfers::Window::Started);
     let mut buf = [0u8; 8192];
     loop {
         let mut fd = libc::pollfd {
@@ -749,7 +799,11 @@ fn run_observed_with_stdin(
                     // A read can contain a heading followed by many hook/log
                     // lines. Observe every phase before those lines replace
                     // the latest display text.
-                    observer.feed_observed(&buf[..n], &mut on_ready, &mut |line| { phase = downloads.phase(manager, line, &phase); on_line(line); });
+                    observer.feed_observed(&buf[..n], &mut on_ready, &mut |line| {
+                        phase = downloads.phase(manager, line, &phase);
+                        if let Some(window) = transfers::window(manager, line) { transfers::emit(manager, window); }
+                        on_line(line);
+                    });
                 }
                 Err(error) if interactive && error.raw_os_error() == Some(libc::EIO) => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -868,9 +922,12 @@ pub fn start_background(command: &mut Command) -> io::Result<BackgroundCommand> 
             .stderr(Stdio::from(std::os::fd::OwnedFd::from(writer)));
         reader = Box::new(input);
     }
-    command.env("LC_ALL", "C").stdin(Stdio::null());
+    // A redirected stdin does not stop sudo from opening /dev/tty. Keep the
+    // invoking session for its authentication ticket, but give this download
+    // a background process group so the helper cannot relay selector input.
+    command.env("LC_ALL", "C").stdin(Stdio::null()).process_group(0);
     let child = ChildGuard(command.spawn()?);
-    crate::execution::register_child(child.0.id());
+    crate::execution::register_child_group(child.0.id());
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     *NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()) = Some("Downloading repository packages".into());
     let mut downloads = NativeDownloads::current();
@@ -910,19 +967,22 @@ pub fn draw_selection() {
     });
 }
 
-pub fn wait_for_sources(handle: &std::thread::JoinHandle<()>) {
+pub(crate) fn wait_for_preparation<T>(manager: Manager, handle: &std::thread::JoinHandle<T>) {
     let mut footer = if io::stdin().is_terminal()
         && io::stdout().is_terminal()
         && std::env::var("TERM").is_ok_and(|term| term != "dumb")
     {
-        Footer::new(Manager::Sources, true).ok()
+        Footer::new(manager, true).ok()
     } else {
         None
     };
     while !handle.is_finished() {
         if let Some(footer) = &mut footer {
             let _ = footer.resize();
-            let _ = footer.draw("");
+            let phase = if manager == Manager::Sources { String::new() } else {
+                PREPARING.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(m, _)| *m == manager).map(|(_, text)| text.clone()).unwrap_or_else(|| "Preparing downloads".into())
+            };
+            let _ = footer.draw(&phase);
             // Raw mode sends Ctrl-C as input rather than a terminal signal.
             // During the wait there is no child PTY to forward it to.
             let mut fd = libc::pollfd {

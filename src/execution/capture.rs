@@ -13,14 +13,20 @@ pub fn capture_output(command: &mut Command) -> io::Result<std::process::Output>
 /// truncated successful check. Readers drain both pipes and the child is reaped
 /// on timeout, overflow, cancellation, and ordinary failure.
 pub fn capture_output_with_limit(command: &mut Command, limit: usize, timeout: std::time::Duration) -> io::Result<std::process::Output> {
+    capture_output_observed(command, limit, timeout, std::sync::Arc::new(|_, _| {}))
+}
+
+pub(crate) type OutputObserver = std::sync::Arc<dyn Fn(bool, &[u8]) + Send + Sync>;
+pub(crate) fn capture_output_observed(command: &mut Command, limit: usize, timeout: std::time::Duration, observe: OutputObserver) -> io::Result<std::process::Output> {
     use std::os::unix::process::CommandExt;
     ensure_not_terminating()?;
-    fn read_bounded(mut stream: impl Read, limit: usize, overflow: std::sync::Arc<std::sync::atomic::AtomicBool>) -> io::Result<Vec<u8>> {
+    fn read_bounded(mut stream: impl Read, limit: usize, overflow: std::sync::Arc<std::sync::atomic::AtomicBool>, stderr: bool, observe: OutputObserver) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         let mut buffer = [0u8; 4096];
         loop {
             let count = stream.read(&mut buffer)?;
             if count == 0 { return Ok(bytes); }
+            observe(stderr, &buffer[..count]);
             let keep = count.min(limit.saturating_sub(bytes.len()));
             if keep != count { overflow.store(true, std::sync::atomic::Ordering::SeqCst); }
             bytes.extend_from_slice(&buffer[..keep]);
@@ -34,8 +40,9 @@ pub fn capture_output_with_limit(command: &mut Command, limit: usize, timeout: s
     let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let out_overflow = std::sync::Arc::clone(&overflow);
     let err_overflow = std::sync::Arc::clone(&overflow);
-    let output = std::thread::spawn(move || read_bounded(stdout, limit, out_overflow));
-    let errors = std::thread::spawn(move || read_bounded(stderr, limit, err_overflow));
+    let out_observe = observe.clone();
+    let output = std::thread::spawn(move || read_bounded(stdout, limit, out_overflow, false, out_observe));
+    let errors = std::thread::spawn(move || read_bounded(stderr, limit, err_overflow, true, observe));
     let start = std::time::Instant::now();
     let status = loop {
         if overflow.load(std::sync::atomic::Ordering::SeqCst) {

@@ -36,7 +36,12 @@ modules. A documentation rule alone cannot enforce a boundary.
    interpretation of the original inventory. Never silently relax forced flags.
 4. **Keep capability gaps distinct from runtime failure.** With --keep-going,
    a declared unsupported upgrade option may exclude its manager before effects.
-   Invalid configuration, bad metadata and insufficient capacity remain fatal.
+   Failed independent metadata discovery may also exclude its manager under
+   --keep-going. Typed reports preserve successful managers and carry every
+   failed manager/phase into the same eligibility decision. Strict consumers
+   explicitly require complete reports. Untrusted/failed metadata never enters
+   approval or execution. Invalid configuration, invalid prepared plans and
+   insufficient capacity remain fatal.
    Runtime native/unknown failures remain fatal; verified AUR build failure has
    its separate guarded Sources continuation contract. An incomplete plan keeps
    a nonzero result and preserves pending orphan cleanup.
@@ -78,3 +83,14 @@ long functions and legacy forwarding/removal paths remain recorded in the map.
 No universal approved/executed/verified typestate has been implemented. Introduce
 such state types when migrating those paths; do not claim a folder split has
 already prevented every bypass or made every future feature consistent.
+
+Discovery now has a required lossless report type and typed manager identities;
+that report is required at the provider boundary too. Sources carry failures by
+exact alias/package, retaining successful packages even under the same alias.
+Each manager's refresh precedes only its own check; source workers pull queued
+targets as they finish, with a fixed concurrency bound and stable result order.
+integration refresh/check collectors cannot silently return an empty successful
+result after another manager fails. The shared eligibility plan consumes these
+failures alongside capability skips. This enforces the collection/planning
+boundary for its callers; it does not establish transaction rollback or make
+installation failures safe to continue.

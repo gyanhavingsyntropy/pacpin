@@ -9,6 +9,41 @@
 
     use super::*;
     #[test]
+    fn build_logs_cannot_impersonate_authentication_verification_or_installation() {
+        for manager in [Manager::Aur, Manager::Sources] {
+            for line in ["checking for a working compiler... yes", "checking password support... no", "installing headers in pkgdir", "optional feature test failed", "gcc -Dfilename=authentication.c -c source.c"] {
+                assert_eq!(phase_text(manager, line, "Building packages"), "Building packages", "{line}");
+            }
+            assert_eq!(phase_text(manager, "==> Starting package()...", "Building packages"), "Packaging source");
+            assert_eq!(phase_text(manager, "installing staged binaries", "Packaging source"), "Packaging source");
+            assert_eq!(phase_text(manager, "==> Finished making: package 1-1", "Packaging source"), "Build complete; awaiting installation");
+            assert_eq!(phase_text(manager, "(1/1) upgrading package [####] 100%", "Packaging source"), if manager == Manager::Aur { "Installing packages (100%, 1/1)" } else { "Installing packages" });
+            assert_eq!(phase_text(manager, "==> ERROR: A failure occurred in build().", "Building packages"), "Operation failed");
+        }
+    }
+    #[test]
+    fn makepkg_charset_resets_do_not_hide_preparation_windows() {
+        let mut observer = Observer::default();
+        let mut lines = Vec::new();
+        for chunk in [b"\x1b[1m==>\x1b(".as_slice(), b"B\x1b[m Starting build()...\x1b(B\x1b[m\r\n"] {
+            observer.feed_observed(chunk, &mut || {}, &mut |line| lines.push(line.to_owned()));
+        }
+        assert_eq!(lines, ["==> Starting build()..."]);
+        assert_eq!(transfers::window(Manager::Aur, &lines[0]), Some(transfers::Window::Computing));
+        assert_eq!(phase_text(Manager::Aur, &lines[0], "Downloading"), "Building packages");
+    }
+    #[test]
+    fn aur_transfer_scope_survives_narrow_footer_and_resets_at_build() {
+        let phase = phase_text(Manager::Aur, "12 100M 25 25M 0 0 1M 0 0:00:40 0:00:10 0:00:30 1M", "Preparing");
+        assert_eq!(phase, "Downloading (file) (25%)");
+        for width in [12, 18, 25, 35] {
+            let line = native_footer(&phase, width);
+            assert!(line.contains("25%"), "{width}: {line}");
+            assert!(crate::ui::str_width(&line) <= width);
+        }
+        assert_eq!(phase_text(Manager::Aur, "==> Starting build()...", &phase), "Building packages");
+    }
+    #[test]
     fn native_totals_weight_all_archives_and_ignore_individual_bars() {
         native_downloads(vec![("small-1-x86_64".into(), 10), ("large-1-x86_64".into(), 90)], || {
             let mut downloads = NativeDownloads::current();
@@ -209,6 +244,19 @@
         assert_eq!(child.wait().unwrap().code(), Some(7));
         assert!(NATIVE_BACKGROUND.lock().unwrap().is_none());
         assert!(TERMINAL.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn background_download_has_own_group_and_preserves_invoking_session() {
+        let _serial = crate::execution::CHILD_TEST_LOCK.lock().unwrap();
+        let child = start_background(Command::new("sh").args(["-c", "sleep 0.2"])).unwrap();
+        let pid = child.child.0.id() as libc::pid_t;
+        // A privilege helper may open /dev/tty despite redirected stdin.
+        // It must see a background group, but retain the session/tty ticket.
+        assert_eq!(unsafe { libc::getsid(pid) }, unsafe { libc::getsid(0) });
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+        assert_ne!(unsafe { libc::getpgid(pid) }, unsafe { libc::getpgrp() });
+        assert!(child.wait().unwrap().success());
     }
 
     #[test]
@@ -450,3 +498,26 @@
             "worker printed into native output"
         );
     }
+#[test]
+fn skipped_footer_preserves_the_typed_cause() {
+    assert_eq!(SkipReason::UpdateCheck.footer(Manager::Sources), "Sources: ⚠ Skipped (update check failed)");
+    assert_eq!(SkipReason::MetadataRefresh.footer(Manager::Flatpak), "Flatpak: ⚠ Skipped (metadata refresh failed)");
+    assert_eq!(SkipReason::UnsupportedOptions.footer(Manager::Nix), "Nix: ⚠ Skipped (unsupported options)");
+}
+#[test]
+fn partial_source_checks_preserve_live_and_completed_source_rows() {
+    let mut history = vec!["Pacman: ✔ Upgrade complete".into()];
+    let mut active = vec!["Sources: Downloading 40%".into()];
+    super::annotate_source_checks(&mut history, &mut active, 1);
+    assert_eq!(active, ["Sources: Downloading 40% · ⚠ 1 check(s) skipped"]);
+    assert_eq!(history.len(), 1);
+    let mut history = vec!["Sources: ✔ Upgrade complete".into()];
+    super::annotate_source_checks(&mut history, &mut [], 2);
+    assert_eq!(history, ["Sources: ✔ Upgrade complete · ⚠ 2 check(s) skipped"]);
+    let mut history = Vec::new();
+    super::annotate_source_checks(&mut history, &mut [], 1);
+    assert_eq!(history, ["Sources: ⚠ 1 check(s) skipped"]);
+    let previous = history.clone();
+    super::annotate_source_checks(&mut history, &mut [], 0);
+    assert_eq!(history, previous);
+}

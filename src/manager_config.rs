@@ -36,6 +36,9 @@ pub struct Definition {
     pub cache_cleanup: Vec<String>,
     pub clean: Vec<String>,
     pub refresh: Vec<String>,
+    /// Optional literal download-only command, run before this manager's stage.
+    /// Automatic scratch policy only; never silently relax forced RAM/storage.
+    pub prepare: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub scratch_mib: Option<u64>,
     pub helper: Option<String>,
@@ -94,7 +97,7 @@ pub fn validate(file: &ManagerFile) -> Result<(), String> {
             }
             if !definition.check.is_empty() || !definition.verify.is_empty() || !definition.upgrade.is_empty() || !definition.upgrade_ram.is_empty()
                 || !definition.upgrade_storage.is_empty() || !definition.no_cache_args.is_empty()
-                || !definition.cache_cleanup.is_empty() || !definition.clean.is_empty() || !definition.refresh.is_empty()
+                || !definition.cache_cleanup.is_empty() || !definition.clean.is_empty() || !definition.refresh.is_empty() || !definition.prepare.is_empty()
                 || !definition.env.is_empty() || definition.scratch_mib.is_some() {
                 return Err(format!("{name}: core commands are owned by the typed adapter; configure helper/privilege_tool instead"));
             }
@@ -116,6 +119,7 @@ pub fn validate(file: &ManagerFile) -> Result<(), String> {
         for (operation, command, placeholders) in [
             ("check", &definition.check, false), ("refresh", &definition.refresh, false),
             ("verify", &definition.verify, true),
+            ("prepare", &definition.prepare, true),
             ("upgrade", &definition.upgrade, true), ("upgrade_ram", &definition.upgrade_ram, true),
             ("upgrade_storage", &definition.upgrade_storage, true), ("clean", &definition.clean, false),
             ("cache_cleanup", &definition.cache_cleanup, false),
@@ -231,6 +235,17 @@ mod tests {
     #[test]
     fn accepts_literal_commands_and_composable_variants() {
         let body = "[managers.custom]\nadapter='command'\nenabled=true\ncheck=['/opt/custom/check']\nverify=['/opt/custom/verify','{id}','{version}']\nupgrade=['/opt/custom/update','--','{id}','{version}']\nupgrade_ram=['/opt/custom/update','--','{id}']\nscratch_mib=32\nno_cache_args=['--no-cache']\n";
+        validate(&toml::from_str(body).unwrap()).unwrap();
+    }
+    #[test]
+    fn preparation_requires_explicit_target_scope_and_cannot_override_core() {
+        for body in [
+            "[managers.pacman]\nadapter='pacman'\nprepare=['tool','{id}']",
+            "[managers.aur]\nadapter='aur'\nprepare=['tool','{id}']",
+            "[managers.nix]\nadapter='nix'\nprepare=['nix','copy','--all']",
+            "[managers.nix]\nadapter='nix'\nprepare=['{id}']",
+        ] { assert!(validate(&toml::from_str(body).unwrap()).is_err(), "{body}"); }
+        let body = "[managers.nix]\nadapter='nix'\nprepare=['wrapper','download','--','{id}','{revision}']";
         validate(&toml::from_str(body).unwrap()).unwrap();
     }
     #[test]

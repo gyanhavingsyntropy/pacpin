@@ -1,5 +1,7 @@
 ### Transaction and UI contracts
 
+- Native previews and archive resolution share `db::find_sync_package`. Prefer exact names across repositories before providers, preserve versioned dependency constraints and explicit repository scope, and report ALPM conflict/dependency details before approval. Replacement removals must satisfy the full `replaces` constraint, including its version.
+
 - Render all requested targets, solver-added dependencies, implicit dependency upgrades, and removals before the final plan summary. Derive native counts and sizes from the prepared ALPM transaction. Counts must explicitly include new dependencies: show `41 upgrades + 7 new dependencies`, omit `+ 0`, and make the overall total unambiguous. Keep read-only check and upgrade previews consistent.
 - Treat download size, final net growth, and temporary peak storage as different values. Check available root and cache space before native downloads and again before installation. `--no-cache` cleans after a successful manager transaction; it cannot eliminate peak installation space. Btrfs snapshots, open deleted files, quotas and hooks can make estimates incomplete.
 - Report cache cleanup separately for each invoked manager: completed, failed, unnecessary or skipped with a reason. Check actual cleanup exit status before reporting success. Preserve failed-manager archives for recovery; successfully completed managers can clean their own caches even if a later manager fails. Never silently hide cleanup inside journal-recording conditions.
@@ -13,6 +15,7 @@
 - Reuse the reserved terminal region across successive footer phases. A label change must not scroll normal output or insert blank lines. Release the region for unauthenticated prompts and at invocation exit, including process::exit and cancellation. Verify a visible output anchor stays on the same row during a sequence of phases with no new output. Cached sudo operations should show their phase during quiet work; only genuinely pending authentication defers it.
 - Audit the entire invocation against the footer, including repository refresh, manager discovery/update checks, dependency and space checks, plan approval, orphan review with or without downloads, installation, dependency reasons/history, hook verification/rebuild context, orphan removal, cache cleanup and restart inspection. Shared execution alone does not cover work before or after a child process. Display actual concurrent work in separate rows, retain failed managers during continuation, distinguish native/AUR cache phases, and bound history rows to preserve the active stages and normal output in short terminals. Record unavailable VM checks explicitly.
 - Background repository downloads during orphan review must appear in the shared footer and must not own selector input. Lists must preserve their complete inventory in scrollback, show viewport position and usable navigation, fit narrow terminals, and confirm on one Enter even when searching. Small-terminal fallback must retain safe default selections.
+- Give background download commands a separate process group in the invoking terminal session, and register that group with shared cancellation. Null stdin alone is insufficient: sudo-rs can still open /dev/tty and block its relay after the selector restores canonical input. Do not detach the terminal session or change foreground command input to solve this; both affect authentication reuse. Check process groups, child exit, terminal restoration and ALPM locks rather than accepting a finished download bar as process completion.
 - After orphan selection confirms, print a brief selection result and keep repository download progress visible while awaiting the download process. Test Enter while downloads are still running, after they have already finished, and before a download failure. A test that finishes downloading before Enter cannot verify this transition. Keep input and Ctrl-C working throughout the wait, and verify the actual child status and lock cleanup.
 - Remember inventory separately from pending orphan cleanup. Persist confirmed selections before transactions; failed/skipped removal and interruption must re-offer cleanup on a later full upgrade, including when no updates remain. Revalidate and ask again rather than treating stored names as removal authorization. Read-only listings, --noconfirm without autoremove and scoped runs must not acknowledge pending cleanup. Verify a second invocation with an unchanged known list after both AUR failure and removal failure, plus explicit decline and legacy-state migration.
 - Orphan removal and cache cleanup are real footer steps owned by their typed `pm` APIs and shared tracked executor. Show completion only after successful child exit, retain earlier completed managers, and omit stages with no work. Keep automatic cache input intact through the renderer and verify one sudo prompt per invocation with cleanup enabled.
@@ -23,3 +26,24 @@
 - Feed automatic cache-clean answers without risking SIGPIPE when a helper exits early; preserve and report the child's actual cleanup exit status. Verify authentication reuse with --no-cache as well as installation stages.
 - Respect the configured/runtime privilege tool in refresh, install, remove, orphan removal, keep, rollback and forwarding paths. Do not pass sudo-only validation/noninteractive flags to pkexec or doas. Helpers and makepkg remain unprivileged.
 - Back these contracts with regression tests and real terminal checks in the disposable VM: new-dependency counts and ordering, long/narrow selectors, one Enter, background download status, completed manager rows, failed native extraction with possible partial application, failed cleanup exit codes, cleanup ordering and storage refusal. Record which failures were injected; a native download failure does not exercise extraction failure.
+## Partial Sources discovery in the footer
+
+A source package check failure does not mark the whole Sources stage skipped.
+Show a skipped-check warning alongside healthy Sources download/install/completion
+state, or a standalone warning if no healthy Sources work remains. Keep the exact
+failed alias/package in the plan diagnostics and the final result incomplete.
+User wait messages describe source downloads without requiring knowledge of the
+worker thread or prefetch implementation. Metadata activity rows reflect each
+manager's own refresh/check lifetime rather than a global refresh phase.
+
+## Transfer progress and preparation
+
+Interpret transfer output through `progress/transfers`, shared by ordinary installs
+and upgrades. Native repository downloads use their aggregate byte plan; AUR
+curl/wget percentages identify the current file and Git percentages identify the
+object transfer. Do not present those as a total AUR transaction percentage.
+Flatpak reports the current ref; Nix may report store copying without a known
+percentage. Custom adapters may print `PACPIN_PROGRESS download DONE/TOTAL` and
+`PACPIN_PROGRESS phase=build|verify|install`. Validate counters, preserve the
+percentage in narrow footers, and replace it on phase change. A transfer at 100%
+never means installation succeeded or that the helper has no more downloads.

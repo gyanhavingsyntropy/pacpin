@@ -11,6 +11,28 @@ pub(super) struct Provider {
     no_cache: AtomicBool,
 }
 impl Provider {
+    fn preparation_policy_for(&self, policy: crate::scratch::Policy, no_cache: bool) -> crate::integrations::preparation::Policy {
+        use crate::integrations::preparation::Policy;
+        if policy != crate::scratch::Policy::Auto {
+            return Policy::Unsupported("preparation omitted under forced scratch; upgrade uses its declared scratch variant");
+        }
+        if no_cache && self.definition.cache_cleanup.is_empty() {
+            return Policy::Unsupported("cache-avoidance upgrades omit preparation cache writes");
+        }
+        if !self.definition.prepare.is_empty() { return Policy::BeforeStage; }
+        if self.definition.adapter == "flatpak" && self.definition.upgrade == builtin::defaults("flatpak")
+            && self.definition.selected_flags.is_empty() {
+            Policy::BeforeStage
+        } else { Policy::Unsupported("no download-only preparation configured") }
+    }
+    fn preparation_arguments(&self, update: &ExternalUpdate) -> io::Result<Vec<String>> {
+        if !self.definition.prepare.is_empty() { return builtin::expand(&self.definition.prepare, update); }
+        let mut arguments = builtin::expand(&builtin::defaults("flatpak"), update)?;
+        // Exact approved ref/commit only: never deploy or implicitly expand
+        // into related refs/dependency installations during preparation.
+        arguments.splice(2..2, ["--no-deploy", "--no-deps", "--no-related", "--noninteractive"].map(str::to_string));
+        Ok(arguments)
+    }
     pub(super) fn new(name: String, mut definition: Definition) -> Self {
         if definition.upgrade.is_empty() { definition.upgrade = builtin::defaults(&definition.adapter); }
         if definition.adapter == "pipx" && definition.no_cache_args.is_empty() { definition.no_cache_args = vec!["--pip-args=--no-cache-dir".into()]; }
@@ -52,6 +74,30 @@ impl Provider {
     }
 }
 impl IntegrationProvider for Provider {
+    fn preview_upgrade(&self, updates: &[ExternalUpdate]) {
+        if self.preparation_policy() == super::preparation::Policy::BeforeStage {
+            for update in updates {
+                match self.preparation_arguments(update) {
+                    Ok(arguments) => println!(":: {} download-only preparation: {}", self.name, builtin::display(&arguments)),
+                    Err(error) => eprintln!(":: {} preparation unavailable: {error}", self.name),
+                }
+            }
+        }
+    }
+    fn preparation_policy(&self) -> crate::integrations::preparation::Policy {
+        self.preparation_policy_for(crate::scratch::policy(), self.no_cache.load(Ordering::SeqCst))
+    }
+    fn prefetch(&self, updates: &[ExternalUpdate]) -> io::Result<()> {
+        use crate::integrations::preparation::Policy;
+        if self.preparation_policy() != Policy::BeforeStage { return Err(io::Error::other("Preparation policy changed")); }
+        let approved = self.approved.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for update in updates {
+            if !approved.contains(update) { return Err(io::Error::other("Preparation target changed after approval")); }
+            let arguments = self.preparation_arguments(update)?;
+            crate::progress::capture_preparation(&mut self.command(&arguments)?, crate::progress::integration_manager(&self.name))?;
+        }
+        Ok(())
+    }
     fn name(&self) -> &str { &self.name }
     fn is_available(&self) -> bool {
         let executable = self.definition.check.first().map(String::as_str).unwrap_or(&self.definition.adapter);
@@ -63,7 +109,9 @@ impl IntegrationProvider for Provider {
         else { builtin::capture(&mut self.command(&self.definition.refresh)?)?; Ok(()) }
     }
     fn supports_refresh(&self) -> bool { !self.definition.refresh.is_empty() || self.definition.adapter == "flatpak" }
-    fn check_updates(&self) -> io::Result<Vec<ExternalUpdate>> {
+    fn check_updates(&self) -> crate::discovery::Report<ExternalUpdate> {
+        self.approved.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let result = (|| {
         if unsafe { libc::geteuid() } == 0 { return Err(io::Error::other("Configured managers must be checked as the regular user")); }
         if !self.is_available() { return Err(io::Error::new(io::ErrorKind::NotFound, "Configured manager executable is unavailable")); }
         let mut updates = if self.definition.check.is_empty() { builtin::check(&self.definition.adapter, &self.definition.env)? } else {
@@ -96,6 +144,8 @@ impl IntegrationProvider for Provider {
         }
         *self.approved.lock().unwrap_or_else(|e| e.into_inner()) = updates.clone();
         Ok(updates)
+        })();
+        crate::discovery::Report::updates(self.name(), result)
     }
     fn check_options(&self, policy: crate::scratch::Policy, no_cache: bool) -> Result<(), crate::runtime::OptionError> {
         use crate::runtime::OptionError;
@@ -107,7 +157,8 @@ impl IntegrationProvider for Provider {
             let footprint = self.definition.scratch_mib.ok_or_else(|| OptionError::Invalid("Missing scratch_mib".into()))? * 1_048_576;
             crate::scratch::choose(policy, footprint, 128).map_err(OptionError::Invalid)?;
         }
-        for command in [&self.definition.upgrade, self.template_for(policy), &self.definition.verify, &self.definition.cache_cleanup] {
+        let prepare = if self.preparation_policy_for(policy, no_cache) == super::preparation::Policy::BeforeStage { &self.definition.prepare[..] } else { &[] };
+        for command in [&self.definition.upgrade[..], self.template_for(policy), &self.definition.verify, &self.definition.cache_cleanup, prepare] {
             if !command.is_empty() && !crate::is_command_available(&command[0]) { return Err(OptionError::Invalid(format!("{} executable '{}' is unavailable", self.name, command[0]))); }
         }
         Ok(())
@@ -182,4 +233,38 @@ impl IntegrationProvider for Provider {
         if self.definition.clean.is_empty() { builtin::clean(&self.definition.adapter, &self.definition.env) } else { self.run(&self.definition.clean, "Cleaning unused packages") }
     }
     fn supports_clean(&self) -> bool { !self.definition.clean.is_empty() || matches!(self.definition.adapter.as_str(), "flatpak" | "nix") }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+    use crate::integrations::preparation::Policy;
+    fn provider(adapter: &str) -> Provider {
+        Provider::new(adapter.into(), Definition { adapter: adapter.into(), ..Default::default() })
+    }
+    #[test]
+    fn flatpak_prepares_only_the_approved_installation_ref_and_commit() {
+        let provider = provider("flatpak");
+        assert_eq!(provider.preparation_policy_for(crate::scratch::Policy::Auto, false), Policy::BeforeStage);
+        let update = ExternalUpdate { runner: "Flatpak".into(), id: "app/org.example.App/x86_64/stable".into(), name: "App".into(),
+            repo: "flathub".into(), version: "2".into(), installed_version: Some("1".into()), revision: Some("0123456789abcdef".into()), scope: Some("--user".into()) };
+        assert_eq!(provider.preparation_arguments(&update).unwrap(), ["flatpak", "update", "--no-deploy", "--no-deps", "--no-related", "--noninteractive", "-y", "--user", "--commit=0123456789abcdef", "--", "app/org.example.App/x86_64/stable"]);
+    }
+    #[test]
+    fn forced_scratch_cache_avoidance_and_custom_variants_do_not_inherit_preparation() {
+        let mut provider = provider("flatpak");
+        for policy in [crate::scratch::Policy::Ram, crate::scratch::Policy::Storage] {
+            assert!(matches!(provider.preparation_policy_for(policy, false), Policy::Unsupported(_)));
+        }
+        assert!(matches!(provider.preparation_policy_for(crate::scratch::Policy::Auto, true), Policy::Unsupported(_)));
+        provider.definition.cache_cleanup = vec!["tool".into(), "cache".into()];
+        assert_eq!(provider.preparation_policy_for(crate::scratch::Policy::Auto, true), Policy::BeforeStage);
+        provider.definition.selected_flags.push("custom".into());
+        assert!(matches!(provider.preparation_policy_for(crate::scratch::Policy::Auto, false), Policy::Unsupported(_)));
+        provider.definition.prepare = vec!["tool".into(), "download".into(), "{id}".into()];
+        assert_eq!(provider.preparation_policy_for(crate::scratch::Policy::Auto, false), Policy::BeforeStage);
+        for adapter in ["nix", "pipx", "command"] {
+            assert!(matches!(self::provider(adapter).preparation_policy_for(crate::scratch::Policy::Auto, false), Policy::Unsupported(_)));
+        }
+    }
 }

@@ -66,6 +66,19 @@ pub(crate) fn run() {
 
     let mut args: Vec<String> = env::args().skip(1).collect();
 
+    // Setup has no runtime package operation: validate its own options before
+    // invocation-only privilege/scratch flags can be consumed silently.
+    if args.first().is_some_and(|arg| matches!(arg.as_str(), "init" | "setup")) {
+        match wizard::parse_args(&args) {
+            Ok(wizard::Action::Help) => wizard::print_help(),
+            Ok(wizard::Action::Setup { reset }) => {
+                if let Err(error) = wizard::run(reset) { eprintln!("Error: {error}"); exit(1); }
+            }
+            Err(error) => { eprintln!("Error: {error}"); exit(2); }
+        }
+        exit(0);
+    }
+
     let cli_privilege_override = match runtime::extract_privilege_override(&mut args) {
         Ok(tool) => tool.map(str::to_string),
         Err(error) => { eprintln!("Error: {error}"); exit(2); }
@@ -113,16 +126,6 @@ pub(crate) fn run() {
         exit(0);
     }
 
-    if args
-        .first()
-        .map(|s| s == "init" || s == "setup")
-        .unwrap_or(false)
-    {
-        let reset = args.iter().any(|a| a == "-r" || a == "--reset");
-        wizard::run_first_launch_wizard(true, reset);
-        exit(0);
-    }
-
     if args.as_slice() == ["config", "init"] {
         let path = config::get_config_path();
         match manager_config::initialize(path.parent().unwrap_or_else(|| Path::new("."))) {
@@ -137,10 +140,10 @@ pub(crate) fn run() {
 
     // Explicit operations must not create configuration as an onboarding side effect.
     let (mut config, just_initialized) = if args.is_empty() && !config::config_exists() && io::stdin().is_terminal() {
-        if let Some(cfg) = wizard::run_first_launch_wizard(false, false) {
-            (cfg, true)
-        } else {
-            (load_config(), false)
+        match wizard::run(false) {
+            Ok(Some(cfg)) => (cfg, true),
+            Ok(None) => exit(0),
+            Err(error) => { eprintln!("Error: {error}"); exit(1); }
         }
     } else {
         (load_config(), false)

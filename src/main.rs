@@ -20,6 +20,7 @@ mod aur;
 pub mod commands;
 mod config;
 mod db;
+mod discovery;
 mod download;
 mod hooks;
 pub mod pm;

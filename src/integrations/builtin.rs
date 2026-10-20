@@ -192,18 +192,6 @@ pub(super) fn expand(command: &[String], update: &ExternalUpdate) -> io::Result<
     }).collect()
 }
 pub(super) fn display(command: &[String]) -> String { command.iter().map(|s| crate::utils::shell_quote(s)).collect::<Vec<_>>().join(" ") }
-pub(super) fn preview(adapter: &str, updates: &[ExternalUpdate]) -> String {
-    updates.iter().map(|u| expand(&defaults(adapter), u).map(|c| display(&c)).unwrap_or_else(|e| format!("Invalid plan: {e}"))).collect::<Vec<_>>().join(" && ")
-}
-pub(super) fn execute(adapter: &str, updates: &[ExternalUpdate]) -> io::Result<bool> {
-    for update in updates {
-        let arguments = expand(&defaults(adapter), update)?;
-        let mut command = command(&arguments[0], &Environment::new()); command.args(&arguments[1..]);
-        if !crate::progress::run(&mut command, crate::progress::integration_manager(&update.runner), "Upgrading packages", || {})?.success() { return Ok(false); }
-        verify(adapter, update, &Environment::new())?;
-    }
-    Ok(true)
-}
 pub(super) fn verify(adapter: &str, update: &ExternalUpdate, env: &Environment) -> io::Result<()> {
     let correct = match adapter {
         "flatpak" => {

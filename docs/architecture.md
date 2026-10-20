@@ -44,10 +44,12 @@ exceptions below remain explicit migration targets.
 | --- | --- |
 | `main.rs` | Module declarations, compatibility exports and entry into `cli::run` (about 55 lines) |
 | `cli/{mod,help,tests}.rs` | Invocation startup and dispatch, CLI reference and preserved CLI regression checks |
+| `wizard.rs`, `wizard/{preferences,prompts,review,tests}.rs` | Interactive setup coordination, validated line input, preservation-aware preferences, effective settings review and current feature guidance; no package-manager execution |
+| `config/setup.rs` | Bounded exact snapshots of all four config files; locked conflict detection, private main-config backups and the existing atomic config writer; supplemental files stay user-owned |
 | `commands/pins.rs` | Pin matching and smart unpin, including persistence and approval |
 | `execution/mod.rs` | Tracked children/groups, owned cleanup registry, graceful cancellation and child guards |
 | `execution/resources.rs` | Instance-owned cleanup registry; production has one invocation registry, tests use independent instances |
-| `execution/capture.rs` | Bounded concurrent output capture, timeout and descendant cleanup |
+| `execution/capture.rs` | Bounded concurrent output capture, optional stream observation, timeout and descendant cleanup; no UI policy |
 | `execution/tests.rs` | Preserved cancellation, resource-registry and bounded-capture checks |
 | `sandbox.rs` | Native/provider app routing and TryOptions facade (about 135 lines) |
 | `sandbox/native.rs` | Native app archive preparation, aggregate downloads and launch |
@@ -55,10 +57,12 @@ exceptions below remain explicit migration targets.
 | `sandbox/mounts.rs` | Bubblewrap probes and permitted host mounts |
 | `sandbox/workspace.rs` | App resource guard, private directories and conservative stale cleanup |
 | `sandbox/entrypoints.rs` | Selection within the requested package's executable inventory |
-| `progress.rs` | Session/footer and foreground/background display transport |
+| `progress.rs` | Session/footer and foreground/background display transport; background downloads use a separate process group while retaining the invoking terminal session |
 | `progress/observer.rs` | Bounded byte/escape normalization and operation markers |
 | `progress/stages.rs` | Scoped concurrent checks and pending approved manager stages; checking never marks an upgrade complete |
 | `progress/metrics.rs` | Aggregate progress estimates and concise phase labels |
+| `progress/transfers.rs` | Manager-specific transfer interpretation, scoped percentages and typed preparation windows shared by installs/upgrades |
+| `integrations/preparation.rs` | Approved optional preparation jobs, explicit capability policy, phase gating and join/abort lifetime |
 | `progress/tests.rs` | Preserved renderer, parser, terminal and child-transport checks |
 
 Command capture no longer lives in the terminal renderer. HTTP, archive,
@@ -67,6 +71,15 @@ operations; app-specific stale cleanup remains with sandbox. Metrics do not
 establish process success. See [design rationale and references](development/design.md).
 
 ### Native and AUR boundary
+
+`db::find_sync_package` owns native repository target lookup for transaction
+previews, native try/run archives (including missing dependencies), install
+routing, and candidate conflict/delay checks. It delegates exact-name-before-provider
+selection and version matching to ALPM, retaining explicit repository scope.
+Installed inventory and the resolver's pin/vendor/exclusion policy intentionally
+use exact identities; those policy decisions must not substitute a virtual provider.
+The preview owns transaction preparation and detailed ALPM errors, including
+version-aware replacement removals; it never commits packages.
 
 `src/pm.rs` is the public facade. Callers continue to use `pm::install`,
 `pm::clean_scoped`, `pm::check_lock` and other existing APIs.
@@ -94,11 +107,30 @@ just cutting that function into helpers sharing a large mutable context.
 
 `commands/upgrade.rs` keeps transaction ordering and its public command API.
 Its private `commands/upgrade/preflight.rs` owns one typed capability/eligibility
-result: unsupported options may skip their manager with --keep-going; invalid
+result: failed manager discovery and unsupported options may skip their manager
+with --keep-going; invalid
 plans remain fatal. It projects discovered inventory before counts, hook planning,
 approval, downloads and execution. Required provider capability methods prevent
 an adapter from silently inheriting support. Core AUR and external stages are
 separate typed identities, even when an external display name is AUR.
+
+`discovery.rs` owns lossless typed per-manager metadata reports and manager/phase
+failure identities, including exact `Source(alias/package)` failures. Provider
+check methods themselves must return lossless reports, so a Sources adapter can
+retain successful siblings instead of collapsing partial discovery to an error.
+Integration discovery pipelines each manager's own refresh/check independently;
+there is no global metadata-refresh barrier. Sources start before native refresh;
+native/AUR resolution still requires refreshed native metadata. Collectors return these reports;
+the resolver records AUR failures with the same identity. Strict `check` consumes
+complete reports explicitly. Upgrade supplies failures to eligibility, including
+refresh failures (which prohibit rechecking stale metadata). The single plan
+excludes failed managers from targets, prefetch, actions and cleanup; retains
+unknown counts and typed reasons in skipped footer rows; preserves pending orphan
+cleanup and drives a nonzero
+incomplete result. Native initialization/refresh/transaction failures remain
+fatal and cannot be represented as a skippable native discovery manager.
+Hook planning consumes the same AUR eligibility decision to block AUR rebuilds;
+scripts watching verified successful changes retain their independent conditions.
 
 `commands/upgrade/planning.rs` owns requested-target classification,
 ignores, delay policy and conversion into result records.
@@ -112,6 +144,9 @@ Use this existing structure when adding features:
 src/
   main.rs                     # thin crate entry
   cli/                        # invocation routing and help
+  wizard.rs                   # setup coordination and command validation
+  wizard/                     # preferences, line input, review and tests
+  config/setup.rs             # exact setup snapshots, backups and locked save
   execution/                  # neutral child/resource/capture ownership
   sandbox/                    # native/provider apps, mounts, inventory, workspace
   progress/                   # output normalization, metrics, scoped stage state and tests
@@ -144,6 +179,7 @@ src/
     catalog.rs
     direct.rs
     provider.rs
+    discovery.rs              # rolling bounded per-package checks and lossless outcomes
     install.rs
     build.rs                  # compilation, output inspection and capacity
     build/recipe.rs           # trusted TOML build schema and approval preview
@@ -163,6 +199,19 @@ pre-create empty scaffolding or make callers import private child paths.
 
 ## Change-impact checklist
 
+Download preparation crosses `commands/upgrade` → `integrations/preparation`
+→ provider adapters → `download` or `execution/capture`. Foreground
+`progress::run_observed` emits typed windows interpreted by the same transfer
+parser that supplies footer labels. Each provider must declare Background,
+BeforeStage or Unsupported. Only private verified release artifacts currently
+use Background; backend caches lack a cross-manager space reservation and stay
+BeforeStage. Preparation never verifies an installed upgrade. Failed preparation
+allows the ordinary stage to retry; stopped plans join started jobs without
+starting queued work. Jobs and footer rows use the eligible approved inventory.
+See the preparation scenarios in the verification contract. Helpers can fetch
+more inputs after a first build phase; overlap is opportunistic, not exclusive
+bandwidth scheduling for every AUR package.
+
 Review the owner and related modules in both directions: a caller may supply a
 new option while a downstream consumer interprets a changed result. Choose
 verification from the changed contract, not only the filename.
@@ -170,7 +219,7 @@ verification from the changed contract, not only the filename.
 | Change | Owner and related code to inspect | Contracts and verification |
 | --- | --- | --- |
 | CLI flags, scope or privilege override | `cli`, `commands/cli`, `runtime`, `commands/{upgrade,rebuild,ephemeral,maintenance}`, `manager_config`, `pm/install`, integration adapters | Option values and `--`; reject unsupported combinations before effects; no leaked pacpin flags; dry-run and scoped commands; runtime-flag VM verifier |
-| Configuration schema or persistence | `config`, `manager_config`, `wizard`, `commands/{pins,delays,rebuild}`, `sources`, `hooks`, configured integrations | Preserve legacy fields and supplemental files; validate duplicates; atomic writes and locks; read-only commands create nothing; config and manager checks |
+| Configuration schema or persistence | `config`, `config/setup`, `manager_config`, `wizard`, `commands/{pins,delays,rebuild}`, `sources`, `hooks`, configured integrations | Preserve legacy fields and supplemental files; validate duplicates; atomic writes and locks; read-only commands create nothing; config and manager checks; init VM fresh/reconfigure/reset/cancel/conflict scenarios |
 | Install pin intent or VCS version policy | `pm/{install,pinning}`, `resolver`, `config`, `commands/{pins,check,upgrade}`, Sources ownership | Original qualified requests versus helper routing/discovery; preserve selected companions and existing exact/glob rules; gate persistence on success; stale AUR VCS metadata must not trigger downgrades; unit and actual VM install checks |
 | Native resolution or transaction plan | `db`, `pacman_config`, `resolver`, `preview`, `commands/{check,upgrade,rebuild}`, `pm/{install,validation}`, `ui`, `journal`, `hooks` | Exact repositories/targets, provides/conflicts, solver dependencies, display counts, capacity estimates and approved/installed result identity; ALPM fixtures and native VM scenarios |
 | AUR metadata, helper or continuation | `aur`, `resolver`, `commands/upgrade`, `pm/{install,continuation,workspace,rebuild,cache}`, `sources/install`, `hooks` | Build unprivileged; actual helper result; recognized build failure versus native damage; keep-going stays opt-in; failure remains visible; actual AUR + Sources VM scenarios |
@@ -284,7 +333,18 @@ Source compilation, cleanup and authentication checks are recorded in
 [the source-build verification report](verification/2026-10-15-source-builds.md).
 Explicit pin intent and stale VCS version handling are covered in
 [the AUR pinning report](verification/2026-10-15-aur-pinning.md).
+Background download process groups, orphan-menu input handoffs and the combined
+terminal/manager audit are recorded in
+[the orphan handoff report](verification/2026-10-15-orphan-handoff.md).
 
 The map and instructions make reviews easier; they cannot alone prevent a
 regression. Narrow APIs, explicit ownership and verification of real failure
 paths provide the evidence that a change preserved its contracts.
+
+The shared native lookup, versioned replacement/reinstall policy, concurrent
+checks regression and focused CLI audit are recorded in
+[the native lookup report](verification/2026-10-16-native-lookup.md).
+
+Typed discovery outcomes, shared continuation eligibility, scoped hooks and
+required footer skip causes are covered in
+[the discovery continuation report](verification/2026-10-17-discovery-continuation.md).

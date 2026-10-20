@@ -1,367 +1,124 @@
-// pacpin - Declarative Package Resolver & Upgrade Engine for Arch Linux / CachyOS
-// Copyright (C) 2026 Gyan <330976822+gyanhavingsyntropy@users.noreply.github.com>
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+//! Interactive onboarding coordinates prompts; configuration owns persistence.
+use crate::config::{self, Config};
+use std::io::{self, IsTerminal};
 
-use crate::config::{get_config_path, save_config, save_config_if_unchanged, Config, Features, Options};
-use crate::integrations::{FlatpakProvider, IntegrationProvider, NixProvider, PipxProvider};
-use crate::ui::print_banner;
-use colored::Colorize;
-use std::collections::BTreeMap;
-use std::io::{self, IsTerminal, Write};
-use std::process::Command;
+mod preferences;
+mod prompts;
+mod review;
+#[cfg(test)]
+mod tests;
 
-fn prompt_yn(prompt_text: &str, default_yes: bool) -> bool {
-    let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
-    print!("  {} {} ", prompt_text.bold(), hint.cyan());
-    io::stdout().flush().unwrap();
-
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return default_yes;
-    }
-    let trimmed = input.trim().to_lowercase();
-    if trimmed.is_empty() {
-        default_yes
-    } else if trimmed == "y" || trimmed == "yes" {
-        true
-    } else if trimmed == "n" || trimmed == "no" {
-        false
-    } else {
-        default_yes
-    }
+pub(crate) enum Action {
+    Help,
+    Setup { reset: bool },
 }
 
-fn prompt_input(prompt_text: &str, default_val: &str) -> String {
-    print!("  {} (default: {}) : ", prompt_text.bold(), default_val.cyan());
-    io::stdout().flush().unwrap();
-
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return default_val.to_string();
+pub(crate) fn parse_args(args: &[String]) -> Result<Action, String> {
+    let mut reset = false;
+    let mut help = false;
+    for arg in args.iter().skip(1) {
+        match arg.as_str() {
+            "--reset" | "-r" => reset = true,
+            "--help" | "-h" => help = true,
+            _ => {
+                return Err(format!(
+                    "Unsupported init option '{arg}'. Use pacpin init --help."
+                ))
+            }
+        }
     }
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        default_val.to_string()
+    Ok(if help {
+        Action::Help
     } else {
-        trimmed.to_string()
-    }
+        Action::Setup { reset }
+    })
 }
 
-fn detect_aur_helper() -> Option<String> {
-    for helper in crate::config::SAFE_AUR_HELPERS {
-        if Command::new("which").arg(helper).output().map(|o| o.status.success()).unwrap_or(false) {
-            return Some(helper.to_string());
-        }
-    }
-    None
+pub(crate) fn print_help() {
+    println!("pacpin init [--reset]  (alias: setup)");
+    println!("Interactive setup for privileges, AUR, rules, managers and cache preferences.");
+    println!("Requires an input/output terminal. Enter accepts the shown default; q cancels.");
+    println!("Review before saving. Existing config.toml is backed up; supplemental files are preserved.");
+    println!("--reset starts main preferences/rules/manifest from defaults, keeping supplemental definitions.");
+    println!("Use config init to create missing managers.toml, sources.toml and hooks.toml without prompts.");
+    println!("Scratch/scope/keep-going flags belong to individual operations, not init.");
 }
 
-fn has_cachyos_repos() -> bool {
-    if let Ok(content) = std::fs::read_to_string("/etc/pacman.conf") {
-        content.contains("[cachyos]") || content.contains("[cachyos-v3]") || content.contains("[cachyos-core-v3]")
-    } else {
-        false
+pub(crate) fn run(reset: bool) -> Result<Option<Config>, String> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err("Interactive setup requires an input/output terminal. Use pacpin init in a terminal, or config init to create missing supplemental templates.".into());
     }
-}
-
-pub fn run_first_launch_wizard(force: bool, reset: bool) -> Option<Config> {
-    print_banner();
-
-    let config_path = get_config_path();
-    let existing_cfg = if config_path.exists() && !reset {
-        Some(crate::config::load_config())
-    } else {
-        None
+    if unsafe { libc::geteuid() } == 0 {
+        return Err("Run setup as your regular user; it configures that user's files and needs no elevation.".into());
+    }
+    let path = config::get_config_path();
+    let snapshot = config::setup::Snapshot::load(&path, reset)?;
+    let fresh = !snapshot.has_main() || reset;
+    let mut prompts = prompts::Prompts::new(io::stdin().lock(), io::stdout().lock());
+    let result = questionnaire(
+        &mut prompts,
+        snapshot.config.clone(),
+        fresh,
+        &path,
+        snapshot.has_main(),
+        reset,
+    );
+    drop(prompts);
+    let updated = match result {
+        Ok(Some(updated)) => updated,
+        Ok(None) | Err(prompts::Error::Cancelled) => {
+            println!(":: Setup cancelled; no setup files or shell aliases were written.");
+            return Ok(None);
+        }
+        Err(prompts::Error::Io(error)) => {
+            return Err(format!("Setup input/output failed: {error}"))
+        }
     };
-    let supplemental = match crate::config::supplemental_defaults() {
-        Ok(config) => config, Err(error) => { eprintln!("Error: {error}"); return None; }
-    };
-    let preserved = existing_cfg.as_ref().unwrap_or(&supplemental);
-
-    if reset && config_path.exists() {
-        println!("{}", ":: Resetting configuration and launching setup from scratch...\n".yellow().bold());
-    } else if existing_cfg.is_some() && !force {
-        println!("{}", ":: Existing configuration found at ~/.config/pacpin/config.toml.".yellow());
-        if !prompt_yn("Run setup wizard and reconfigure?", false) {
-            println!("Configuration unchanged.");
-            return None;
-        }
-        println!();
+    let backup = snapshot.save(&updated)?;
+    println!(":: Configuration saved: {}", path.display());
+    if let Some(backup) = backup {
+        println!(":: Previous configuration backup: {}", backup.display());
     }
-
-    println!("{}", ":: Welcome to pacpin! Let's tailor your package management preferences.\n".cyan().bold());
-
-    let (mut pins, mut exclude, mut delays, mut repo_order, mut vendor_stickiness) = if let Some(ref cfg) = existing_cfg {
-        if !cfg.pins.is_empty() || !cfg.delay.is_empty() || !cfg.repo_order.is_empty() {
-            println!(
-                "  {}",
-                format!(
-                    "ℹ Preserving {} existing pin(s), {} exclusion rule(s), {} delay rule(s), and custom repo order.",
-                    cfg.pins.len(),
-                    cfg.exclude.len(),
-                    cfg.delay.len()
-                )
-                .cyan()
-            );
-        }
-        (cfg.pins.clone(), cfg.exclude.clone(), cfg.delay.clone(), cfg.repo_order.clone(), cfg.features.vendor_stickiness)
-    } else {
-        (BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), Vec::new(), false)
-    };
-
-    // 1. Repository Pinning & Shielding
-    println!("{}", "[1/5] Repository Pinning & Shielding:".bold());
-    println!("      Lock packages or wildcards to specific repos (e.g. core, cachyos, extra)");
-    println!("      to prevent unwanted upstream overrides and prioritize curated repositories.");
-    let enable_pinning = prompt_yn("Enable Repository Pinning?", true);
-    println!();
-
-    if enable_pinning {
-        let discovered_repos = crate::db::AlpmManager::resolve_repo_order(&repo_order);
-        println!(
-            "  {}",
-            format!(
-                "ℹ Detected {} repositories on your system:",
-                discovered_repos.len()
-            )
-            .cyan()
-        );
-        for (i, r) in discovered_repos.iter().enumerate() {
-            print!("    {}. [{}]", i + 1, r);
-            if (i + 1) % 4 == 0 || i == discovered_repos.len() - 1 {
-                println!();
-            } else {
-                print!("  ");
-            }
-        }
-        println!();
-
-        if has_cachyos_repos() {
-            println!("  {}", "ℹ Detected CachyOS repositories on your system.".cyan());
-            if prompt_yn("Add baseline protection pins (amd-ucode, intel-ucode, linux-firmware* to core)?", true) {
-                pins.insert("amd-ucode".to_string(), "core".to_string());
-                pins.insert("intel-ucode".to_string(), "core".to_string());
-                pins.insert("linux-firmware*".to_string(), "core".to_string());
-                exclude.insert("cachyos".to_string(), vec!["linux-firmware*".to_string()]);
-                println!("  ✔ Added core microcode and firmware protection pins.\n");
-            } else {
-                println!();
-            }
-        }
-
-        if prompt_yn("Customize repository search priority order or add repos?", false) {
-            if let Some(new_order) = crate::repo_menu::run_repo_menu(&discovered_repos) {
-                repo_order = new_order;
-                println!("  ✔ Saved custom repository search order.\n");
-            }
-        }
-
-        vendor_stickiness = prompt_yn(
-            "Enable Vendor Stickiness? (keep installed packages bound to their originating repo)",
-            vendor_stickiness,
-        );
-        if vendor_stickiness {
-            println!("  ✔ Enabled vendor stickiness.\n");
-        } else {
-            println!("  ℹ Vendor stickiness disabled.\n");
-        }
-    } else {
-        println!();
+    match crate::manager_config::initialize(path.parent().unwrap_or_else(|| std::path::Path::new("."))) {
+        Ok(created) => for file in created { println!(":: Created {file}"); },
+        Err(error) => return Err(format!("Main configuration saved, but optional templates are incomplete: {error}. Run pacpin config init to retry.")),
     }
-
-    // 2. Stability Delay Buffer
-    println!("{}", "[2/5] Stability Delay Buffer:".bold());
-    println!("      Hold back bleeding-edge updates (e.g., Linux kernel, mesa, nvidia)");
-    println!("      for a designated buffer period (in days) to avoid day-0 upstream regressions.");
-    let enable_delays = prompt_yn("Enable Stability Delay Buffer?", false);
-    if enable_delays {
-        let default_days_str = prompt_input("Default buffer period for kernel/drivers in days", "3");
-        let days = default_days_str.parse::<u32>().unwrap_or(3);
-        if prompt_yn("Apply default delay buffer to kernel packages?", true) {
-            for k in crate::utils::KERNEL_PACKAGES {
-                delays.insert(k.to_string(), days);
-            }
-            println!("  ✔ Set {}-day stability buffer on kernel packages.\n", days);
-        } else {
-            println!();
+    if updated.features.shell_aliases {
+        for file in crate::alias::AliasManager::setup_aliases() {
+            println!(":: Added pin alias to {file}");
         }
-    } else {
-        println!();
-    }
-
-    // 3. Smart Orphan Lifecycle Management
-    println!("{}", "[3/5] Smart Orphan Lifecycle Management:".bold());
-    println!("      Distinguish pure useless dependencies from active optional plugins");
-    println!("      (like LADSPA for ffmpeg), and only prompt when dependencies actually change.");
-    let enable_orphans = prompt_yn("Enable Smart Orphan Management?", true);
-    println!();
-
-    // 4. AUR Integration
-    println!("{}", "[4/5] AUR Helper Integration:".bold());
-    let detected_helper = detect_aur_helper();
-    let helper = if let Some(ref h) = detected_helper {
-        println!("      Detected installed AUR helper: '{}'", h.green().bold());
-        if prompt_yn(&format!("Use '{}' for AUR packages?", h), true) {
-            h.clone()
-        } else {
-            prompt_input("Enter your preferred AUR helper command", "paru")
-        }
-    } else {
-        println!("      No standard AUR helper detected (paru/yay).");
-        prompt_input("Enter your preferred AUR helper command", "paru")
-    };
-    println!();
-
-    // 5. External Package Manager Integrations
-    println!("{}", "[5/5] External Package Manager Integrations:".bold());
-    println!("      Automatically check and unify updates for additional package managers.");
-    let has_flatpak = FlatpakProvider.is_available();
-    let has_nix = NixProvider.is_available();
-    let has_pipx = PipxProvider.is_available();
-
-    let mut enable_flatpak = false;
-    let mut enable_nix = false;
-    let mut enable_pipx = false;
-
-    if has_flatpak || has_nix || has_pipx {
-        if io::stdin().is_terminal() {
-            let mut items = Vec::new();
-            if has_flatpak {
-                items.push(crate::tui_select::CheckboxItem::new(
-                    "flatpak",
-                    "Flatpak",
-                    "Flathub updates & automatic unused runtime cleanup",
-                    true,
-                    false,
-                ));
-            }
-            if has_nix {
-                items.push(crate::tui_select::CheckboxItem::new(
-                    "nix",
-                    "Nix",
-                    "Nix profile updates & garbage collection",
-                    true,
-                    false,
-                ));
-            }
-            if has_pipx {
-                items.push(crate::tui_select::CheckboxItem::new(
-                    "pipx",
-                    "Pipx",
-                    "Isolated Python CLI app updates (pipx upgrade-all)",
-                    true,
-                    false,
-                ));
-            }
-            if let Some(selected) = crate::tui_select::run_checkbox_menu(
-                "EXTERNAL PACKAGE MANAGERS",
-                "Select integrations to enable ([Space] to toggle, [Enter] to confirm)",
-                &items,
-            ) {
-                enable_flatpak = selected.contains(&"flatpak".to_string());
-                enable_nix = selected.contains(&"nix".to_string());
-                enable_pipx = selected.contains(&"pipx".to_string());
-            }
-        } else {
-            if has_flatpak {
-                enable_flatpak = prompt_yn("  • Enable Flatpak integration (flathub updates & cleanup)?", false);
-            }
-            if has_nix {
-                enable_nix = prompt_yn("  • Enable Nix integration (profile updates & garbage collection)?", false);
-            }
-            if has_pipx {
-                enable_pipx = prompt_yn("  • Enable Pipx integration (isolated Python CLI updates)?", false);
-            }
-        }
-
-        if enable_flatpak {
-            println!("  ✔ Enabled Flatpak integration.");
-        }
-        if enable_nix {
-            println!("  ✔ Enabled Nix integration.");
-        }
-        if enable_pipx {
-            println!("  ✔ Enabled Pipx integration.");
-        }
-        if !enable_flatpak && !enable_nix && !enable_pipx {
-            println!("  ℹ External integrations disabled.");
-        }
-    } else {
-        println!("      No external package managers detected (Flatpak/Nix/Pipx).");
-    }
-    let enable_aliases = prompt_yn("  • Configure shell alias 'pin' in shell startup files (~/.bashrc / ~/.zshrc)?", false);
-
-    let enable_integrations = enable_flatpak || enable_nix || enable_pipx;
-
-    let config = Config {
-        manager_file: preserved.manager_file.clone(),
-        manager_base_options: preserved.manager_base_options.clone(),
-        external_sources: preserved.external_sources.clone(),
-        external_hooks: preserved.external_hooks.clone(),
-        hooks: preserved.hooks.clone(),
-        sources: preserved.sources.clone(),
-        features: Features {
-            pinning: enable_pinning,
-            stability_delays: enable_delays,
-            smart_orphans: enable_orphans,
-            integrations: enable_integrations,
-            vendor_stickiness,
-            shell_aliases: enable_aliases,
-        },
-        options: Options { helper, ..Options::default() },
-        repo_order,
-        pins,
-        exclude,
-        delay: delays,
-        integrations: crate::config::IntegrationsConfig {
-            flatpak: enable_flatpak,
-            nix: enable_nix,
-            pipx: enable_pipx,
-        },
-        packages: existing_cfg.as_ref().map(|cfg| cfg.packages.clone()).unwrap_or_default(),
-    };
-
-    let saved = if reset {
-        save_config(&config).map_err(|e| e.to_string())
-    } else {
-        save_config_if_unchanged(existing_cfg.as_ref().unwrap_or(&supplemental), &config)
-    };
-    if let Err(e) = saved {
-        eprintln!("{}", format!("Error saving configuration: {}", e).red());
-        return None;
-    }
-    if let Some(directory) = crate::config::get_config_path().parent() {
-        if let Err(error) = crate::manager_config::initialize(directory) {
-            eprintln!("Warning: Could not create optional manager/recipe files: {error}");
-        }
-    }
-
-    if config.features.shell_aliases {
-        crate::alias::AliasManager::setup_aliases();
         crate::alias::AliasManager::mark_notified();
     }
+    let mut prompts = prompts::Prompts::new(io::empty(), io::stdout().lock());
+    review::next_steps(&mut prompts)
+        .map_err(|error| format!("Cannot print setup guidance: {error:?}"))?;
+    Ok(Some(updated))
+}
 
-    println!("{}", "✔ Configuration saved successfully!".green().bold());
-    println!("  Path: {}", config_path.display().to_string().cyan());
-    println!("\nYou're all set! Try running:");
-    println!("  • {} to verify your repository setup", "pacpin check".bold().cyan());
-    println!("  • {} to perform a full system upgrade", "pacpin -Syu".bold().cyan());
-    println!("  • {} to manage or inspect orphaned packages", "pacpin orphans".bold().cyan());
-    if config.features.shell_aliases {
-        println!("  {}", "Reload your shell configuration to use the pin alias.\n".dimmed());
+fn questionnaire<R: io::BufRead, W: io::Write>(
+    prompts: &mut prompts::Prompts<R, W>,
+    config: Config,
+    fresh: bool,
+    path: &std::path::Path,
+    has_main: bool,
+    reset: bool,
+) -> prompts::Result<Option<Config>> {
+    prompts.section(&format!("pacpin {} - setup", env!("CARGO_PKG_VERSION")))?;
+    prompts.say("Enter accepts the current value. Type q at any prompt to cancel. Changes are saved only after the final review.")?;
+    prompts.say(&format!("Configuration: {}", path.display()))?;
+    if reset && has_main {
+        prompts.say("Reset replaces main preferences, rules and package declarations. The old main file will be backed up; supplemental definitions stay in their files.")?;
+    } else if has_main {
+        prompts.say("Existing rules, package declarations, recipes, hooks and manager overrides are retained. Only the preferences you answer are changed.")?;
     }
-
-    Some(config)
+    let updated = preferences::configure(prompts, config, fresh)?;
+    review::show(prompts, &updated, path, has_main)?;
+    if prompts.yes_no(
+        "Save this configuration and create missing templates?",
+        false,
+    )? {
+        Ok(Some(updated))
+    } else {
+        Ok(None)
+    }
 }

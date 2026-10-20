@@ -131,7 +131,7 @@ pub fn cmd_check(config: &Config, args: &[String]) {
     let mut res = if quiet { resolver.resolve_with_options(config, skip_aur) }
         else { crate::progress::operation(crate::progress::Manager::Checks, "Checking package updates", || resolver.resolve_with_options(config, skip_aur)) };
     if !res.check_errors.is_empty() {
-        eprintln!("Error: Update check incomplete: {}", res.check_errors.join("; "));
+        eprintln!("Error: Update check incomplete: {}", crate::discovery::describe(&res.check_errors));
         if let Some(handle) = ext_handle { let _ = handle.join(); }
         exit(1);
     }
@@ -154,7 +154,7 @@ pub fn cmd_check(config: &Config, args: &[String]) {
 
     let external_updates = ext_handle
         .map(|h| {
-            let join = || h.join().unwrap_or_else(|_| Err(std::io::Error::other("External update worker failed")));
+            let join = || h.join().map_err(|_| "External update worker failed".to_string())?.require_complete();
             if quiet { join() } else { crate::progress::operation(crate::progress::Manager::Checks, "Checking external updates", join) }
         })
         .unwrap_or_else(|| Ok(Vec::new()));

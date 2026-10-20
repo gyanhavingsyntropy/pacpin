@@ -23,7 +23,8 @@ pub(super) fn print_help() {
     println!("      --aur-only               Upgrade AUR targets only (build dependencies may use pacman)");
     println!("      --external-only          Upgrade enabled external managers only");
     println!("      --MANAGER.FLAG           Apply a custom flag defined in managers.toml");
-    println!("      --keep-going             Skip unsupported managers; try Sources after verified AUR build failure");
+    println!("      --keep-going             Skip failed checks/unsupported manager options; report incomplete work");
+    println!("                               Also try Sources after a verified AUR build failure");
     println!("      --use-ram                Use tmpfs for Sources / Paru builds and native run/try files");
     println!("      --use-storage            Use disk for Sources / Paru builds and native run/try files");
     println!("      --noconfirm              Bypass interactive confirmation prompt");
@@ -55,7 +56,8 @@ pub(super) fn print_help() {
         "  list                         List active pins, exclusions, delays, and repo priority"
     );
     println!("  reset [-f]                   Reset all configurations, pins, and delays to default (-f force)");
-    println!("  init [--reset]               Interactive onboarding wizard (use --reset for clean slate)");
+    println!("  init [--reset]               Guided preferences/managers setup, final review and backup");
+    println!("    init --help                 Setup behavior, cancellation and supplemental file ownership");
     println!("  capture [-n|--force]          Save explicitly installed packages to [packages]");
     println!("  rebuild [-n|--noconfirm]      Install missing declared packages without removing extras");
     println!("    --enforce-repos             Reinstall present repo-qualified packages from declared repos");

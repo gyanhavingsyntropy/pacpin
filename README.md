@@ -116,11 +116,35 @@ Pacman's local database does not reliably record which repository originally sup
 
 After you confirm an interactive upgrade with sudo, pacpin can download repository packages into pacman's cache while the orphan selector is open. The shared footer shows this download; the selector preserves its complete inventory in scrollback and supports page navigation, Home/End, and one Enter to confirm. pacpin waits for that download-only operation to finish before installing. With pkexec or doas, repository downloads stay in the normal foreground operation. If prefetch fails, the normal upgrade downloads the packages. Selected orphans are removed only after a successful upgrade and a fresh check of the installed package graph.
 
+Sources release downloads can overlap a recognized verification, build or install
+phase of an earlier manager. AUR fetching remains owned by Paru, which has no AUR
+download-only mode. Its footer shows the current file or Git transfer percentage,
+then changes to building/installing; that percentage is not the whole AUR upgrade.
+Helpers may fetch later inputs after starting a build, so overlap is opportunistic.
+Git source compilation stays in its foreground stage.
+
+With automatic scratch policy and its canonical upgrade command, Flatpak prepares
+the exact approved ref/commit using download-only mode immediately before its
+upgrade. This avoids concurrent backend-cache writes without a shared space budget.
+Nix, Pipx and custom managers can opt in with a literal `prepare = [...]` command
+in `managers.toml`; it must download only and include `{id}`. Forced scratch omits
+this optional preparation, and cache-avoidance upgrades omit it unless cleanup is
+declared. The actual upgrade still obeys its validated flags. Preparation failures
+retry normally; unsupported optional preparation never skips an eligible upgrade.
+Custom wrappers may report `PACPIN_PROGRESS download DONE/TOTAL` and
+`PACPIN_PROGRESS phase=build|verify|install` for concise footer updates.
+
 Confirmed orphan cleanup is recorded separately from the known-package inventory. If an upgrade fails or removal cannot finish, a later full upgrade offers cleanup again, even with no package updates and an unchanged known list. Stored selections are a reminder, not permission to remove packages without a new review. Declining the new review stops repeated prompts for that unchanged list. Read-only orphan listings, scoped upgrades and `--noconfirm` without explicit autoremove preserve pending cleanup. Older state gets one fresh review when this tracking is first introduced. `pin orphans -c` also resolves pending cleanup.
 
 Removal checks the entire selection against the installed dependency graph. Dependencies needed by a retained package, including an unchecked optional orphan, are kept with an explanation. Removal is limited to the confirmed targets; unchecked dependencies remain installed. Orphan removal and cache cleanup appear as separate footer steps; completed upgrades remain checked while cleanup runs. `--keep-going` does not enable orphan removal after an upgrade failure.
 
 The shared footer also describes repository refresh, update/dependency/space checks, plan approval, orphan review, source extraction, saved records, hook rebuilds and restart inspection. Approved AUR and external upgrades stay visible as **Pending** while earlier managers run. Flatpak, Nix and other configured managers get separate rows for their actual checks and operations; checking for updates never marks an upgrade complete. Orphan review has its own row even without downloads; concurrent repository downloads remain visible alongside it. Failed managers stay marked during continuation. Short terminals prioritize active work and recent failures over older completed rows and summarize extra pending stages.
+
+Enabled external managers (including Sources, Flatpak and Nix) check for updates concurrently. Each waits only for its own required metadata refresh: Sources can check while Flatpak and native databases refresh, and native/AUR resolution follows native refresh. Individual Sources packages also check concurrently, using up to four workers across aliases; a free worker starts the next queued package immediately. The combined plan waits for the selected checks to finish. Package transactions retain their ordered execution. Native target lookup prefers an exact package name across repositories before virtual providers; explicit repository targets remain confined to that repository. Dependency-preview failures identify conflicting packages or unsatisfied dependencies.
+
+With `--keep-going`, a failed source package check excludes only that exact `alias/package`. Other packages, including those sharing the alias, remain eligible. Counts for failed checks remain unknown and the invocation returns incomplete (exit 2); the footer warns about skipped checks while retaining healthy Sources progress. Without the flag, any failed check stops before installation; read-only `pin check` also requires complete discovery.
+
+Ordinary native install dry-runs also prepare the transaction and show solver-added dependencies and removals. Full system transactions delegated directly to pacman state when dependencies have not been expanded. Forced native reinstalls remain included in capacity estimates.
 
 The final plan summary follows dependency and removal details. Its native counts and sizes include the prepared transaction's additional packages: for example, `41 upgrades + 7 new dependencies`, with no `+ 0` when there are none. Sources and other managers retain unknown sizes rather than appearing to add zero bytes.
 
@@ -160,7 +184,7 @@ pin upgrade --aur-only --use-ram            # Paru clones / downloads / builds i
 TMPDIR=/path/to/disk/scratch pin upgrade --sources-only --use-storage
 pin -S aur/antigravity --use-ram            # one AUR package
 pin -S source-alias/package --use-storage   # one Source package
-pin -Syu --keep-going                      # skip unsupported managers; guarded Sources continuation
+pin -Syu --keep-going                      # continue eligible managers; report skipped work
 pin run --use-ram extra/jq -- . input.json  # downloads + extracted files in RAM; host execution
 pin try --use-storage extra/jq -- . input.json # disk files; Bubblewrap isolation
 pin run --dry-run --use-ram extra/jq        # inspect the workspace policy without downloading
@@ -173,7 +197,7 @@ pin rebuild --use-storage --no-cache --dry-run # preview declared native/AUR/Sou
 
 Paru receives a private clone directory and makepkg directory environment overrides. Successful temporary workspaces are removed; failed AUR workspaces are retained with their path for inspection (RAM contents disappear on reboot). Custom clone/makepkg/chroot/local-repository flags conflict with this policy; other helpers fail explicitly rather than ignoring the request. Sources retain their automatic temporary-workspace cleanup.
 
-`--keep-going` also skips managers whose requested upgrade scratch/cache options are explicitly unsupported, before approval or installation. It previews their names, packages and reasons, continues eligible managers, keeps the overall result incomplete (exit 2), and defers orphan cleanup. Invalid configuration, insufficient capacity and uncertain failures remain fatal. Skipped managers perform no upgrade, prefetch or cache cleanup; successful invoked managers can still clean their own caches.
+`--keep-going` skips a manager whose metadata refresh or update check failed, and managers whose requested upgrade scratch/cache options are explicitly unsupported. Successful check results are retained. Failed discovery is shown before approval with an unknown update count; it is never reported as up to date. Eligible managers continue, while the result stays incomplete (exit 2), even when none have updates. Orphan cleanup stays pending. Hooks still use verified successful changes; an unrelated check failure does not suppress a script, while AUR rebuild hooks are skipped when AUR is ineligible. Skipped managers perform no upgrade, prefetch, namespaced custom action or cache cleanup; successful invoked managers can still clean their own caches. Invalid local configuration, insufficient capacity, native dependency/refresh failures and uncertain installation failures remain fatal. Read-only `pin check` still requires complete discovery.
 
 Runtime continuation is opt-in and limited to recognized makepkg build failures under the default native/dependency policy with Paru. It requires no observed native installation, an unchanged pacman database and log, an unlocked database, and satisfied installed dependencies. AUR build-dependency installations therefore conservatively disable continuation. Unknown failures, interruptions and native extraction/commit failures stop the run. Only Sources opt in: each exact approved package is checked independently, including transitive installed dependencies, actual archive dependencies, a prepared ALPM transaction with no extra packages/removals, and root/scratch capacity. Packages with scriptlets, conflicts or replacements are excluded. Successful Sources are recorded individually; the AUR failure still produces a nonzero exit, skips orphan cleanup and preserves failed AUR caches. This is not a recovery command for damaged packages.
 
@@ -257,12 +281,53 @@ incompatible upstream recipe build successfully.
 | `pacpin undelay <pkg>` | Remove a stability delay buffer |
 | `pacpin list` | List active engine features, pins, exclusions, delays, and repo priority |
 | `pacpin reset [-f]` | Reset all configurations, pins, and delays to default (creates automatic timestamped backup) |
-| `pacpin init [--reset]` | Interactive onboarding wizard to configure preferences from scratch |
+| `pacpin init [--reset]` (`setup`) | Guided current preferences, manager selection and configuration review; backs up the previous main file before saving |
 | `pacpin config init` | Create missing editable manager, source and hook files without overwriting existing files |
 | `pacpin config validate` | Validate the main config and all supplemental files |
 | `pacpin manager NAME --FLAG [-n|--noconfirm]` | Preview or run configured standalone manager actions |
 | `pacpin capture [-n|--force]` | Save explicitly installed packages and Flatpak apps to `[packages]` (`-n` previews) |
 | `pacpin rebuild [-n|--noconfirm] [--enforce-repos]` | Install missing listed packages without deleting extras; optionally reinstall from declared repositories |
+
+#### Guided setup
+
+Run `pacpin init` as your regular user in a terminal. It covers privilege/AUR
+tools, repository policies and delays, orphan review, cache preferences and
+Flatpak/Nix/Pipx participation. It also explains Sources build recipes, conditional
+hooks, declarative packages, temporary apps, manager capabilities and per-command
+scratch/scope controls. It does not install packages or execute recipes/hooks.
+
+Existing values are the defaults when reconfiguring. Press Enter to keep a value,
+or type `q` to cancel; EOF also cancels. Invalid answers are retried. A final review
+requires an explicit **yes** before writing. Setup never writes shell aliases
+before that approval, and new setups leave alias maintenance disabled by default.
+Existing `config.toml` is backed up as `config.toml.backup-*.toml` beside the main
+file. Edits to any of the four configuration files while the wizard is open
+prevent saving, including comment-only edits.
+
+All editable configuration lives in the same directory (normally
+`~/.config/pacpin/`, or `$XDG_CONFIG_HOME/pacpin/`):
+
+| File | Purpose during setup |
+| --- | --- |
+| `config.toml` | Preferences, repository rules and `[packages]` declarations |
+| `managers.toml` | Built-in/custom adapters, explicit manager selection, capabilities and custom flags |
+| `sources.toml` | Release/catalog recipes and trusted local source-build commands/optimization settings |
+| `hooks.toml` | Conditional commands or AUR rebuilds after verified changes |
+
+Missing supplemental templates are created after saving; existing files are
+preserved byte for byte. Explicit manager `enabled`, `helper` or `privilege_tool`
+overrides are shown with their owning file rather than offered as ineffective
+main-config edits. Use `pacpin config init` to create only missing supplemental
+templates without interactive setup, and `pacpin config validate` to check them.
+
+`pacpin init --reset` starts main preferences, rules and package declarations
+from defaults, then asks for approval and backs up the old main file (even if its
+TOML is malformed). It retains supplemental definitions; fix malformed
+supplemental files before running setup. `init --help` describes the flow.
+Runtime flags such as `--pkexec`, `--use-ram`, `--no-cache` and `--keep-going` belong
+to operations; setup rejects them. Choose a persistent privilege tool and cache
+preference in the wizard instead. Forced scratch placement is never a universal
+default for external managers with different storage models.
 
 ### System Maintenance & Hygiene
 | Command | Description |
@@ -300,6 +365,8 @@ See [module ownership, affected-module checks and the refactoring plan](docs/arc
 and [design principles with professional references](docs/development/design.md)
 for where features belong and which related paths to review. [AGENTS.md](AGENTS.md)
 records the development and verification contracts.
+The [orphan-menu handoff audit](docs/verification/2026-10-15-orphan-handoff.md)
+records the sudo-rs terminal fix and its transaction, authentication and footer checks.
 
 ## Building from Source
 

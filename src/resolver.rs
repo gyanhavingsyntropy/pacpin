@@ -143,7 +143,7 @@ pub struct ResolvedPackage {
 
 #[derive(Debug, Clone)]
 pub struct ResolveResult {
-    pub check_errors: Vec<String>,
+    pub check_errors: Vec<crate::discovery::Failure>,
     pub installed_count: usize,
     pub repos: Vec<String>,
     #[allow(dead_code)]
@@ -662,16 +662,18 @@ impl<'a> ResolverEngine<'a> {
             None => HashMap::new(),
             Some(Ok(Ok(data))) => data,
             Some(Ok(Err(error))) => {
-                check_errors.push(error);
+                check_errors.push(crate::discovery::Failure::new(crate::discovery::Manager::Aur, crate::discovery::Phase::Updates, error));
                 HashMap::new()
             }
             Some(Err(_)) => {
-                check_errors.push("AUR update worker failed".into());
+                check_errors.push(crate::discovery::Failure::new(crate::discovery::Manager::Aur, crate::discovery::Phase::Updates, "AUR update worker failed"));
                 HashMap::new()
             }
         };
 
         // Resolve pending packages requiring AUR inspection
+        // Failed discovery is not evidence that a pinned package is absent.
+        if !check_errors.is_empty() { pending_aur.clear(); }
         for p in pending_aur {
             let mut candidate: Option<CandidatePackage> = None;
             let is_sticky = p.is_sticky;

@@ -186,13 +186,13 @@ fn prefetch_inner(plan: &Plan) -> Result<(), String> {
         }
     }
     crate::progress::source_message(format!(
-            ":: [Background] Prefetching source package: {}/{} ({})",
+            ":: Sources: Downloading source package: {}/{} ({})",
             plan.alias, plan.name, plan.tag
         ));
     let mut work = Workdir::new_for_plan(plan, None)?;
     let artifact = download(plan, &mut work)?;
     crate::progress::source_message(format!(
-            ":: [Background] Completed download & verification for {}/{}",
+            ":: Sources: Completed download & verification for {}/{}",
             plan.alias, plan.name
         ));
     let mut lock = PREFETCH_CACHE.lock().unwrap_or_else(|e| e.into_inner());

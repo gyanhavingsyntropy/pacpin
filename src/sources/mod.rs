@@ -4,6 +4,7 @@ mod catalog;
 mod direct;
 mod install;
 mod provider;
+mod discovery;
 mod build;
 mod git;
 pub use build::BuildRecipe;

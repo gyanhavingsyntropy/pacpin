@@ -18,7 +18,6 @@ use crate::config::Config;
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
 
@@ -114,6 +113,7 @@ fn write_flatpak_cache(path: &std::path::Path, content: &[u8]) -> std::io::Resul
 mod builtin;
 #[path = "integrations/configured.rs"]
 mod configured;
+pub(crate) mod preparation;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -138,7 +138,7 @@ pub trait IntegrationProvider: Send + Sync {
     fn is_available(&self) -> bool;
     fn refresh_metadata(&self) -> Result<(), std::io::Error>;
     fn supports_refresh(&self) -> bool { false }
-    fn check_updates(&self) -> std::io::Result<Vec<ExternalUpdate>>;
+    fn check_updates(&self) -> crate::discovery::Report<ExternalUpdate>;
     fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String;
     fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> Result<bool, std::io::Error>;
     fn check_options(&self, policy: crate::scratch::Policy, no_cache: bool) -> Result<(), crate::runtime::OptionError>;
@@ -151,46 +151,15 @@ pub trait IntegrationProvider: Send + Sync {
     fn clean_command_str(&self) -> String;
     fn execute_clean(&self) -> Result<bool, std::io::Error>;
     fn supports_clean(&self) -> bool { false }
-    fn prefetch(&self, _updates: &[ExternalUpdate]) {}
-    fn supports_prefetch(&self) -> bool { false }
+    fn preparation_policy(&self) -> preparation::Policy;
+    fn prefetch(&self, _updates: &[ExternalUpdate]) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "No download-only preparation adapter"))
+    }
     fn supports_aur_failure_continuation(&self) -> bool { false }
     fn execute_after_aur_failure(&self, _update: &ExternalUpdate, _permit: &mut crate::pm::AurBuildFailurePermit) -> Result<bool, std::io::Error> {
         Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "This integration does not support continuation after AUR failure"))
     }
 }
-
-// Wizard probes retain the same API and use shared, bounded process tracking.
-pub struct FlatpakProvider;
-pub struct NixProvider;
-pub struct PipxProvider;
-macro_rules! builtin_provider {
-    ($provider:ident, $name:literal, $adapter:literal) => {
-        impl IntegrationProvider for $provider {
-            fn name(&self) -> &str { $name }
-            fn is_available(&self) -> bool { crate::is_command_available($adapter) }
-            fn refresh_metadata(&self) -> std::io::Result<()> { builtin::refresh($adapter, &BTreeMap::new()) }
-            fn supports_refresh(&self) -> bool { $adapter == "flatpak" }
-            fn check_options(&self, policy: crate::scratch::Policy, no_cache: bool) -> Result<(), crate::runtime::OptionError> {
-                if policy != crate::scratch::Policy::Auto {
-                    return Err(crate::runtime::OptionError::Unsupported(format!("{} does not support {policy:?} scratch", $name)));
-                }
-                if no_cache {
-                    return Err(crate::runtime::OptionError::Unsupported(format!("{} does not support --no-cache", $name)));
-                }
-                Ok(())
-            }
-            fn check_updates(&self) -> std::io::Result<Vec<ExternalUpdate>> { builtin::check($adapter, &BTreeMap::new()) }
-            fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String { builtin::preview($adapter, updates) }
-            fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> std::io::Result<bool> { builtin::execute($adapter, updates) }
-            fn clean_command_str(&self) -> String { builtin::clean_preview($adapter) }
-            fn execute_clean(&self) -> std::io::Result<bool> { builtin::clean($adapter, &BTreeMap::new()) }
-            fn supports_clean(&self) -> bool { $adapter != "pipx" }
-        }
-    };
-}
-builtin_provider!(FlatpakProvider, "Flatpak", "flatpak");
-builtin_provider!(NixProvider, "Nix", "nix");
-builtin_provider!(PipxProvider, "Pipx", "pipx");
 
 pub struct IntegrationsManager;
 impl IntegrationsManager {
@@ -257,97 +226,59 @@ impl IntegrationsManager {
         handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
     }
 
-    pub fn refresh_all_parallel(providers: &[Arc<dyn IntegrationProvider>]) -> std::io::Result<()> {
-        let providers: Vec<_> = providers.iter().filter(|p| p.supports_refresh()).collect();
-        if providers.is_empty() {
-            return Ok(());
-        }
-
-        println!(
-            "{}",
-            ":: Refreshing external package manager metadata...".cyan()
-        );
-        let mut handles = Vec::new();
-
-        for p in providers {
-            let provider = Arc::clone(p);
-            let activity = crate::progress::activity(crate::progress::integration_manager(p.name()), "Refreshing metadata");
-            handles.push((p.name().to_string(), thread::spawn(move || {
-                let _activity = activity;
-                provider.refresh_metadata()
-            })));
-        }
-
-        let mut errors = Vec::new();
-        for (name, handle) in handles {
-            match handle.join() {
-                Ok(Ok(())) => {}, Ok(Err(error)) => errors.push(format!("{name}: {error}")),
-                Err(_) => errors.push(format!("{name}: metadata worker failed")),
-            }
-        }
-        if errors.is_empty() { Ok(()) } else { Err(std::io::Error::other(errors.join("; "))) }
+    pub(crate) fn check_updates_parallel(
+        providers: &[Arc<dyn IntegrationProvider>],
+    ) -> crate::discovery::Report<ExternalUpdate> {
+        Self::discover_parallel(providers, false)
     }
 
-    pub fn check_updates_parallel(
-        providers: &[Arc<dyn IntegrationProvider>],
-    ) -> std::io::Result<Vec<ExternalUpdate>> {
+    /// Each manager waits only for its own refresh. Sources need no refresh and
+    /// can check immediately, even while Flatpak or native metadata is loading.
+    pub(crate) fn discover_parallel(
+        providers: &[Arc<dyn IntegrationProvider>], refresh: bool,
+    ) -> crate::discovery::Report<ExternalUpdate> {
         if providers.is_empty() {
-            return Ok(Vec::new());
+            return crate::discovery::Report::default();
         }
 
         let mut handles = Vec::new();
 
         for p in providers {
             let provider = Arc::clone(p);
-            let activity = crate::progress::activity(crate::progress::integration_manager(p.name()), "Checking updates");
             handles.push((p.name().to_string(), thread::spawn(move || {
-                let _activity = activity;
+                let manager = crate::progress::integration_manager(provider.name());
+                if refresh && provider.supports_refresh() {
+                    let _activity = crate::progress::activity(manager, "Refreshing metadata");
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| provider.refresh_metadata()));
+                    let error = match result {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(error.to_string()),
+                        Err(_) => Some("metadata worker failed".into()),
+                    };
+                    if let Some(error) = error {
+                        let mut report = crate::discovery::Report::default();
+                        report.record(crate::discovery::Manager::External(provider.name().into()), crate::discovery::Phase::Refresh, Err(error));
+                        return report;
+                    }
+                }
+                let _activity = crate::progress::activity(manager, "Checking updates");
                 provider.check_updates()
             })));
         }
 
-        let mut all_updates = Vec::new();
-        let mut errors = Vec::new();
+        let mut report = crate::discovery::Report::default();
         for (name, handle) in handles {
             match handle.join() {
-                Ok(Ok(updates)) => all_updates.extend(updates),
-                Ok(Err(error)) => errors.push(format!("{name}: {error}")),
-                Err(_) => errors.push(format!("{name}: update worker failed")),
+                Ok(result) => report.append(result),
+                Err(_) => report.record(crate::discovery::Manager::External(name), crate::discovery::Phase::Updates, Err("update worker failed".into())),
             }
         }
-        if errors.is_empty() { Ok(all_updates) } else { Err(std::io::Error::other(format!("Update check incomplete: {}", errors.join("; ")))) }
-    }
-
-    pub fn spawn_prefetch(
-        providers: &[Arc<dyn IntegrationProvider>],
-        external_updates: &[ExternalUpdate],
-    ) -> Option<thread::JoinHandle<()>> {
-        let providers: Vec<_> = providers.iter().filter(|p| p.supports_prefetch()
-            && external_updates.iter().any(|u| u.runner == p.name())).cloned().collect();
-        let updates: Vec<_> = external_updates.to_vec();
-        if providers.is_empty() {
-            return None;
-        }
-        Some(thread::spawn(move || {
-            for p in &providers {
-                let p_updates: Vec<ExternalUpdate> = updates
-                    .iter()
-                    .filter(|u| u.runner == p.name())
-                    .cloned()
-                    .collect();
-                if !p_updates.is_empty() {
-                    p.prefetch(&p_updates);
-                }
-            }
-        }))
-    }
-
-    pub fn has_prefetch(providers: &[Arc<dyn IntegrationProvider>], updates: &[ExternalUpdate]) -> bool {
-        providers.iter().any(|p| p.supports_prefetch() && updates.iter().any(|u| u.runner == p.name()))
+        report
     }
 
     pub fn execute_after_aur_failure(
         providers: &[Arc<dyn IntegrationProvider>], updates: &[ExternalUpdate], permit: &mut crate::pm::AurBuildFailurePermit,
+        preparation: Option<&preparation::Session>,
     ) -> Vec<(String, bool)> {
         let mut outcomes = Vec::new();
         let mut stopped = false;
@@ -360,6 +291,7 @@ impl IntegrationsManager {
             if let Err(reason) = permit.validate() {
                 eprintln!(":: Sources: skipped {}: {reason}", update.name); stopped = true; continue;
             }
+            if let Some(preparation) = preparation { preparation.before(provider.name()); }
             println!(":: Checking independent Sources update: {}", update.name);
             let success = match provider.execute_after_aur_failure(update, permit) {
                 Ok(true) => { println!("✔ Sources: {} updated successfully.", update.name); true },
@@ -380,6 +312,7 @@ impl IntegrationsManager {
     pub fn execute_upgrades(
         providers: &[Arc<dyn IntegrationProvider>],
         external_updates: &[ExternalUpdate],
+        preparation: Option<&preparation::Session>,
     ) -> Vec<(String, String, bool)> {
         let mut outcomes = Vec::new();
         let mut stopped = false;
@@ -394,6 +327,7 @@ impl IntegrationsManager {
                 continue;
             }
             if stopped { println!(":: {}: skipped because an earlier external upgrade failed.", p.name()); outcomes.push((p.name().to_string(), String::new(), false)); continue; }
+            if let Some(preparation) = preparation { preparation.before(p.name()); }
 
             let cmd_str = p.upgrade_command_str(&p_updates);
             println!(
@@ -572,9 +506,9 @@ mod tests {
 
     #[test]
     fn test_provider_supports_clean() {
-        let flatpak = FlatpakProvider;
-        let nix = NixProvider;
-        let pipx = PipxProvider;
+        let flatpak = test_provider("flatpak");
+        let nix = test_provider("nix");
+        let pipx = test_provider("pipx");
         assert!(flatpak.supports_clean());
         assert!(nix.supports_clean());
         assert!(!pipx.supports_clean());
@@ -606,6 +540,7 @@ mod tests {
     }
 
     impl IntegrationProvider for MockProvider {
+        fn preparation_policy(&self) -> preparation::Policy { preparation::Policy::Unsupported("fixture") }
         fn check_options(&self, _: crate::scratch::Policy, _: bool) -> Result<(), crate::runtime::OptionError> { Ok(()) }
         fn name(&self) -> &'static str { self.label }
         fn is_available(&self) -> bool {
@@ -615,9 +550,16 @@ mod tests {
             self.active.fetch_sub(1, Ordering::SeqCst);
             self.available
         }
-        fn refresh_metadata(&self) -> Result<(), std::io::Error> { Ok(()) }
-        fn check_updates(&self) -> std::io::Result<Vec<ExternalUpdate>> {
-            if self.label == "fail-check" { Err(std::io::Error::other("fixture check failed")) } else { Ok(Vec::new()) }
+        fn supports_refresh(&self) -> bool { self.label == "fail-refresh" }
+        fn refresh_metadata(&self) -> Result<(), std::io::Error> {
+            if self.label == "fail-refresh" { Err(std::io::Error::other("fixture refresh failed")) } else { Ok(()) }
+        }
+        fn check_updates(&self) -> crate::discovery::Report<ExternalUpdate> {
+            let mut report = crate::discovery::Report::updates(self.name(), self.check_result());
+            if self.label == "partial-source" {
+                report.record(crate::discovery::Manager::Source("repo/broken".into()), crate::discovery::Phase::Updates, Err("missing asset".into()));
+            }
+            report
         }
         fn upgrade_command_str(&self, _: &[ExternalUpdate]) -> String { String::new() }
         fn execute_upgrade(&self, _: &[ExternalUpdate]) -> Result<bool, std::io::Error> {
@@ -625,6 +567,28 @@ mod tests {
         }
         fn clean_command_str(&self) -> String { String::new() }
         fn execute_clean(&self) -> Result<bool, std::io::Error> { Ok(true) }
+    }
+
+    impl MockProvider {
+        fn check_result(&self) -> std::io::Result<Vec<ExternalUpdate>> {
+            if self.label == "panic-check" { panic!("fixture worker panic"); }
+            if matches!(self.label, "has-update" | "partial-source") {
+                return Ok(vec![ExternalUpdate { runner: self.label.into(), id: "app".into(), ..Default::default() }]);
+            }
+            if self.label.starts_with("parallel-check-") {
+                let count = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(count, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while self.peak.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                if self.peak.load(Ordering::SeqCst) < 3 {
+                    return Err(std::io::Error::other("check workers did not overlap"));
+                }
+            }
+            if self.label == "fail-check" { Err(std::io::Error::other("fixture check failed")) } else { Ok(Vec::new()) }
+        }
     }
 
     #[test]
@@ -642,15 +606,84 @@ mod tests {
     }
 
     #[test]
+    fn discovery_preserves_successes_and_reports_each_failed_or_panicked_manager() {
+        let provider = |label| Arc::new(MockProvider { label, available: true,
+            active: Arc::new(AtomicUsize::new(0)), peak: Arc::new(AtomicUsize::new(0)) }) as Arc<dyn IntegrationProvider>;
+        let (updates, failures) = IntegrationsManager::check_updates_parallel(&[
+            provider("fail-check"), provider("has-update"), provider("panic-check"),
+        ]).into_parts();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].runner, "has-update");
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[1].manager, crate::discovery::Manager::External("panic-check".into()));
+        let (_, failures) = IntegrationsManager::discover_parallel(&[provider("fail-refresh")], true).into_parts();
+        assert_eq!(failures[0].phase, crate::discovery::Phase::Refresh);
+        let (updates, failures) = IntegrationsManager::check_updates_parallel(&[provider("partial-source")]).into_parts();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(failures[0].manager, crate::discovery::Manager::Source("repo/broken".into()));
+    }
+
+    #[test]
+    fn independent_checks_do_not_wait_for_another_managers_refresh() {
+        use std::sync::atomic::AtomicBool;
+        struct Pipeline {
+            refresh: bool,
+            independent_checked: Arc<AtomicBool>,
+        }
+        impl IntegrationProvider for Pipeline {
+            fn preparation_policy(&self) -> preparation::Policy { preparation::Policy::Unsupported("fixture") }
+            fn name(&self) -> &str { if self.refresh { "Flatpak" } else { "Sources" } }
+            fn is_available(&self) -> bool { true }
+            fn supports_refresh(&self) -> bool { self.refresh }
+            fn refresh_metadata(&self) -> std::io::Result<()> {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while !self.independent_checked.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                if self.independent_checked.load(Ordering::SeqCst) { Ok(()) }
+                else { Err(std::io::Error::other("independent check waited for refresh")) }
+            }
+            fn check_updates(&self) -> crate::discovery::Report<ExternalUpdate> {
+                if !self.refresh { self.independent_checked.store(true, Ordering::SeqCst); }
+                crate::discovery::Report::updates(self.name(), Ok(Vec::new()))
+            }
+            fn check_options(&self, _: crate::scratch::Policy, _: bool) -> Result<(), crate::runtime::OptionError> { Ok(()) }
+            fn upgrade_command_str(&self, _: &[ExternalUpdate]) -> String { unreachable!() }
+            fn execute_upgrade(&self, _: &[ExternalUpdate]) -> std::io::Result<bool> { unreachable!() }
+            fn clean_command_str(&self) -> String { unreachable!() }
+            fn execute_clean(&self) -> std::io::Result<bool> { unreachable!() }
+        }
+        let ready = Arc::new(AtomicBool::new(false));
+        let providers: Vec<Arc<dyn IntegrationProvider>> = [true, false].into_iter().map(|refresh|
+            Arc::new(Pipeline { refresh, independent_checked: ready.clone() }) as Arc<dyn IntegrationProvider>).collect();
+        assert!(IntegrationsManager::discover_parallel(&providers, true).require_complete().unwrap().is_empty());
+        assert!(ready.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn update_checks_start_all_manager_workers_before_waiting() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let providers: Vec<Arc<dyn IntegrationProvider>> = [
+            "parallel-check-sources", "parallel-check-flatpak", "parallel-check-nix",
+        ].into_iter().map(|label| Arc::new(MockProvider {
+            label, available: true, active: Arc::clone(&active), peak: Arc::clone(&peak),
+        }) as Arc<dyn IntegrationProvider>).collect();
+        assert!(IntegrationsManager::check_updates_parallel(&providers).require_complete().unwrap().is_empty());
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn metadata_refresh_requires_an_explicit_capability() {
-        assert!(FlatpakProvider.supports_refresh());
-        assert!(!NixProvider.supports_refresh());
-        assert!(!PipxProvider.supports_refresh());
+        assert!(test_provider("flatpak").supports_refresh());
+        assert!(!test_provider("nix").supports_refresh());
+        assert!(!test_provider("pipx").supports_refresh());
         assert!(!crate::sources::SourceProvider::new(&Config::default()).supports_refresh());
         let provider = MockProvider { label: "future", available: true,
             active: Arc::new(AtomicUsize::new(0)), peak: Arc::new(AtomicUsize::new(0)) };
         assert!(!provider.supports_refresh());
-        IntegrationsManager::refresh_all_parallel(&[Arc::new(provider)]).unwrap();
+        IntegrationsManager::discover_parallel(&[Arc::new(provider)], true).require_complete().unwrap();
     }
 
     #[test]
@@ -658,32 +691,36 @@ mod tests {
         let provider = MockProvider { label: "future", available: true,
             active: Arc::new(AtomicUsize::new(0)), peak: Arc::new(AtomicUsize::new(0)) };
         assert!(!provider.supports_clean());
-        assert!(FlatpakProvider.supports_clean());
-        assert!(NixProvider.supports_clean());
-        assert!(!PipxProvider.supports_clean());
+        assert!(test_provider("flatpak").supports_clean());
+        assert!(test_provider("nix").supports_clean());
+        assert!(!test_provider("pipx").supports_clean());
     }
 
     #[test]
     fn prefetch_is_opt_in_and_matches_the_selected_manager() {
-        let providers: Vec<Arc<dyn IntegrationProvider>> = vec![Arc::new(FlatpakProvider), Arc::new(crate::sources::SourceProvider::new(&Config::default()))];
-        let mut updates = vec![ExternalUpdate { runner: "Flatpak".into(), id: "app".into(), name: "App".into(), repo: "test".into(), version: "1".into(), ..ExternalUpdate::default() }];
-        assert!(!IntegrationsManager::has_prefetch(&providers, &updates));
-        assert!(IntegrationsManager::spawn_prefetch(&providers, &updates).is_none());
-        updates[0].runner = "Sources".into();
-        assert!(IntegrationsManager::has_prefetch(&providers, &updates));
-        assert!(!IntegrationsManager::has_prefetch(&providers, &[]));
+        assert_eq!(test_provider("flatpak").preparation_policy(), preparation::Policy::BeforeStage);
+        for adapter in ["nix", "pipx"] {
+            assert!(matches!(test_provider(adapter).preparation_policy(), preparation::Policy::Unsupported(_)));
+        }
+        assert!(matches!(crate::sources::SourceProvider::new(&Config::default()).preparation_policy(), preparation::Policy::Unsupported(_)));
+    }
+
+    fn test_provider(adapter: &str) -> configured::Provider {
+        configured::Provider::new(adapter.into(), crate::manager_config::Definition {
+            adapter: adapter.into(), ..Default::default()
+        })
     }
 
     #[test]
     fn failed_checks_are_errors_and_failed_upgrades_stop_later_managers() {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = |label| Arc::new(MockProvider { label, available: true, active: Arc::clone(&calls), peak: Arc::new(AtomicUsize::new(0)) }) as Arc<dyn IntegrationProvider>;
-        let error = IntegrationsManager::check_updates_parallel(&[provider("fail-check")]).unwrap_err();
+        let error = IntegrationsManager::check_updates_parallel(&[provider("fail-check")]).require_complete().unwrap_err();
         assert!(error.to_string().contains("fail-check"));
         let outcomes = IntegrationsManager::execute_upgrades(&[provider("fail-upgrade"), provider("later")], &[
             ExternalUpdate { runner: "fail-upgrade".into(), id: "first".into(), ..ExternalUpdate::default() },
             ExternalUpdate { runner: "later".into(), id: "second".into(), ..ExternalUpdate::default() },
-        ]);
+        ], None);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(outcomes.iter().all(|(_, _, success)| !success));
     }

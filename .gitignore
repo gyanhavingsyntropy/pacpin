@@ -4,3 +4,8 @@
 *~
 .DS_Store
 dist/
+
+# Private machine settings and raw VM recordings stay local.
+/AGENTS.local.md
+/docs/development/vm.local.md
+/docs/verification/*-evidence/

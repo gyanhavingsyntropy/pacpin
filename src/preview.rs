@@ -7,6 +7,7 @@
 // inside pacman's own summary under --noconfirm.
 
 use crate::db::AlpmManager;
+use crate::db::find_sync_package;
 use alpm::TransFlag;
 use std::collections::HashSet;
 
@@ -81,35 +82,6 @@ pub fn strip_repo(target: &str) -> &str {
     target.split('/').next_back().unwrap_or(target)
 }
 
-fn find_sync_package<'a>(
-    alpm: &'a alpm::Alpm,
-    target: &str,
-) -> Result<&'a alpm::Package, String> {
-    if let Some((repo, name)) = target.split_once('/') {
-        let db = alpm
-            .syncdbs()
-            .into_iter()
-            .find(|db| db.name() == repo)
-            .ok_or_else(|| {
-                format!("Repository '[{repo}]' is not registered for transaction preview.")
-            })?;
-        db.pkg(name).map_err(|_| {
-            format!(
-                "Package '{name}' was not found in repository '[{repo}]' during transaction preview."
-            )
-        })
-    } else {
-        alpm.syncdbs()
-            .into_iter()
-            .find_map(|db| db.pkg(target).ok().or_else(|| db.pkgs().find_satisfier(target)))
-            .ok_or_else(|| {
-                format!(
-                    "Package '{target}' was not found in any sync database during transaction preview."
-                )
-            })
-    }
-}
-
 /// Prepares (but never commits) the native transaction for `targets` and
 /// returns the solver-expanded add/remove sets. Uses a lock-free transaction on
 /// the already-registered databases: no refresh, no download, no install.
@@ -117,8 +89,18 @@ pub fn prepare_native_preview(
     manager: &mut AlpmManager,
     targets: &[String],
 ) -> Result<TransactionPreview, String> {
+    prepare_native_preview_with_needed(manager, targets, true)
+}
+
+/// Match an install/rebuild's reinstall policy as well as its target identities.
+pub(crate) fn prepare_native_preview_with_needed(
+    manager: &mut AlpmManager,
+    targets: &[String],
+    needed: bool,
+) -> Result<TransactionPreview, String> {
     let alpm = manager.handle_mut();
-    alpm.trans_init(TransFlag::NO_LOCK | TransFlag::NEEDED)
+    let flags = if needed { TransFlag::NO_LOCK | TransFlag::NEEDED } else { TransFlag::NO_LOCK };
+    alpm.trans_init(flags)
         .map_err(|e| format!("Cannot start transaction preview: {e}"))?;
     let result = (|| {
         let mut staged_names: HashSet<String> = HashSet::new();
@@ -143,7 +125,9 @@ pub fn prepare_native_preview(
                     if staged_names.contains(&name) || replaced.iter().any(|n| n == &name) {
                         continue;
                     }
-                    if local.pkg(name.as_str()).is_ok() {
+                    if local.pkgs().find_satisfier(dep.to_string())
+                        .is_some_and(|installed| installed.name() == name)
+                    {
                         replaced.push(name);
                     }
                 }
@@ -156,8 +140,29 @@ pub fn prepare_native_preview(
                 }
             }
         }
-        alpm.trans_prepare()
-            .map_err(|e| format!("Transaction preview failed: {e}"))?;
+        alpm.trans_prepare().map_err(|error| {
+            let details: Vec<String> = match error.data() {
+                Some(alpm::PrepareData::ConflictingDeps(conflicts)) => conflicts
+                    .into_iter()
+                    .map(|conflict| format!("{} conflicts with {} ({})",
+                        conflict.package1().name(), conflict.package2().name(), conflict.reason()))
+                    .collect(),
+                Some(alpm::PrepareData::UnsatisfiedDeps(dependencies)) => dependencies
+                    .into_iter()
+                    .map(|missing| {
+                        let mut message = format!("{} requires {}", missing.target(), missing.depend());
+                        if let Some(cause) = missing.causing_pkg() {
+                            message.push_str(&format!(" (affected by {cause})"));
+                        }
+                        message
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let mut message = format!("Transaction preview failed: {error}");
+            for detail in details { message.push_str(&format!("\n  {detail}")); }
+            message
+        })?;
 
         let local = alpm.localdb();
         let mut adds = Vec::new();
@@ -339,6 +344,70 @@ mod tests {
     }
 
     #[test]
+    fn preview_prefers_exact_names_across_repositories_before_providers() {
+        let local = [pkg("firefox", "1.0-1")];
+        let mut provider = pkg("firefox-pure", "1.0-1");
+        provider.provides = &["firefox"];
+        provider.conflicts = &["firefox"];
+        let earlier = [provider];
+        let later = [pkg("firefox", "2.0-1")];
+        let mut fixture = AlpmFixture::new(&local, &[("earlier", &earlier), ("later", &later)]);
+        let preview = prepare_native_preview(fixture.manager_mut(), &["firefox".into()]).unwrap();
+        assert_eq!(preview.adds.len(), 1);
+        assert_eq!(preview.adds[0].name, "firefox");
+        assert_eq!(preview.adds[0].repo, "later");
+        assert_eq!(preview.adds[0].version, "2.0-1");
+        assert!(preview.removes.is_empty());
+    }
+
+    #[test]
+    fn preview_still_resolves_virtual_targets_without_an_exact_package() {
+        let mut provider = pkg("provider", "1.0-1");
+        provider.provides = &["virtual-app=1"];
+        let sync = [provider];
+        let mut fixture = AlpmFixture::new(&[], &[("extra", &sync)]);
+        let preview = prepare_native_preview(fixture.manager_mut(), &["virtual-app>=1".into()]).unwrap();
+        assert_eq!(preview.adds[0].name, "provider");
+        let qualified = prepare_native_preview(fixture.manager_mut(), &["extra/virtual-app".into()]).unwrap();
+        assert_eq!(qualified.adds[0].name, "provider");
+        assert!(prepare_native_preview(fixture.manager_mut(), &["absent/virtual-app".into()]).is_err());
+    }
+
+    #[test]
+    fn preview_names_conflicting_packages_and_releases_failed_transaction() {
+        let local = [pkg("installed", "1.0-1")];
+        let mut conflicting = pkg("conflicting", "2.0-1");
+        conflicting.conflicts = &["installed<2"];
+        let sync = [conflicting, pkg("safe", "1.0-1")];
+        let mut fixture = AlpmFixture::new(&local, &[("extra", &sync)]);
+        let error = prepare_native_preview(fixture.manager_mut(), &["conflicting".into()]).unwrap_err();
+        assert!(error.contains("conflicting dependencies"), "{error}");
+        assert!(error.contains("conflicting conflicts with installed (installed<2)"), "{error}");
+        assert!(prepare_native_preview(fixture.manager_mut(), &["safe".into()]).is_ok());
+    }
+
+    #[test]
+    fn preview_names_unsatisfied_versioned_dependencies() {
+        let sync = [FixturePackage::with_depends("app", "2.0-1", &["missing>=3"])];
+        let mut fixture = AlpmFixture::new(&[], &[("extra", &sync)]);
+        let error = prepare_native_preview(fixture.manager_mut(), &["app".into()]).unwrap_err();
+        assert!(error.contains("app requires missing>=3"), "{error}");
+    }
+
+    #[test]
+    fn forced_reinstallation_stays_in_preview_for_capacity_checks() {
+        let local = [FixturePackage::with_size("app", "1-1", 100, 10)];
+        let sync = [FixturePackage::with_size("app", "1-1", 100, 10)];
+        let mut fixture = AlpmFixture::new(&local, &[("extra", &sync)]);
+        assert!(prepare_native_preview(fixture.manager_mut(), &["app".into()]).unwrap().adds.is_empty());
+        let reinstall = prepare_native_preview_with_needed(fixture.manager_mut(), &["app".into()], false).unwrap();
+        assert_eq!(reinstall.adds.len(), 1);
+        assert_eq!(reinstall.adds[0].name, "app");
+        assert_eq!(reinstall.adds[0].new_isize, 100);
+        assert_eq!(native_peak(&reinstall), NATIVE_RESERVE + 100);
+    }
+
+    #[test]
     fn already_current_targets_are_not_counted_as_changes() {
         let local = [pkg("same", "1.0-1"), pkg("app", "1.0-1")];
         let sync = [pkg("same", "1.0-1"), pkg("app", "2.0-1")];
@@ -366,6 +435,24 @@ mod tests {
             .removes
             .iter()
             .any(|(n, v)| n == "old-pkg" && v == "1.0-1"));
+    }
+
+    #[test]
+    fn preview_does_not_remove_packages_outside_replacement_version_constraint() {
+        let local = [pkg("old-pkg", "3.0-1")];
+        let sync = [FixturePackage::with_replaces("new-pkg", "1.0-1", &["old-pkg<2"])];
+        let mut fixture = AlpmFixture::new(&local, &[("extra", &sync)]);
+        let preview = prepare_native_preview(fixture.manager_mut(), &["new-pkg".into()]).unwrap();
+        assert!(preview.removes.is_empty());
+    }
+
+    #[test]
+    fn preview_removes_packages_matching_replacement_version_constraint() {
+        let local = [pkg("old-pkg", "1.0-1")];
+        let sync = [FixturePackage::with_replaces("new-pkg", "1.0-1", &["old-pkg<2"])];
+        let mut fixture = AlpmFixture::new(&local, &[("extra", &sync)]);
+        let preview = prepare_native_preview(fixture.manager_mut(), &["new-pkg".into()]).unwrap();
+        assert_eq!(preview.removes, [("old-pkg".into(), "1.0-1".into())]);
     }
 
     #[test]
