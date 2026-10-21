@@ -162,7 +162,7 @@ not implemented; `needrestart` reports restart needs after updates.
 The final plan summary follows dependency and removal details. Its native counts and sizes include the prepared transaction's additional packages: for example, `41 upgrades + 7 new dependencies`, with no `+ 0` when there are none. Sources and other managers retain unknown sizes rather than appearing to add zero bytes.
 
 **Package Space Delta** covers installed package files only. With `--no-cache`,
-**Cache Now** combines cache estimates for eligible planned managers before
+**Cache Before Update** combines cache estimates for eligible planned managers before
 downloads. Pacman's configured cache directories have a bounded, read-only
 inspection. AUR helper and external cache sizes currently remain unknown rather
 than guessing their configured locations or counting installed Flatpak runtimes

@@ -1111,7 +1111,7 @@ pub fn render_transaction_plan(
         let size = cache_usage_text(cache);
         // U+1F5C3 (archive box) defaults to text presentation in some terminals,
         // unlike this emoji-presentation folder. Use a predictable two-cell icon.
-        print_card_line("📁 Cache Now           : ", &size, size.dimmed().to_string());
+        print_card_line("📁 Cache Before Update : ", &size, size.dimmed().to_string());
     }
     println!("  └{}┘\n", "─".repeat(card_inner_w));
     if let Some(cache) = details.as_ref().and_then(|details| details.cache.as_ref()).filter(|cache| !cache.unknown_managers.is_empty()) {
@@ -1332,8 +1332,8 @@ mod tests {
     fn test_card_line_alignment() {
         let card_inner_w = 58;
         let test_cases = vec![
-            ("📁 Cache Now           : ", "~0 B"),
-            ("📁 Cache Now           : ", "~1.0 KiB + unknown"),
+            ("📁 Cache Before Update : ", "~0 B"),
+            ("📁 Cache Before Update : ", "~1.0 KiB + unknown"),
             ("📦 Packages to Upgrade : ", "1 (0 custom, 1 default)"),
             ("⏸ Packages Held Back  : ", "1 packages"),
             ("📥 Total Download Size : ", "2.30 MiB"),

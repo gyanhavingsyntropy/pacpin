@@ -132,8 +132,8 @@ class ReviewChecks(PreparationChecks):
             require(actions.index("Pacman") < actions.index("Sources"), "native/source labels missing")
         if cache_estimate is None:
             cache_estimate = cache and bool(managers - {"Sources"})
-        require(("Cache Now" in text) == cache_estimate, "combined cache estimate scope mismatch")
-        require("Pacman Cache Now" not in text and "🗃" not in text, "old cache label or ambiguous icon remains")
+        require(("Cache Before Update" in text) == cache_estimate, "combined cache estimate scope mismatch")
+        require("Cache Now" not in text and "🗃" not in text, "old cache label or ambiguous icon remains")
         if cache_estimate:
             for manager in managers - {"Pacman", "Sources"}:
                 require(re.search(rf"Cache sizes unknown: [^.]*\b{manager}\b", text) is not None, f"{manager} cache incorrectly appears measured/empty")
@@ -158,7 +158,7 @@ class ReviewChecks(PreparationChecks):
             (self.root / f"{name}.review-screen.txt").write_text(self.rc("get-text", "--extent", "screen")),
             (self.root / f"{name}.review.txt").write_text(self.rc("get-text", "--extent", "all")))
 
-    def suite(self):
+    def cache_cards(self):
         self.original_cfg = self.cfg.read_text()
         for width, policy in [(80, "--use-ram"), (44, "--use-storage")]:
             name = f"native-cache-border-{width}"
@@ -170,6 +170,8 @@ class ReviewChecks(PreparationChecks):
             assert "Scratch preference unused" not in text
             assert run("pacman", "-Q", "pacpin-ui-native").strip().endswith("1.0.0-1")
 
+    def suite(self):
+        self.cache_cards()
         name = "decline-native-source-orphans"
         self.reset_case(name, source=True, orphans=True)
         self.case(name, ["-Su", "--no-cache"], confirm=True, confirm_response="n", confirm_action=self.capture(name), width=80)
@@ -241,7 +243,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=Path)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--section", choices=["review", "extras"], default="review")
+    parser.add_argument("--section", choices=["review", "extras", "cache-cards"], default="review")
     args = parser.parse_args()
     if (os.environ.get("PACPIN_DISPOSABLE_VM") != "1" or os.geteuid() == 0
             or "ID=garuda" not in Path("/etc/os-release").read_text()
@@ -254,6 +256,8 @@ def main():
         checks = ReviewChecks(args.binary, args.output, "unix:/tmp/pacpin-ui-kitty.sock", False, False, "review")
         if args.section == "extras":
             checks.extras()
+        elif args.section == "cache-cards":
+            checks.cache_cards()
         else:
             checks.suite()
     finally:
