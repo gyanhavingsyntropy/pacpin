@@ -36,6 +36,33 @@ User wait messages describe source downloads without requiring knowledge of the
 worker thread or prefetch implementation. Metadata activity rows reflect each
 manager's own refresh/check lifetime rather than a global refresh phase.
 
+## Upgrade execution preview
+
+Show short unnumbered action labels before approval. Keep detailed preparation
+and base commands in dry runs. Restart advice is not an approval-plan action.
+Use the existing
+native/AUR command builder and the provider's required typed upgrade actions;
+Sources are internal recipe operations, not a recursive CLI invocation. A
+provider preview error refuses approval instead of becoming a printable invalid
+command. State that base commands receive runtime workspace/environment/display
+options; do not imply the whole transaction is replayable with `&&`.
+
+In dry runs, describe each eligible manager's actual preparation policy. Orphan review is a
+separate decision after package approval; selected removal is revalidated after
+verified success. Hooks run only for verified changes, then optional orphan
+removal and successful-manager cache cleanup precede restart inspection. Omit
+uninvoked stages and distinguish noninteractive automatic selection from review.
+Check ordinary, scoped, skipped/incomplete, no-work, dry-run and narrow-terminal
+cases. Do not turn preview generation into manager execution or cache mutation.
+
+Keep installed-package space change separate from current cache estimates.
+Cache inspection is read-only, bounded and never traverses nested downloads or
+symlinks. Unknown contents remain unknown; logical file bytes do not guarantee
+reclaimed filesystem space. Do not subtract them from package delta or peak need.
+The horizontal footer phase strip reuses its existing separator row, with
+individual manager metrics below it. Cleanup pending rows follow actual selected
+orphans/requested successful-manager cleanup; clear them after their lifecycle.
+
 ## Transfer progress and preparation
 
 Interpret transfer output through `progress/transfers`, shared by ordinary installs

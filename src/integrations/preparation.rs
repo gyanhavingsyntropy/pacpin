@@ -111,14 +111,12 @@ impl Session {
 }
 impl Drop for Session { fn drop(&mut self) { self.finish(); } }
 
-pub(crate) fn preview(providers: &[Arc<dyn IntegrationProvider>], updates: &[ExternalUpdate], aur: bool) {
-    if aur { println!(":: AUR preparation: helper-managed; Paru has no AUR download-only mode."); }
-    for provider in providers.iter().filter(|p| updates.iter().any(|u| u.runner == p.name())) {
-        let description = match provider.preparation_policy() {
-            Policy::Background => "release downloads can overlap verification/build/install phases",
-            Policy::BeforeStage => "download-only preparation immediately before its upgrade",
-            Policy::Unsupported(reason) => reason,
-        };
-        println!(":: {} preparation: {description}.", provider.name());
+impl Policy {
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::Background => "eligible release downloads may overlap earlier verification/build/install phases; otherwise prepare at this stage",
+            Self::BeforeStage => "download-only preparation immediately before this manager's upgrade",
+            Self::Unsupported(reason) => reason,
+        }
     }
 }

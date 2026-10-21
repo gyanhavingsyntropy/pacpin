@@ -1,5 +1,5 @@
 use super::*;
-use crate::integrations::{ExternalUpdate, IntegrationProvider};
+use crate::integrations::{ExternalUpdate, IntegrationProvider, UpgradeAction};
 use std::io;
 use std::sync::Mutex;
 
@@ -15,6 +15,7 @@ impl SourceProvider {
         }
     }
 }
+
 impl IntegrationProvider for SourceProvider {
     fn check_options(&self, _policy: crate::scratch::Policy, _no_cache: bool) -> Result<(), crate::runtime::OptionError> {
         // Sources own temporary workspaces under either policy. Their actual
@@ -46,15 +47,16 @@ impl IntegrationProvider for SourceProvider {
             Err(error) => crate::discovery::Report::updates(self.name(), Err(error)),
         }
     }
-    fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String {
-        format!(
-            "pacpin -S -- {}",
-            updates
-                .iter()
-                .map(|u| crate::utils::shell_quote(&u.id))
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
+    fn upgrade_actions(&self, updates: &[ExternalUpdate]) -> io::Result<Vec<UpgradeAction>> {
+        let plans = self.approved.lock().unwrap_or_else(|e| e.into_inner());
+        updates.iter().map(|update| {
+            let plan = plans.iter().find(|plan| update.id == format!("{}/{}", plan.alias, plan.name) && update.version == plan.version)
+                .ok_or_else(|| io::Error::other("Source update changed after approval"))?;
+            let preparation = if plan.git.is_some() { "fetch approved Git revision and build" }
+                else if plan.recipe.build.is_some() { "download, verify and build source archive" }
+                else { "download and verify release; package if needed" };
+            Ok(UpgradeAction::Internal(format!("{} -> {}: {preparation}; install local package via {} pacman -U; remove temporary workspace", update.id, update.version, self.config.options.privilege_tool)))
+        }).collect()
     }
     fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> Result<bool, io::Error> {
         let plans = self
@@ -169,5 +171,30 @@ impl SourceProvider {
             report.record(failure.manager, failure.phase, Err(failure.detail));
         }
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod action_tests {
+    use super::*;
+    #[test]
+    fn sources_describe_approved_internal_work_instead_of_a_recursive_command() {
+        let mut config = Config::default();
+        config.options.privilege_tool = "pkexec".into();
+        let provider = SourceProvider::new(&config);
+        let recipe: Recipe = toml::from_str("asset='app.tar'\nformat='archive'\n[binaries]\napp='bin/app'\n").unwrap();
+        provider.approved.lock().unwrap().push(Plan {
+            alias: "upstream".into(), name: "app".into(),
+            source: Source { kind: Kind::Local, url: "/tmp/fixture-catalog.json".into(), token_env: None, packages: BTreeMap::new() },
+            recipe, tag: "v2".into(), version: "2-1".into(),
+            asset: Asset { name: "app.tar".into(), url: "app.tar".into(), sha256: Some("a".repeat(64)) },
+            git: None, persist_source: false,
+        });
+        let mut update = ExternalUpdate { runner: "Sources".into(), id: "upstream/app".into(), version: "2-1".into(), ..Default::default() };
+        let actions = provider.upgrade_actions(std::slice::from_ref(&update)).unwrap();
+        assert!(matches!(&actions[0], UpgradeAction::Internal(action) if action.contains("upstream/app -> 2-1") && action.contains("pkexec pacman -U") && !action.contains("pacpin -S")));
+        assert!(provider.upgrade_description(std::slice::from_ref(&update)).unwrap().starts_with("Internal:"));
+        update.version = "3-1".into();
+        assert!(provider.upgrade_actions(&[update]).is_err());
     }
 }

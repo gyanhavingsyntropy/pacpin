@@ -56,6 +56,15 @@ impl Provider {
         command.splice(index..index, extra);
         Ok(command)
     }
+    fn option_previews(&self) -> Vec<String> {
+        self.definition.selected_flags.iter().map(|name| {
+            let flag = &self.definition.flags[name];
+            let mut effects = Vec::new();
+            if !flag.args.is_empty() { effects.push(format!("add {}", builtin::display(&flag.args))); }
+            if !flag.command.is_empty() { effects.push(format!("after success run {}", builtin::display(&flag.command))); }
+            format!("{} option {name}: {}", self.name, effects.join("; "))
+        }).collect()
+    }
     fn command(&self, arguments: &[String]) -> io::Result<Command> {
         if unsafe { libc::geteuid() } == 0 { return Err(io::Error::other("Start pacpin as a regular user; manager commands are unprivileged")); }
         let executable = arguments.first().ok_or_else(|| io::Error::other("Unsupported operation: no configured command"))?;
@@ -74,14 +83,11 @@ impl Provider {
     }
 }
 impl IntegrationProvider for Provider {
-    fn preview_upgrade(&self, updates: &[ExternalUpdate]) {
-        if self.preparation_policy() == super::preparation::Policy::BeforeStage {
-            for update in updates {
-                match self.preparation_arguments(update) {
-                    Ok(arguments) => println!(":: {} download-only preparation: {}", self.name, builtin::display(&arguments)),
-                    Err(error) => eprintln!(":: {} preparation unavailable: {error}", self.name),
-                }
-            }
+    fn preview_upgrade(&self, _updates: &[ExternalUpdate]) {
+        // Custom flag effects still need explicit review; routine download
+        // preparation belongs to the detailed dry-run, not approval chatter.
+        for text in self.option_previews() {
+            for line in crate::ui::wrap_field(&text, ":: ", "    ", crate::ui::get_terminal_width()) { println!("{line}"); }
         }
     }
     fn preparation_policy(&self) -> crate::integrations::preparation::Policy {
@@ -164,13 +170,13 @@ impl IntegrationProvider for Provider {
         Ok(())
     }
     fn configure_no_cache(&self, no_cache: bool) { self.no_cache.store(no_cache, Ordering::SeqCst); }
-    fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String {
-        let mut commands: Vec<_> = updates.iter().map(|u| self.arguments(u).map(|args| builtin::display(&args)).unwrap_or_else(|e| format!("Invalid plan: {e}"))).collect();
+    fn upgrade_actions(&self, updates: &[ExternalUpdate]) -> io::Result<Vec<UpgradeAction>> {
+        let mut commands: Vec<_> = updates.iter().map(|u| self.arguments(u).map(|args| UpgradeAction::Command(builtin::display(&args)))).collect::<io::Result<_>>()?;
         for flag in &self.definition.selected_flags {
             let command = &self.definition.flags[flag].command;
-            if !command.is_empty() { commands.push(builtin::display(command)); }
+            if !command.is_empty() { commands.push(UpgradeAction::Command(builtin::display(command))); }
         }
-        commands.join(" && ")
+        Ok(commands)
     }
     fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> io::Result<bool> {
         self.validate_options(self.no_cache.load(Ordering::SeqCst)).map_err(io::Error::other)?;
@@ -219,7 +225,6 @@ impl IntegrationProvider for Provider {
     }
     fn cache_command_str(&self) -> Option<String> {
         if !self.definition.cache_cleanup.is_empty() { Some(builtin::display(&self.definition.cache_cleanup)) }
-        else if !self.definition.no_cache_args.is_empty() { Some("Cache writes disabled by configured upgrade arguments".into()) }
         else { None }
     }
     fn execute_cache_cleanup(&self) -> io::Result<bool> {
@@ -241,6 +246,26 @@ mod preparation_tests {
     use crate::integrations::preparation::Policy;
     fn provider(adapter: &str) -> Provider {
         Provider::new(adapter.into(), Definition { adapter: adapter.into(), ..Default::default() })
+    }
+    #[test]
+    fn concise_review_still_exposes_custom_flag_arguments_and_commands() {
+        let mut provider = provider("flatpak");
+        assert!(provider.option_previews().is_empty());
+        provider.definition.selected_flags.push("review".into());
+        provider.definition.flags.insert("review".into(), crate::manager_config::UserFlag {
+            args: vec!["--verbose".into()], command: vec!["tool".into(), "action".into()],
+        });
+        let text = provider.option_previews().join("\n");
+        assert!(text.contains("option review: add '--verbose'"));
+        assert!(text.contains("after success run 'tool' 'action'"));
+    }
+    #[test]
+    fn disabling_cache_writes_does_not_invent_a_later_cleanup_step() {
+        let mut provider = provider("pipx");
+        assert!(!provider.definition.no_cache_args.is_empty());
+        assert!(provider.cache_command_str().is_none());
+        provider.definition.cache_cleanup = vec!["tool".into(), "cache".into()];
+        assert_eq!(provider.cache_command_str().as_deref(), Some("'tool' 'cache'"));
     }
     #[test]
     fn flatpak_prepares_only_the_approved_installation_ref_and_commit() {
@@ -266,5 +291,19 @@ mod preparation_tests {
         for adapter in ["nix", "pipx", "command"] {
             assert!(matches!(self::provider(adapter).preparation_policy_for(crate::scratch::Policy::Auto, false), Policy::Unsupported(_)));
         }
+    }
+
+    #[test]
+    fn upgrade_actions_share_actual_argument_expansion_and_fail_closed() {
+        let flatpak = provider("flatpak");
+        let mut update = ExternalUpdate { id: "app/org.example.App/x86_64/stable".into(), version: "2".into(), scope: Some("--user".into()), ..Default::default() };
+        assert!(flatpak.upgrade_actions(std::slice::from_ref(&update)).is_err());
+        update.revision = Some("approved-commit".into());
+        let actions = flatpak.upgrade_actions(std::slice::from_ref(&update)).unwrap();
+        assert_eq!(actions, vec![UpgradeAction::Command(builtin::display(&flatpak.arguments(&update).unwrap()))]);
+        let pipx = provider("pipx");
+        pipx.configure_no_cache(true);
+        let actions = pipx.upgrade_actions(&[ExternalUpdate { id: "environment".into(), ..Default::default() }]).unwrap();
+        assert!(matches!(&actions[0], UpgradeAction::Command(command) if command.contains("--pip-args=--no-cache-dir")));
     }
 }

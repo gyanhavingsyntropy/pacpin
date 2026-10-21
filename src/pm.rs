@@ -14,6 +14,7 @@ use crate::db::AlpmManager;
 use crate::journal::TransactionJournal;
 
 mod cache;
+mod cache_usage;
 mod continuation;
 mod install;
 mod lock;
@@ -28,6 +29,7 @@ pub use cache::{
     CacheScope, cache_scope, clean, clean_after_transaction, clean_preview, clean_scoped,
     helper_privilege_args, transaction_cache_cleanup,
 };
+pub use cache_usage::{CacheUsage, native_cache_usage};
 pub use install::{InstallOptions, build_install_commands, install};
 pub use lock::{LockInfo, check_lock, get_lock_info, wait_for_lock};
 pub use orphans::remove_orphans;

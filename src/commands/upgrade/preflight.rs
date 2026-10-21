@@ -192,7 +192,7 @@ mod tests {
             self.error.clone().map_or(Ok(()), Err)
         }
         fn configure_no_cache(&self, value: bool) { self.configured.store(value, Ordering::SeqCst); }
-        fn upgrade_command_str(&self, _: &[ExternalUpdate]) -> String { panic!("preflight must not execute or render commands") }
+        fn upgrade_actions(&self, _: &[ExternalUpdate]) -> std::io::Result<Vec<crate::integrations::UpgradeAction>> { panic!("preflight must not execute or render commands") }
         fn execute_upgrade(&self, _: &[ExternalUpdate]) -> std::io::Result<bool> { panic!("preflight must not execute") }
         fn clean_command_str(&self) -> String { panic!("preflight must not clean") }
         fn execute_clean(&self) -> std::io::Result<bool> { panic!("preflight must not clean") }

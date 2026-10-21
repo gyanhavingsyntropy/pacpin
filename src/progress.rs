@@ -3,6 +3,7 @@
 mod metrics;
 mod observer;
 mod stages;
+mod overview;
 pub(crate) mod transfers;
 pub use stages::{activity, pending, stop_pending};
 #[cfg(test)]
@@ -588,7 +589,10 @@ impl Footer {
         // DEC save/restore does not change the package manager's output cursor.
         // DECSC/DECRC also preserve autowrap. If the window shrinks during this
         // write, clip footer text instead of wrapping it into ordinary output.
-        write!(out, "\x1b7\x1b[?7l\x1b[{row};1H\x1b[0m\x1b[2K{}", "─".repeat(self.cols.saturating_sub(1) as usize))?;
+        let heading = overview::line(self.manager, native, &stages::snapshot().pending,
+            &COMPLETED.lock().unwrap_or_else(|e| e.into_inner()),
+            &FAILED.lock().unwrap_or_else(|e| e.into_inner()), self.cols.saturating_sub(1) as usize);
+        write!(out, "\x1b7\x1b[?7l\x1b[{row};1H\x1b[0m\x1b[2K{heading}")?;
         for (index, line) in lines.iter().enumerate() {
             write!(out, "\x1b[{};1H\x1b[2K{line}", row + 1 + index as u16)?;
         }

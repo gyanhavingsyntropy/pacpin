@@ -32,8 +32,10 @@ impl Registry {
     }
 
     fn not_run(&mut self) {
-        for (_, _, phase) in &mut self.rows {
-            if matches!(phase, Phase::Pending) { *phase = Phase::NotRun; }
+        for (_, manager, phase) in &mut self.rows {
+            // Successful managers may still clean their caches after another
+            // stage fails; finalization owns that decision.
+            if matches!(phase, Phase::Pending) && *manager != Manager::Cache { *phase = Phase::NotRun; }
         }
     }
 
@@ -98,7 +100,7 @@ pub(super) fn clear() {
 #[derive(Default)]
 pub(super) struct Snapshot {
     pub activities: Vec<(Manager, String)>,
-    pending: Vec<(Manager, String)>,
+    pub(super) pending: Vec<(Manager, String)>,
 }
 
 impl Snapshot {
@@ -161,8 +163,9 @@ mod tests {
         let mut registry = Registry::default();
         let aur = registry.insert(Manager::Aur, Phase::Pending);
         registry.insert(Manager::Nix, Phase::Pending);
+        registry.insert(Manager::Cache, Phase::Pending);
         registry.not_run();
         registry.remove(&[aur]);
-        assert_eq!(registry.snapshot().pending, [(Manager::Nix, "Not run (earlier failure)".into())]);
+        assert_eq!(registry.snapshot().pending, [(Manager::Nix, "Not run (earlier failure)".into()), (Manager::Cache, "Pending".into())]);
     }
 }

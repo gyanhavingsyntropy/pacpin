@@ -24,7 +24,7 @@ use colored::Colorize;
 use crate::commands::check_pacman_lock;
 use crate::config::Config;
 use crate::db::{AlpmManager, OrphanPackage};
-use crate::integrations::{self, IntegrationsManager};
+use crate::integrations::IntegrationsManager;
 use crate::journal::TransactionJournal;
 use crate::orphans::OrphanManager;
 use crate::pm;
@@ -37,6 +37,7 @@ use crate::ui::{self, print_banner};
 
 mod planning;
 mod preflight;
+mod execution_plan;
 #[cfg(test)]
 mod tests;
 
@@ -410,8 +411,8 @@ pub fn cmd_upgrade(
         preview: &preview,
         explicit_names: &explicit_names,
         requested: &requested_targets.items,
+        native_cache: (no_cache && !preview.adds.is_empty()).then(pm::native_cache_usage),
     }));
-    crate::integrations::preparation::preview(&ext_providers, &external_updates, !aur_targets.is_empty());
 
     // New dependencies are executed as explicit repo-qualified targets so the
     // transaction cannot silently resolve to anything other than the approved
@@ -469,51 +470,30 @@ pub fn cmd_upgrade(
         .map(|s| s.as_str())
         .collect();
 
-    let mut command_strs = Vec::new();
-    let helper_flags = if aur_targets.is_empty() { Vec::new() } else {
-        match pm::helper_privilege_args(&config.options.helper, &config.options.privilege_tool) {
-            Ok(flags) => flags,
-            Err(error) => { eprintln!("Error: {error}"); exit(1); }
-        }
-    };
-
-    if !pacman_targets.is_empty() {
-        let mut p_cmd = vec![config.options.privilege_tool.as_str(), "pacman", "-S", "--needed", "--noconfirm"];
-        p_cmd.extend(forwarded_pacman_flags.iter().copied());
-        p_cmd.push("--");
-        let mut s = p_cmd.join(" ");
-        s.push(' ');
-        s.push_str(&pacman_targets.join(" "));
-        command_strs.push(s);
-    }
-
     if !aur_targets.is_empty() {
-        let helper = &config.options.helper;
-        let mut a_cmd = vec![helper.as_str(), "-S", "--needed", "--aur", "--noconfirm"];
-        a_cmd.extend(helper_flags.iter().copied());
-        if no_cache {
-            a_cmd.push("--cleanafter");
-        }
-        a_cmd.extend(forwarded_pacman_flags.iter().copied());
-        a_cmd.push("--");
-        let mut s = a_cmd.join(" ");
-        s.push(' ');
-        s.push_str(&aur_targets.join(" "));
-        command_strs.push(s);
-    }
-
-    for p in &ext_providers {
-        let p_updates: Vec<integrations::ExternalUpdate> = external_updates
-            .iter()
-            .filter(|u| u.runner == p.name())
-            .cloned()
-            .collect();
-        if !p_updates.is_empty() {
-            command_strs.push(p.upgrade_command_str(&p_updates));
+        if let Err(error) = pm::helper_privilege_args(&config.options.helper, &config.options.privilege_tool) {
+            eprintln!("Error: {error}"); exit(1);
         }
     }
-
-    let full_cmd = command_strs.join(" && ");
+    let options = pm::InstallOptions { needed: true, noconfirm: true, no_cache,
+        forwarded_flags: forwarded_pacman_flags.iter().map(|flag| (*flag).to_string()).collect(), ..Default::default() };
+    let mut core_commands = pm::build_install_commands(&pacman_targets, &aur_targets, &config.options.helper, &config.options.privilege_tool, &options, false).0.into_iter();
+    let native_command = (!pacman_targets.is_empty()).then(|| core_commands.next().expect("native command"));
+    let aur_command = (!aur_targets.is_empty()).then(|| core_commands.next().expect("AUR command"));
+    let review_orphans = (autoremove || orphan_list_changed) && !orphans.is_empty();
+    let orphan_review = if review_orphans && !noconfirm {
+        execution_plan::OrphanReview::Interactive(orphans.len())
+    } else {
+        let count = noconfirm_orphan_selection(&orphans, autoremove).len();
+        if count == 0 { execution_plan::OrphanReview::None } else { execution_plan::OrphanReview::Automatic(count) }
+    };
+    let execution_plan = match execution_plan::Plan::new(execution_plan::Input {
+        native: native_command.clone().map(|command| (command, pacman_targets.len())),
+        aur: aur_command.clone().map(|command| (command, aur_targets.len())),
+        providers: &ext_providers, updates: &external_updates, orphans: orphan_review,
+        native_during_review: review_orphans && !noconfirm && native_command.is_some() && config.options.privilege_tool == "sudo",
+        hooks: !hook_plan.is_empty(), aur_hook: hook_plan.has_aur(), no_cache,
+    }) { Ok(plan) => plan, Err(error) => { eprintln!("Error: {error}"); exit(1); } };
 
     if !pacman_targets.is_empty() {
         if let Err(error) = crate::progress::operation(crate::progress::Manager::Checks, "Checking installation space", || crate::preview::check_native_capacity(&preview)) {
@@ -532,14 +512,13 @@ pub fn cmd_upgrade(
         }
     }
 
+    let external_scratch: Vec<_> = ext_providers.iter().filter(|p| p.name() != "Sources" && external_updates.iter().any(|u| u.runner == p.name())).map(|p| p.name()).collect();
+    if let Some(description) = crate::scratch::describe_managers(external_updates.iter().any(|u| u.runner == "Sources"), !aur_targets.is_empty() || hook_plan.has_aur(), &external_scratch) { println!(":: {description}"); }
+    execution_plan.render(dry_run);
     if dry_run {
         if keep_going { println!("Dry-Run: --keep-going skips failed manager discovery and unsupported options, and permits independent Sources after a verified AUR build failure; skipped or failed work keeps the run unsuccessful."); }
-        let external_scratch: Vec<_> = ext_providers.iter().filter(|p| p.name() != "Sources" && external_updates.iter().any(|u| u.runner == p.name())).map(|p| p.name()).collect();
-        if let Some(description) = crate::scratch::describe_managers(external_updates.iter().any(|u| u.runner == "Sources"), !aur_targets.is_empty() || hook_plan.has_aur(), &external_scratch) { println!("Dry-Run: {description}"); }
-        println!("{}", "Dry-Run: Synthesized Upgrade Commands:".bold());
-        println!("  ➔ {}\n", full_cmd.cyan());
         if no_cache {
-            println!("{}", "Dry-Run: Cache Cleanup Action (--no-cache):".bold());
+            println!("{}", "Dry-Run: Conditional cache cleanup after manager success (--no-cache):".bold());
             let has_native = !pacman_targets.is_empty();
             let has_aur = !aur_targets.is_empty() || hook_plan.has_aur();
             if has_native && has_aur {
@@ -594,10 +573,6 @@ pub fn cmd_upgrade(
         println!();
     }
 
-    println!("{}", ":: Synthesized Upgrade Command:".cyan());
-    println!("  {}\n", full_cmd.bold());
-
-    let review_orphans = (autoremove || orphan_list_changed) && !orphans.is_empty();
     let mut selected_orphans = Vec::new();
     let mut prefetch = None;
     let mut planned_managers = Vec::new();
@@ -666,6 +641,9 @@ pub fn cmd_upgrade(
             exit(1);
         }
     }
+
+    let orphan_pending = crate::progress::pending(if selected_orphans.is_empty() { &[] } else { &[crate::progress::Manager::Orphans] });
+    let cache_pending = crate::progress::pending(if execution_plan.has_cache_cleanup() { &[crate::progress::Manager::Cache] } else { &[] });
 
     if let Some(child) = prefetch {
         match child.wait() {
@@ -752,13 +730,7 @@ pub fn cmd_upgrade(
                         _ => eprintln!(":: Warning: Packages installed, but dependency install reasons could not be updated. Review them with pacman -Qi."),
                     }
                 }
-                let mut cmd_parts = vec![config.options.privilege_tool.as_str(), "pacman", "-S", "--needed", "--noconfirm"];
-                cmd_parts.extend(forwarded_pacman_flags.iter().cloned());
-                cmd_parts.push("--");
-                let mut full_cmd_s = cmd_parts.join(" ");
-                full_cmd_s.push(' ');
-                full_cmd_s.push_str(&pacman_targets.join(" "));
-                executed_commands.push(full_cmd_s);
+                executed_commands.push(native_command.clone().expect("native command"));
             }
             Ok(s) => {
                 exit_status = Ok(s);
@@ -773,7 +745,6 @@ pub fn cmd_upgrade(
     }
 
     if all_success && !aur_targets.is_empty() {
-        let helper = &config.options.helper;
         let options = pm::InstallOptions { needed: true, noconfirm: true, no_cache,
             forwarded_flags: forwarded_pacman_flags.iter().map(|s| (*s).to_owned()).collect(), ..Default::default() };
         let report = pm::execute_aur(config, &aur_targets, &options, pm::AurOperation::Install, keep_going);
@@ -806,17 +777,7 @@ pub fn cmd_upgrade(
                     }
                     applied_updates.push(requested_aur_resolved_package(item));
                 }
-                let mut cmd_parts = vec![helper.as_str(), "-S", "--needed", "--aur", "--noconfirm"];
-                cmd_parts.extend(helper_flags.iter().copied());
-                if no_cache {
-                    cmd_parts.push("--cleanafter");
-                }
-                cmd_parts.extend(forwarded_pacman_flags.iter().cloned());
-                cmd_parts.push("--");
-                let mut full_cmd_s = cmd_parts.join(" ");
-                full_cmd_s.push(' ');
-                full_cmd_s.push_str(&aur_targets.join(" "));
-                executed_commands.push(full_cmd_s);
+                executed_commands.push(aur_command.clone().expect("AUR command"));
             }
             Ok(s) => {
                 exit_status = Ok(s);
@@ -908,9 +869,9 @@ pub fn cmd_upgrade(
             }
         }
         let cmd_to_record = if executed_commands.is_empty() {
-            full_cmd.clone()
+            execution_plan.summary()
         } else {
-            executed_commands.join(" && ")
+            executed_commands.join("\n")
         };
         let _ = crate::progress::operation(crate::progress::Manager::Record, "Saving upgrade history", || TransactionJournal::record_transaction("upgrade", tx_packages, &cmd_to_record));
 
@@ -949,6 +910,7 @@ pub fn cmd_upgrade(
         println!("\n:: Orphan cleanup skipped because the upgrade failed; pending cleanup will be offered again on the next full upgrade.");
     }
 
+    drop(orphan_pending);
     let aur_cleanup = match (if !aur_targets.is_empty() && (native_ok || pacman_targets.is_empty()) { Some(aur_ok) } else { None }, hook_outcome.aur) {
         (Some(initial), Some(hook)) => Some(initial && hook),
         (initial, hook) => initial.or(hook),
@@ -957,6 +919,7 @@ pub fn cmd_upgrade(
         (!pacman_targets.is_empty()).then_some(native_ok),
         aur_cleanup);
     let external_cleanup_ok = IntegrationsManager::transaction_cache_cleanup(&ext_providers, &external_outcomes, no_cache);
+    drop(cache_pending);
 
     if !applied_updates.is_empty() {
         restart::RestartInspector::print_restart_advisory(&applied_updates, &config.options.privilege_tool);

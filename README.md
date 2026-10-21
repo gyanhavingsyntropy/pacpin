@@ -3,8 +3,8 @@
 **Declarative Package Resolver & Upgrade Engine for Arch Linux / CachyOS**
 
 > [!WARNING]
-> **Experimental pre-release (`3.2.0-alpha.1`).** Known bugs remain, and the
-> published `v3.1.0` build should not be considered stable. Pacpin has not
+> **Experimental: no stable release has been published yet.** Bugs are possible.
+> Pacpin has not
 > completed a release-grade security review. Avoid unattended upgrades and
 > running untrusted packages with `pin try` or `pin run`; test in a disposable
 > VM, inspect each proposed transaction, and keep system backups.
@@ -138,7 +138,7 @@ Confirmed orphan cleanup is recorded separately from the known-package inventory
 
 Removal checks the entire selection against the installed dependency graph. Dependencies needed by a retained package, including an unchecked optional orphan, are kept with an explanation. Removal is limited to the confirmed targets; unchecked dependencies remain installed. Orphan removal and cache cleanup appear as separate footer steps; completed upgrades remain checked while cleanup runs. `--keep-going` does not enable orphan removal after an upgrade failure.
 
-The shared footer also describes repository refresh, update/dependency/space checks, plan approval, orphan review, source extraction, saved records, hook rebuilds and restart inspection. Approved AUR and external upgrades stay visible as **Pending** while earlier managers run. Flatpak, Nix and other configured managers get separate rows for their actual checks and operations; checking for updates never marks an upgrade complete. Orphan review has its own row even without downloads; concurrent repository downloads remain visible alongside it. Failed managers stay marked during continuation. Short terminals prioritize active work and recent failures over older completed rows and summarize extra pending stages.
+The shared footer describes repository refresh, checks, review, installation and cleanup. A compact horizontal phase strip sits above individual manager metrics; selected orphan removal and requested cache cleanup remain pending until their actual stages run. Approved AUR and external upgrades stay visible as **Pending** while earlier managers run. Flatpak, Nix and other configured managers get separate rows; checking for updates never marks an upgrade complete. Concurrent repository downloads remain visible during orphan review, and failed managers stay marked during continuation. Narrow terminals shorten the phase strip; short terminals prioritize active work and recent failures.
 
 Enabled external managers (including Sources, Flatpak and Nix) check for updates concurrently. Each waits only for its own required metadata refresh: Sources can check while Flatpak and native databases refresh, and native/AUR resolution follows native refresh. Individual Sources packages also check concurrently, using up to four workers across aliases; a free worker starts the next queued package immediately. The combined plan waits for the selected checks to finish. Package transactions retain their ordered execution. Native target lookup prefers an exact package name across repositories before virtual providers; explicit repository targets remain confined to that repository. Dependency-preview failures identify conflicting packages or unsatisfied dependencies.
 
@@ -146,7 +146,28 @@ With `--keep-going`, a failed source package check excludes only that exact `ali
 
 Ordinary native install dry-runs also prepare the transaction and show solver-added dependencies and removals. Full system transactions delegated directly to pacman state when dependencies have not been expanded. Forced native reinstalls remain included in capacity estimates.
 
+Upgrade approval shows short, unnumbered action labels, for example
+`Actions: Pacman · Sources · Orphan review · Cache cleanup (on success)`.
+These labels do not imply sequential downloads. `--dry-run` additionally shows
+base manager commands, internal Sources actions and per-manager preparation;
+runtime paths/options are added during execution. No combined shell script is
+invented for internal or conditional work. Dry runs perform none of these actions.
+
+Orphan selection follows approval, and selected removal requires revalidation
+and whole-run success. Hooks require verified changes; cache cleanup applies to
+successful invoked managers. Restart advice follows cleanup without adding an
+approval-plan action. Scheduling installation for the next restart is currently
+not implemented; `needrestart` reports restart needs after updates.
+
 The final plan summary follows dependency and removal details. Its native counts and sizes include the prepared transaction's additional packages: for example, `41 upgrades + 7 new dependencies`, with no `+ 0` when there are none. Sources and other managers retain unknown sizes rather than appearing to add zero bytes.
+
+**Package Space Delta** covers installed package files only. With native
+`--no-cache` work, **Pacman Cache Now** separately estimates logical file bytes
+in configured caches before downloads. It is `Unknown` for nested/unreadable
+contents or a large scan; other managers' cache sizes are not guessed. This is
+not guaranteed reclaimable disk space: snapshots, shared extents and later
+downloads change the result. Cache cleanup after success does not reduce peak
+installation space.
 
 `--no-cache` cleans native/AUR caches involved in successful manager transactions.
 Sources remove temporary workspaces separately. Other managers must declare

@@ -7,7 +7,7 @@ impl IntegrationProvider for Probe {
     fn is_available(&self) -> bool { true }
     fn refresh_metadata(&self) -> std::io::Result<()> { Ok(()) }
     fn check_updates(&self) -> crate::discovery::Report<ExternalUpdate> { crate::discovery::Report::updates("Nix", Ok(Vec::new())) }
-    fn upgrade_command_str(&self, _: &[ExternalUpdate]) -> String { String::new() }
+    fn upgrade_actions(&self, _: &[ExternalUpdate]) -> std::io::Result<Vec<crate::integrations::UpgradeAction>> { Ok(Vec::new()) }
     fn execute_upgrade(&self, _: &[ExternalUpdate]) -> std::io::Result<bool> { Ok(true) }
     fn check_options(&self, _: crate::scratch::Policy, _: bool) -> Result<(), crate::runtime::OptionError> { Ok(()) }
     fn clean_command_str(&self) -> String { String::new() }

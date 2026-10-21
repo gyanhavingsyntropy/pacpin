@@ -63,6 +63,7 @@ exceptions below remain explicit migration targets.
 | `progress/metrics.rs` | Aggregate progress estimates and concise phase labels |
 | `progress/transfers.rs` | Manager-specific transfer interpretation, scoped percentages and typed preparation windows shared by installs/upgrades |
 | `integrations/preparation.rs` | Approved optional preparation jobs, explicit capability policy, phase gating and join/abort lifetime |
+| `commands/upgrade/execution_plan.rs` | Remaining staged work for approval/dry-run: typed provider command/internal actions, shared core command previews, conditional orphan/hooks/cache/restart lifecycle; never an executable transaction script |
 | `progress/tests.rs` | Preserved renderer, parser, terminal and child-transport checks |
 
 Command capture no longer lives in the terminal renderer. HTTP, archive,
@@ -134,6 +135,20 @@ scripts watching verified successful changes retain their independent conditions
 
 `commands/upgrade/planning.rs` owns requested-target classification,
 ignores, delay policy and conversion into result records.
+`IntegrationProvider::upgrade_actions` requires each backend to return typed
+`UpgradeAction::Command` or `Internal` actions, with errors for invalid approved
+plans. Configured adapters use their actual argument expansion; Sources describe
+the retained approved recipe without a second lookup or recursive pacpin call.
+`commands/upgrade/execution_plan.rs` presents these actions and preparation
+policies alongside core previews from `pm::build_install_commands`. Actual
+executed descriptions remain suitable for history, without inventing an overall
+shell script for internal/conditional actions.
+Routine approval renders short unnumbered labels; dry runs retain action and
+preparation details. `pm/cache_usage.rs` owns bounded read-only cache estimates;
+the UI displays these separately from installed-package space change.
+`progress/overview.rs` renders a horizontal phase strip in the existing separator
+row, while manager metrics retain their own rows. Upgrade finalization owns
+pending orphan/cache lifetimes and preserves cache cleanup after partial failure.
 `commands/upgrade/tests.rs` preserves the command/planning regression checks.
 The main file drops from 1,835 to roughly 1,130 lines; its remaining long command
 function is a further refactoring target, not a small facade yet.

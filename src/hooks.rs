@@ -238,6 +238,8 @@ impl Plan {
             .any(|(_, hook, _)| matches!(hook.action, Action::RebuildAur { .. }))
     }
 
+    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+
     pub fn run(&self, config: &Config, successful: bool, noconfirm: bool) -> Outcome {
         let mut outcome = Outcome::default();
         if self.entries.is_empty() {

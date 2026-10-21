@@ -228,7 +228,7 @@ package() {{
                 path.unlink()
         run("sudo", "-n", "pacman", "-Syy", "--noconfirm")
 
-    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello", orphan_choice=None, expect_no_orphan_prompt=False, orphans=None, cache=None, cancel_manager=None, completed_before_cache=None, cancel_marker=None, password_prompt="PACPIN_AUTH_PASSWORD:", resize_password=False, cwd=None, confirm_action=None, source_package="pacpin-ui-source", source_version="2.0.0-1"):
+    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello", orphan_choice=None, expect_no_orphan_prompt=False, orphans=None, cache=None, cancel_manager=None, completed_before_cache=None, cancel_marker=None, password_prompt="PACPIN_AUTH_PASSWORD:", resize_password=False, cwd=None, confirm_action=None, source_package="pacpin-ui-source", source_version="2.0.0-1", confirm_response="y"):
         result = self.root / f"{name}.status"
         result.unlink(missing_ok=True)
         raw = self.root / f"{name}.raw.txt"
@@ -311,7 +311,7 @@ package() {{
             if confirm and not confirmed and "Proceed with installation?" in screen:
                 if confirm_action is not None:
                     confirm_action()
-                self.rc("send-text", "--stdin", input="y")
+                self.rc("send-text", "--stdin", input=confirm_response)
                 self.rc("send-key", "enter")
                 confirmed = True
             if orphan_choice is not None and selection_started is None and "Showing " in screen and "Enter confirms" in screen:
@@ -437,7 +437,8 @@ package() {{
             failures.append(f"expected exactly one sudo password prompt per run ({repeat} runs)")
         if password and re.search(re.escape(password_prompt) + r" *garuda", raw_text):
             failures.append("sudo password echoed into the transcript")
-        if source and args[0] == "-Su" and not self.baseline and "External Package Transactions" in raw_text and "Unknown" not in raw_text and "+ unknown" not in raw_text:
+        size_text = " ".join(raw_text.replace("│", " ").split())
+        if source and args[0] == "-Su" and not self.baseline and "External Package Transactions" in raw_text and "Unknown" not in size_text and "+ unknown" not in size_text:
             failures.append("unknown source sizes shown as a complete total")
         final_screen = self.rc("get-text", "--extent", "screen")
         if re.search(r"(?:^|\n)(?:Pacman|AUR|Sources|Flatpak|Nix|Pipx|Hooks|Orphans|Cache):", final_screen):

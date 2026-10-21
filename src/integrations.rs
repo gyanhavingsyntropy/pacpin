@@ -131,6 +131,21 @@ pub struct ExternalUpdate {
     pub scope: Option<String>,
 }
 
+/// Providers must distinguish an actual command from pacpin-owned work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpgradeAction {
+    Command(String),
+    Internal(String),
+}
+impl UpgradeAction {
+    pub fn description(&self) -> String {
+        match self {
+            Self::Command(command) => command.clone(),
+            Self::Internal(action) => format!("Internal: {action}"),
+        }
+    }
+}
+
 pub trait IntegrationProvider: Send + Sync {
     /// Optional recipe detail from the exact approved snapshot, before approval.
     fn preview_upgrade(&self, _updates: &[ExternalUpdate]) {}
@@ -139,7 +154,10 @@ pub trait IntegrationProvider: Send + Sync {
     fn refresh_metadata(&self) -> Result<(), std::io::Error>;
     fn supports_refresh(&self) -> bool { false }
     fn check_updates(&self) -> crate::discovery::Report<ExternalUpdate>;
-    fn upgrade_command_str(&self, updates: &[ExternalUpdate]) -> String;
+    fn upgrade_actions(&self, updates: &[ExternalUpdate]) -> std::io::Result<Vec<UpgradeAction>>;
+    fn upgrade_description(&self, updates: &[ExternalUpdate]) -> std::io::Result<String> {
+        Ok(self.upgrade_actions(updates)?.iter().map(UpgradeAction::description).collect::<Vec<_>>().join("; "))
+    }
     fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> Result<bool, std::io::Error>;
     fn check_options(&self, policy: crate::scratch::Policy, no_cache: bool) -> Result<(), crate::runtime::OptionError>;
     fn validate_options(&self, no_cache: bool) -> Result<(), String> {
@@ -291,14 +309,18 @@ impl IntegrationsManager {
             if let Err(reason) = permit.validate() {
                 eprintln!(":: Sources: skipped {}: {reason}", update.name); stopped = true; continue;
             }
-            if let Some(preparation) = preparation { preparation.before(provider.name()); }
             println!(":: Checking independent Sources update: {}", update.name);
+            let description = match provider.upgrade_description(std::slice::from_ref(update)) {
+                Ok(description) => description,
+                Err(error) => { eprintln!(":: Sources plan is invalid: {error}"); outcomes.push((String::new(), false)); stopped = true; continue; }
+            };
+            if let Some(preparation) = preparation { preparation.before(provider.name()); }
             let success = match provider.execute_after_aur_failure(update, permit) {
                 Ok(true) => { println!("✔ Sources: {} updated successfully.", update.name); true },
                 Ok(false) => { eprintln!(":: Sources: {} failed.", update.name); false },
                 Err(error) => { eprintln!(":: Sources: {} was not completed: {error}", update.name); false },
             };
-            outcomes.push((provider.upgrade_command_str(std::slice::from_ref(update)), success));
+            outcomes.push((description, success));
             if !success && permit.validate().is_err() { stopped = true; }
         }
         let source_count = updates.iter().filter(|u| u.runner == "Sources").count();
@@ -327,15 +349,23 @@ impl IntegrationsManager {
                 continue;
             }
             if stopped { println!(":: {}: skipped because an earlier external upgrade failed.", p.name()); outcomes.push((p.name().to_string(), String::new(), false)); continue; }
+            let cmd_str = match p.upgrade_description(&p_updates) {
+                Ok(description) => description,
+                Err(error) => {
+                    eprintln!(":: {} plan is invalid: {error}", p.name());
+                    crate::progress::failed(crate::progress::integration_manager(p.name()));
+                    outcomes.push((p.name().to_string(), String::new(), false));
+                    stopped = true;
+                    continue;
+                }
+            };
             if let Some(preparation) = preparation { preparation.before(p.name()); }
-
-            let cmd_str = p.upgrade_command_str(&p_updates);
             println!(
-                "\n{} Upgrading {} ({} packages: {})...",
+                "\n{} Upgrading {} ({} approved {})...",
                 "::".cyan(),
                 p.name().bold(),
                 p_updates.len(),
-                cmd_str.dimmed()
+                if p_updates.len() == 1 { "target" } else { "targets" }
             );
             let manager = Some(crate::progress::integration_manager(p.name()));
             match p.execute_upgrade(&p_updates) {
@@ -561,7 +591,7 @@ mod tests {
             }
             report
         }
-        fn upgrade_command_str(&self, _: &[ExternalUpdate]) -> String { String::new() }
+        fn upgrade_actions(&self, _: &[ExternalUpdate]) -> std::io::Result<Vec<UpgradeAction>> { Ok(Vec::new()) }
         fn execute_upgrade(&self, _: &[ExternalUpdate]) -> Result<bool, std::io::Error> {
             self.active.fetch_add(1, Ordering::SeqCst); Ok(self.label != "fail-upgrade")
         }
@@ -648,7 +678,7 @@ mod tests {
                 crate::discovery::Report::updates(self.name(), Ok(Vec::new()))
             }
             fn check_options(&self, _: crate::scratch::Policy, _: bool) -> Result<(), crate::runtime::OptionError> { Ok(()) }
-            fn upgrade_command_str(&self, _: &[ExternalUpdate]) -> String { unreachable!() }
+            fn upgrade_actions(&self, _: &[ExternalUpdate]) -> std::io::Result<Vec<UpgradeAction>> { unreachable!() }
             fn execute_upgrade(&self, _: &[ExternalUpdate]) -> std::io::Result<bool> { unreachable!() }
             fn clean_command_str(&self) -> String { unreachable!() }
             fn execute_clean(&self) -> std::io::Result<bool> { unreachable!() }

@@ -560,6 +560,7 @@ pub struct PlanDetails<'a> {
     pub preview: &'a TransactionPreview,
     pub explicit_names: &'a HashSet<String>,
     pub requested: &'a [RequestedItem],
+    pub native_cache: Option<crate::pm::CacheUsage>,
 }
 
 pub fn render_transaction_plan(
@@ -1090,7 +1091,7 @@ pub fn render_transaction_plan(
     );
 
     print_card_line(
-        "📊 Net Space Delta     : ",
+        "📊 Package Space Delta : ",
         &tot_delta_str,
         if has_known_delta {
             tot_delta_str.color(tot_delta_color).to_string()
@@ -1098,9 +1099,19 @@ pub fn render_transaction_plan(
             tot_delta_str.dimmed().to_string()
         },
     );
+    if let Some(cache) = details.as_ref().and_then(|details| details.native_cache) {
+        let size = cache_usage_text(cache);
+        print_card_line("🗃 Pacman Cache Now    : ", &size, size.dimmed().to_string());
+    }
     println!("  └{}┘\n", "─".repeat(card_inner_w));
 
     updates.clone()
+}
+
+fn cache_usage_text(usage: crate::pm::CacheUsage) -> String {
+    if usage.complete {
+        format!("~{}", format_size(usage.bytes.min(i64::MAX as u64) as i64))
+    } else { "Unknown".into() }
 }
 
 fn package_count_text(changes: usize, new: usize) -> String {
@@ -1274,6 +1285,12 @@ mod tests {
         assert_eq!(package_count_text(41, 7), "41 upgrades + 7 new installs");
         assert_eq!(package_count_text(41, 0), "41 upgrades");
         assert_eq!(package_count_text(0, 7), "7 new installs");
+    }
+
+    #[test]
+    fn cache_size_is_a_separate_estimate_and_incomplete_scans_are_unknown() {
+        assert_eq!(cache_usage_text(crate::pm::CacheUsage { bytes: 1024, complete: true }), "~1.0 KiB");
+        assert_eq!(cache_usage_text(crate::pm::CacheUsage { bytes: 1024, complete: false }), "Unknown");
     }
 
     #[test]
