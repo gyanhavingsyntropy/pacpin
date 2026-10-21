@@ -26,6 +26,11 @@ class ReviewChecks(PreparationChecks):
         assert "Flatpak option review: after success run" in text
         assert "download-only preparation:" not in text
         assert json.loads((self.root / "flatpak-actions.json").read_text()) == ["prepare", "upgrade", "action", "cache"]
+        frames = json.loads((self.root / f"{name}.frames.json").read_text())
+        assert not any(re.search(r"(?:^|\n)(?:Cache|Orphans): Pending", frame) for frame in frames)
+        for manager in ["Flatpak", "Nix"]:
+            assert any("✔ Updating" in frame and "● Cache" in frame and f"Cache: {manager}:" in frame for frame in frames)
+        assert not any("● Updating" in frame and "fixture operation: cache" in frame and re.search(r"(?:^|\n)Cache:", frame) for frame in frames)
 
         name = "compact-cache-disabled-without-cleanup"
         self.reset_case(name, native=False, external=("nix",))
@@ -39,23 +44,28 @@ class ReviewChecks(PreparationChecks):
         assert not any("Cache: Pending" in frame for frame in frames)
 
         name = "compact-native-source-live-resize"
-        self.reset_case(name, source=True)
+        self.reset_case(name, source=True, orphans=True)
         # Empty live caches can finish between screen samples. Delay only this
         # guest fixture's ordinary sudo forwarding for -Scc, then execute real
         # sudo/pacman. This script has no special permissions or host effects.
         delay = self.root / "cache-delay"
         delay.mkdir()
         helper = delay / "sudo"
-        helper.write_text('#!/bin/sh\ncase " $* " in *" -Scc "*) printf "PACPIN_CACHE_TEST_PAUSE\\n"; sleep 1;; esac\nexec /usr/bin/sudo "$@"\n')
+        helper.write_text('#!/bin/sh\ncase " $* " in *" -Scc "*) printf "PACPIN_CACHE_TEST_PAUSE\\n"; sleep 1;; *" -Rn "*) printf "PACPIN_ORPHAN_TEST_PAUSE\\n"; sleep 1;; esac\nexec /usr/bin/sudo "$@"\n')
         helper.chmod(0o755)
         original_path = self.env["PATH"]
         self.env["PATH"] = str(delay) + ":" + original_path
-        self.case(name, ["-Su", "--no-cache", "--noconfirm"], native=True, source=True, resize=True)
+        self.case(name, ["-Su", "--no-cache", "--noconfirm", "--autoremove"], native=True, source=True, resize=True)
         self.env["PATH"] = original_path
-        self.verify_plan(name, {"Pacman", "Sources"}, internal=True, cache=True)
+        self.verify_plan(name, {"Pacman", "Sources"}, internal=True, orphan=True, cache=True)
         frames = json.loads((self.root / f"{name}.frames.json").read_text())
         assert any("● Updating" in frame and "○ Cache" in frame for frame in frames)
         assert any("● Cache" in frame for frame in frames)
+        assert any("✔ Updating" in frame and "● Cache" in frame and "Cache: Native:" in frame for frame in frames)
+        assert not any(re.search(r"(?:^|\n)(?:Cache|Orphans): Pending", frame) for frame in frames)
+        assert not any("● Cache" in frame and "Pacman: ✔" in frame for frame in frames)
+        assert any("✔ Updating" in frame and "● Orphans" in frame for frame in frames)
+        assert any("✔ Updating" in frame and "✔ Orphans" in frame and "● Cache" in frame for frame in frames)
 
         name = "compact-redirected-dry-run"
         self.reset_case(name, native=False, source=True)
@@ -128,6 +138,8 @@ class ReviewChecks(PreparationChecks):
                   confirm=True, confirm_action=self.capture(name), orphan_choice=[], width=44)
         self.verify_plan(name, {"Pacman", "Sources"}, internal=True, orphan=True, cache=True)
         text = re.sub(r"\s+", " ", transcript(self.root / f"{name}.raw.txt"))
+        frames = json.loads((self.root / f"{name}.frames.json").read_text())
+        assert not any(re.search(r"(?:^|\n)(?:Cache|Orphans): Pending", frame) for frame in frames)
         assert text.index("Actions:") < text.index("Proceed with installation?") < text.index("CLEAN ORPHANED PACKAGES")
         assert "Scratch policy" in text or "Storage" in text
 

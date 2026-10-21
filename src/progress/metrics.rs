@@ -210,7 +210,10 @@ pub(super) fn phase_with_metrics(manager: Manager, text: &str, phase: &str) -> S
 
 pub(super) fn scoped_phase(manager: Manager, label: &str, phase: &str) -> String {
     if manager == Manager::Cache {
-        let scope = if label.contains("native") { "Native" } else if label.contains("AUR") { "AUR" } else { return phase.into(); };
+        let scope = if label.contains("native") { "Native" } else if label.contains("AUR") { "AUR" }
+            else if let Some(scope) = label.strip_prefix("Cleaning ").and_then(|label| label.strip_suffix(" cache")).filter(|scope| !scope.is_empty() && *scope != "package") { scope }
+            else { return phase.into(); };
+        let phase = if phase == label { "Cleaning package cache" } else { phase };
         return format!("{scope}: {phase}");
     }
     phase.into()

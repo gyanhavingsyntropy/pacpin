@@ -534,7 +534,7 @@ impl Footer {
         } else {
             native_footer(current, width.saturating_sub(label.len() + 2))
         };
-        let mut history: Vec<String> = COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&m| m != self.manager)
+        let mut history: Vec<String> = COMPLETED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&m| m != self.manager && overview::history_detail(m, self.manager))
             .map(|manager| format!("{}: ✔ {}", manager.label(), manager.completion())).collect();
         history.extend(FAILED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&m| m != self.manager)
             .map(|manager| format!("{}: ✗ Operation failed", manager.label())));
@@ -585,13 +585,21 @@ impl Footer {
         }
         let row = self.rows.saturating_sub(self.height).saturating_add(1);
         let lines = self.lines(native, self.rows, self.cols);
-        let mut out = io::stdout().lock();
         // DEC save/restore does not change the package manager's output cursor.
         // DECSC/DECRC also preserve autowrap. If the window shrinks during this
         // write, clip footer text instead of wrapping it into ordinary output.
-        let heading = overview::line(self.manager, native, &stages::snapshot().pending,
-            &COMPLETED.lock().unwrap_or_else(|e| e.into_inner()),
-            &FAILED.lock().unwrap_or_else(|e| e.into_inner()), self.cols.saturating_sub(1) as usize);
+        let native_background = NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let preparing = !PREPARING.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        let source_background = SOURCE.lock().unwrap_or_else(|e| e.into_inner()).downloaded != 0;
+        let skipped: Vec<_> = SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(manager, _)| *manager).collect();
+        let heading = overview::line(overview::Snapshot {
+            current: self.manager, phase: native, pending: &stages::snapshot().pending,
+            completed: &COMPLETED.lock().unwrap_or_else(|e| e.into_inner()),
+            failed: &FAILED.lock().unwrap_or_else(|e| e.into_inner()), skipped: &skipped,
+            source_checks_failed: SOURCE_CHECK_FAILURES.load(std::sync::atomic::Ordering::Relaxed) != 0,
+            background_updates: native_background || preparing || source_background,
+        }, self.cols.saturating_sub(1) as usize);
+        let mut out = io::stdout().lock();
         write!(out, "\x1b7\x1b[?7l\x1b[{row};1H\x1b[0m\x1b[2K{heading}")?;
         for (index, line) in lines.iter().enumerate() {
             write!(out, "\x1b[{};1H\x1b[2K{line}", row + 1 + index as u16)?;
@@ -889,7 +897,7 @@ impl BackgroundCommand {
                 return Ok(status);
             }
             let display_failed = footer.as_mut().is_some_and(|display| {
-                let phase = NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner());
+                let phase = NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 display.resize().and_then(|_| display.draw(phase.as_deref().unwrap_or("Waiting for download result"))).is_err()
             });
             if display_failed {

@@ -397,8 +397,8 @@ package() {{
                 failures.append(f"{manager} footer scope mismatch: expected {expected}, observed {present}")
         if cancel_manager and not cancelled:
             failures.append(f"Ctrl-C during {cancel_manager} was not exercised")
-        if completed_before_cache and not any(f"{completed_before_cache}: ✔" in frame and re.search(r"(?:^|\n)Cache: (?!✔)", frame) for frame in snapshots):
-            failures.append(f"completed {completed_before_cache} row absent during cleanup")
+        if completed_before_cache and not any(f"✔ {completed_before_cache}" in frame and re.search(r"(?:^|\n)Cache: (?!✔)", frame) for frame in snapshots):
+            failures.append(f"completed {completed_before_cache} tab absent during cleanup")
         if source and (success or source_completed) and not native and not any(re.search(r"(?:^|\n)Sources:", frame) for frame in snapshots):
             failures.append("source-only progress missing")
         if not source and any(re.search(r"(?:^|\n)Sources: (?!Checking updates|Refreshing metadata|⚠)", frame) for frame in snapshots):

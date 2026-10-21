@@ -919,6 +919,7 @@ pub fn cmd_upgrade(
         (!pacman_targets.is_empty()).then_some(native_ok),
         aur_cleanup);
     let external_cleanup_ok = IntegrationsManager::transaction_cache_cleanup(&ext_providers, &external_outcomes, no_cache);
+    if !cleanup_ok || !external_cleanup_ok { crate::progress::failed(crate::progress::Manager::Cache); }
     drop(cache_pending);
 
     if !applied_updates.is_empty() {

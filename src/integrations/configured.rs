@@ -76,8 +76,11 @@ impl Provider {
         Ok(command)
     }
     fn run(&self, arguments: &[String], phase: &str) -> io::Result<bool> {
+        self.run_as(arguments, crate::progress::integration_manager(&self.name), phase)
+    }
+    fn run_as(&self, arguments: &[String], manager: crate::progress::Manager, phase: &str) -> io::Result<bool> {
         if unsafe { libc::geteuid() } == 0 { return Err(io::Error::other("Start pacpin as a regular user; manager commands are unprivileged")); }
-        let result = crate::progress::run(&mut self.command(arguments)?, crate::progress::integration_manager(&self.name), phase, || {});
+        let result = crate::progress::run(&mut self.command(arguments)?, manager, phase, || {});
         crate::pacman_config::invalidate();
         Ok(result?.success())
     }
@@ -228,7 +231,11 @@ impl IntegrationProvider for Provider {
         else { None }
     }
     fn execute_cache_cleanup(&self) -> io::Result<bool> {
-        if self.definition.cache_cleanup.is_empty() { Ok(true) } else { self.run(&self.definition.cache_cleanup, "Cleaning package cache") }
+        if self.definition.cache_cleanup.is_empty() { return Ok(true); }
+        let result = self.run_as(&self.definition.cache_cleanup, crate::progress::Manager::Cache, &format!("Cleaning {} cache", self.name));
+        if result.as_ref().is_ok_and(|success| *success) { crate::progress::completed(crate::progress::Manager::Cache); }
+        else { crate::progress::failed(crate::progress::Manager::Cache); }
+        result
     }
     fn clean_command_str(&self) -> String {
         if self.definition.clean.is_empty() { builtin::clean_preview(&self.definition.adapter) } else { builtin::display(&self.definition.clean) }

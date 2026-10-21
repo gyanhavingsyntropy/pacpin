@@ -106,7 +106,12 @@ pub(super) struct Snapshot {
 impl Snapshot {
     pub fn append(&self, active: &mut Vec<String>, visible: &mut Vec<Manager>) {
         // Actual concurrent work has priority over stages waiting to start.
-        for (manager, text) in self.activities.iter().chain(&self.pending) {
+        let details = self.pending.iter().filter(|(manager, state)| {
+            // Waiting cleanup is already represented by its phase tab. Keep
+            // actual activity and not-run reasons in the detailed area.
+            !matches!(manager, Manager::Orphans | Manager::Cache) || state != "Pending"
+        });
+        for (manager, text) in self.activities.iter().chain(details) {
             if visible.contains(manager) { continue; }
             active.push(format!("{}: {text}", manager.label()));
             visible.push(*manager);
@@ -167,5 +172,25 @@ mod tests {
         registry.not_run();
         registry.remove(&[aur]);
         assert_eq!(registry.snapshot().pending, [(Manager::Nix, "Not run (earlier failure)".into()), (Manager::Cache, "Pending".into())]);
+    }
+
+    #[test]
+    fn cleanup_waits_in_tabs_but_activity_and_failure_reasons_keep_details() {
+        let mut registry = Registry::default();
+        registry.insert(Manager::Orphans, Phase::Pending);
+        registry.insert(Manager::Cache, Phase::Pending);
+        registry.insert(Manager::Aur, Phase::Pending);
+        let mut rows = Vec::new();
+        registry.snapshot().append(&mut rows, &mut Vec::new());
+        assert_eq!(rows, ["AUR: Pending"]);
+        assert_eq!(registry.snapshot().pending.len(), 3);
+        registry.insert(Manager::Cache, Phase::Activity("Cleaning native package cache"));
+        let mut rows = Vec::new();
+        registry.snapshot().append(&mut rows, &mut Vec::new());
+        assert_eq!(rows, ["Cache: Cleaning native package cache", "AUR: Pending"]);
+        registry.not_run();
+        let mut rows = Vec::new();
+        registry.snapshot().append(&mut rows, &mut Vec::new());
+        assert!(rows.contains(&"Orphans: Not run (earlier failure)".to_string()));
     }
 }

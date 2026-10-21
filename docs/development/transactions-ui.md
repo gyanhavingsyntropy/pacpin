@@ -60,8 +60,14 @@ Cache inspection is read-only, bounded and never traverses nested downloads or
 symlinks. Unknown contents remain unknown; logical file bytes do not guarantee
 reclaimed filesystem space. Do not subtract them from package delta or peak need.
 The horizontal footer phase strip reuses its existing separator row, with
-individual manager metrics below it. Cleanup pending rows follow actual selected
-orphans/requested successful-manager cleanup; clear them after their lifecycle.
+individual manager metrics below it. Pending cleanup belongs only in phase tabs,
+not duplicate detail rows. Preserve the completed Updating tick when Orphans or
+Cache becomes active; failures/incomplete discovery cannot earn that tick.
+During cleanup, replace completed package details with the current cleanup
+manager/step, retaining failure diagnostics. External cleanup uses the same Cache
+phase with its manager name. Narrow tabs keep active work and count hidden tabs.
+Clear pending phases after their actual lifecycle; never infer success from a
+completed download or from a manager merely disappearing from pending work.
 
 ## Transfer progress and preparation
 

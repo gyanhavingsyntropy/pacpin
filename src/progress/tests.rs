@@ -116,6 +116,8 @@
         assert_eq!(Manager::Cache.completion(), "Cleanup complete");
         assert_eq!(scoped_phase(Manager::Cache, "Cleaning native package cache", "Awaiting confirmation"), "Native: Awaiting confirmation");
         assert_eq!(scoped_phase(Manager::Cache, "Cleaning AUR build cache", "Cleaning package cache"), "AUR: Cleaning package cache");
+        assert_eq!(scoped_phase(Manager::Cache, "Cleaning Flatpak cache", "Cleaning Flatpak cache"), "Flatpak: Cleaning package cache");
+        assert_eq!(scoped_phase(Manager::Cache, "Cleaning Nix cache", "Clearing download leftovers"), "Nix: Clearing download leftovers");
     }
 
     #[test]

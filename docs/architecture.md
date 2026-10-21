@@ -60,6 +60,7 @@ exceptions below remain explicit migration targets.
 | `progress.rs` | Session/footer and foreground/background display transport; background downloads use a separate process group while retaining the invoking terminal session |
 | `progress/observer.rs` | Bounded byte/escape normalization and operation markers |
 | `progress/stages.rs` | Scoped concurrent checks and pending approved manager stages; checking never marks an upgrade complete |
+| `progress/overview.rs` | Phase tabs derived from actual pending/completed/failed/skipped manager state; completed update tick, current cleanup detail policy and narrow-tab overflow |
 | `progress/metrics.rs` | Aggregate progress estimates and concise phase labels |
 | `progress/transfers.rs` | Manager-specific transfer interpretation, scoped percentages and typed preparation windows shared by installs/upgrades |
 | `integrations/preparation.rs` | Approved optional preparation jobs, explicit capability policy, phase gating and join/abort lifetime |
