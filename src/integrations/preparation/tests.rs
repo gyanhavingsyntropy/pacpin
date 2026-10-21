@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Probe { policy: Policy, calls: Arc<AtomicUsize>, fail: bool }
 impl IntegrationProvider for Probe {
+    fn cache_usage(&self) -> Option<crate::pm::CacheUsage> { Some(Default::default()) }
     fn name(&self) -> &str { "Nix" }
     fn is_available(&self) -> bool { true }
     fn refresh_metadata(&self) -> std::io::Result<()> { Ok(()) }

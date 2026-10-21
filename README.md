@@ -161,13 +161,22 @@ not implemented; `needrestart` reports restart needs after updates.
 
 The final plan summary follows dependency and removal details. Its native counts and sizes include the prepared transaction's additional packages: for example, `41 upgrades + 7 new dependencies`, with no `+ 0` when there are none. Sources and other managers retain unknown sizes rather than appearing to add zero bytes.
 
-**Package Space Delta** covers installed package files only. With native
-`--no-cache` work, **Pacman Cache Now** separately estimates logical file bytes
-in configured caches before downloads. It is `Unknown` for nested/unreadable
-contents or a large scan; other managers' cache sizes are not guessed. This is
-not guaranteed reclaimable disk space: snapshots, shared extents and later
-downloads change the result. Cache cleanup after success does not reduce peak
-installation space.
+**Package Space Delta** covers installed package files only. With `--no-cache`,
+**Cache Now** combines cache estimates for eligible planned managers before
+downloads. Pacman's configured cache directories have a bounded, read-only
+inspection. AUR helper and external cache sizes currently remain unknown rather
+than guessing their configured locations or counting installed Flatpak runtimes
+and Nix store paths as disposable caches. A known subtotal is shown as
+`~size + unknown`, with the unknown managers named below the box. Sources own
+temporary artifact/build directories and do not add a persistent package cache.
+Nested/unreadable native contents or a large scan also retain an unknown size.
+These are logical file bytes, not guaranteed reclaimed disk space: snapshots,
+shared extents and later downloads change the result. Cache cleanup after
+success does not reduce peak installation space.
+
+`--use-ram` and `--use-storage` choose where temporary working files live. If a
+plan needs none (for example a Pacman-only update), pacpin says that the chosen
+flag has no effect. Installed packages still require disk space.
 
 `--no-cache` cleans native/AUR caches involved in successful manager transactions.
 Sources remove temporary workspaces separately. Other managers must declare

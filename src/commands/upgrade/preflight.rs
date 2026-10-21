@@ -182,6 +182,7 @@ mod tests {
         configured: AtomicBool,
     }
     impl IntegrationProvider for Provider {
+        fn cache_usage(&self) -> Option<crate::pm::CacheUsage> { Some(Default::default()) }
         fn preparation_policy(&self) -> crate::integrations::preparation::Policy { crate::integrations::preparation::Policy::Unsupported("preflight fixture") }
         fn name(&self) -> &str { self.name }
         fn is_available(&self) -> bool { true }

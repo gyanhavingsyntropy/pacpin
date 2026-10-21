@@ -229,6 +229,7 @@ mod tests {
         actions: Option<Vec<UpgradeAction>>,
     }
     impl IntegrationProvider for Provider {
+        fn cache_usage(&self) -> Option<crate::pm::CacheUsage> { Some(Default::default()) }
         fn name(&self) -> &str {
             self.name
         }

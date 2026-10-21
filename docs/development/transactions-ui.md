@@ -56,6 +56,10 @@ Check ordinary, scoped, skipped/incomplete, no-work, dry-run and narrow-terminal
 cases. Do not turn preview generation into manager execution or cache mutation.
 
 Keep installed-package space change separate from current cache estimates.
+Combine eligible managers in one cache row, preserving known subtotals and
+naming managers with unknown sizes. Retained package caches differ from Sources'
+temporary trees and installed Flatpak runtimes/Nix store paths. Unsupported
+measurement is unknown, not zero; an estimate never broadens cleanup scope.
 Cache inspection is read-only, bounded and never traverses nested downloads or
 symlinks. Unknown contents remain unknown; logical file bytes do not guarantee
 reclaimed filesystem space. Do not subtract them from package delta or peak need.

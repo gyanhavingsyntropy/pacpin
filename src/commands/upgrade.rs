@@ -38,6 +38,7 @@ use crate::ui::{self, print_banner};
 mod planning;
 mod preflight;
 mod execution_plan;
+mod cache_summary;
 #[cfg(test)]
 mod tests;
 
@@ -411,7 +412,7 @@ pub fn cmd_upgrade(
         preview: &preview,
         explicit_names: &explicit_names,
         requested: &requested_targets.items,
-        native_cache: (no_cache && !preview.adds.is_empty()).then(pm::native_cache_usage),
+        cache: cache_summary::collect(no_cache, !preview.adds.is_empty(), !aur_targets.is_empty() || hook_plan.has_aur(), &ext_providers, &external_updates),
     }));
 
     // New dependencies are executed as explicit repo-qualified targets so the

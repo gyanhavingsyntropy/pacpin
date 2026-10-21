@@ -17,6 +17,32 @@ from verify_upgrade_ui_vm import run, serialized_verifier, transcript
 class ReviewChecks(PreparationChecks):
     def extras(self):
         self.original_cfg = self.cfg.read_text()
+        name = "combined-native-external-cache-estimate"
+        self.reset_case(name)
+        self.fixture_preparation(("flatpak", "nix"))
+        (self.root / "cache/estimate-fixture").write_bytes(b"x" * 4096)
+        self.case(name, ["-Su", "--no-cache", "--dry-run", "--noconfirm"], width=44)
+        self.verify_plan(name, {"Pacman", "Flatpak", "Nix"}, cache=True)
+        text = " ".join(transcript(self.root / f"{name}.raw.txt").replace("│", " ").split())
+        assert "~4.0 KiB + unknown" in text
+        assert (self.root / "cache/estimate-fixture").stat().st_size == 4096
+        assert not (self.root / "flatpak-actions.json").exists()
+        assert not (self.root / "nix-actions.json").exists()
+
+        name = "incomplete-native-cache-estimate"
+        self.reset_case(name)
+        (self.root / "cache/estimate-fixture").write_bytes(b"x" * 4096)
+        nested = self.root / "cache/nested-download"
+        nested.mkdir()
+        (nested / "keep").write_text("preserve")
+        self.case(name, ["-Su", "--no-cache", "--dry-run", "--noconfirm"])
+        self.verify_plan(name, {"Pacman"}, cache=True)
+        text = " ".join(transcript(self.root / f"{name}.raw.txt").split())
+        assert "~4.0 KiB + unknown" in text and "Cache sizes unknown: Pacman." in text
+        assert (nested / "keep").read_text() == "preserve"
+        (nested / "keep").unlink()
+        nested.rmdir()
+
         name = "compact-custom-options"
         self.reset_case(name, native=False)
         self.fixture_preparation(("flatpak", "nix"))
@@ -38,7 +64,7 @@ class ReviewChecks(PreparationChecks):
         body = "\n".join(line for line in managers.read_text().splitlines() if not line.startswith("cache_cleanup ="))
         managers.write_text(body.replace("[managers.nix]\n", '[managers.nix]\nno_cache_args = ["--avoid-cache"]\n') + "\n")
         self.case(name, ["-Su", "--external-only", "--no-cache", "--noconfirm"])
-        self.verify_plan(name, {"Nix"})
+        self.verify_plan(name, {"Nix"}, cache_estimate=True)
         assert json.loads((self.root / "nix-actions.json").read_text()) == ["upgrade"]
         frames = json.loads((self.root / f"{name}.frames.json").read_text())
         assert not any("Cache: Pending" in frame for frame in frames)
@@ -77,7 +103,7 @@ class ReviewChecks(PreparationChecks):
         self.results.append({"case": name, "status": 0, "failures": [], "capture": "redirected stdout"})
         self.checkpoint()
 
-    def verify_plan(self, name, managers, internal=False, orphan=False, cache=False, keep=False, hooks=False):
+    def verify_plan(self, name, managers, internal=False, orphan=False, cache=False, keep=False, hooks=False, cache_estimate=None):
         result = self.results[-1]
         raw = transcript(self.root / f"{name}.raw.txt")
         text = re.sub(r"\s+", " ", raw)
@@ -104,7 +130,23 @@ class ReviewChecks(PreparationChecks):
         require(("Hooks (if triggered)" in actions) == hooks, "hook scope mismatch")
         if "Pacman" in managers and "Sources" in managers:
             require(actions.index("Pacman") < actions.index("Sources"), "native/source labels missing")
-        require(("Pacman Cache Now" in text) == (cache and "Pacman" in managers), "native cache estimate scope mismatch")
+        if cache_estimate is None:
+            cache_estimate = cache and bool(managers - {"Sources"})
+        require(("Cache Now" in text) == cache_estimate, "combined cache estimate scope mismatch")
+        require("Pacman Cache Now" not in text and "🗃" not in text, "old cache label or ambiguous icon remains")
+        if cache_estimate:
+            for manager in managers - {"Pacman", "Sources"}:
+                require(re.search(rf"Cache sizes unknown: [^.]*\b{manager}\b", text) is not None, f"{manager} cache incorrectly appears measured/empty")
+        if name.startswith("native-cache-border-"):
+            # Inspect captured rendered text with Kitty's independent width
+            # engine, not pacpin's own width helper tested against itself.
+            code = ("import json, sys; from pathlib import Path; "
+                    "from kitty.fast_data_types import wcswidth; "
+                    "lines = Path(sys.argv[1]).read_text().splitlines(); "
+                    "print(json.dumps([wcswidth(line) for line in lines "
+                    "if line.startswith(('  ┌', '  │', '  └'))]))")
+            widths = json.loads(run("kitty", "+runpy", code, str(self.root / f"{name}.review-screen.txt")))
+            require(len(widths) >= 8 and len(set(widths)) == 1, f"rendered card border columns differ: {widths}")
         require("Net Space Delta" not in text, "ambiguous package/cache delta label remains")
         markers = ["Hooks:", "Orphan cleanup:", "Cache cleanup (--no-cache):", "Restart advisory:"]
         (self.root / f"{name}.lifecycle.txt").write_text("\n".join(
@@ -118,6 +160,16 @@ class ReviewChecks(PreparationChecks):
 
     def suite(self):
         self.original_cfg = self.cfg.read_text()
+        for width, policy in [(80, "--use-ram"), (44, "--use-storage")]:
+            name = f"native-cache-border-{width}"
+            self.reset_case(name, source=False)
+            self.case(name, ["-Su", "--no-cache", policy], confirm=True, confirm_response="n", confirm_action=self.capture(name), width=width)
+            self.verify_plan(name, {"Pacman"}, cache=True)
+            text = " ".join(transcript(self.root / f"{name}.raw.txt").split())
+            assert f"{policy} has no effect here: no temporary build files are needed." in text
+            assert "Scratch preference unused" not in text
+            assert run("pacman", "-Q", "pacpin-ui-native").strip().endswith("1.0.0-1")
+
         name = "decline-native-source-orphans"
         self.reset_case(name, source=True, orphans=True)
         self.case(name, ["-Su", "--no-cache"], confirm=True, confirm_response="n", confirm_action=self.capture(name), width=80)

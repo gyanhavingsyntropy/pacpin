@@ -145,8 +145,14 @@ policies alongside core previews from `pm::build_install_commands`. Actual
 executed descriptions remain suitable for history, without inventing an overall
 shell script for internal/conditional actions.
 Routine approval renders short unnumbered labels; dry runs retain action and
-preparation details. `pm/cache_usage.rs` owns bounded read-only cache estimates;
-the UI displays these separately from installed-package space change.
+preparation details. `pm/cache_usage.rs` owns bounded read-only native cache
+estimates. `commands/upgrade/cache_summary.rs` combines them with the required
+provider `cache_usage` contract for eligible planned work only. Sources declare
+temporary artifacts, configured external adapters explicitly retain unknown
+sizes, and AUR sizes remain unknown because helper configuration can relocate
+them. The UI presents one cache row with known subtotals and named unknowns,
+separate from installed-package space change. No cache inspection runs manager
+commands or authorizes cleanup of an uninvoked manager.
 `progress/overview.rs` renders a horizontal phase strip in the existing separator
 row, while manager metrics retain their own rows. Upgrade finalization owns
 pending orphan/cache lifetimes and preserves cache cleanup after partial failure.

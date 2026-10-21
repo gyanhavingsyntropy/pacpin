@@ -560,7 +560,15 @@ pub struct PlanDetails<'a> {
     pub preview: &'a TransactionPreview,
     pub explicit_names: &'a HashSet<String>,
     pub requested: &'a [RequestedItem],
-    pub native_cache: Option<crate::pm::CacheUsage>,
+    pub cache: Option<CacheSummary>,
+}
+
+/// Cache files belonging to eligible planned managers, before new downloads.
+/// Unknown sizes are retained separately; they must never become zero bytes.
+#[derive(Default)]
+pub struct CacheSummary {
+    pub bytes: u64,
+    pub unknown_managers: Vec<String>,
 }
 
 pub fn render_transaction_plan(
@@ -1099,19 +1107,26 @@ pub fn render_transaction_plan(
             tot_delta_str.dimmed().to_string()
         },
     );
-    if let Some(cache) = details.as_ref().and_then(|details| details.native_cache) {
+    if let Some(cache) = details.as_ref().and_then(|details| details.cache.as_ref()) {
         let size = cache_usage_text(cache);
-        print_card_line("🗃 Pacman Cache Now    : ", &size, size.dimmed().to_string());
+        // U+1F5C3 (archive box) defaults to text presentation in some terminals,
+        // unlike this emoji-presentation folder. Use a predictable two-cell icon.
+        print_card_line("📁 Cache Now           : ", &size, size.dimmed().to_string());
     }
     println!("  └{}┘\n", "─".repeat(card_inner_w));
+    if let Some(cache) = details.as_ref().and_then(|details| details.cache.as_ref()).filter(|cache| !cache.unknown_managers.is_empty()) {
+        let text = format!("Cache sizes unknown: {}.", cache.unknown_managers.join(", "));
+        for line in wrap_field(&text, ":: ", "   ", avail) { println!("{line}"); }
+    }
 
     updates.clone()
 }
 
-fn cache_usage_text(usage: crate::pm::CacheUsage) -> String {
-    if usage.complete {
-        format!("~{}", format_size(usage.bytes.min(i64::MAX as u64) as i64))
-    } else { "Unknown".into() }
+fn cache_usage_text(usage: &CacheSummary) -> String {
+    match (usage.bytes, usage.unknown_managers.is_empty()) {
+        (0, false) => "Unknown".into(),
+        (bytes, complete) => format!("~{}{}", format_size(bytes.min(i64::MAX as u64) as i64), if complete { "" } else { " + unknown" }),
+    }
 }
 
 fn package_count_text(changes: usize, new: usize) -> String {
@@ -1289,8 +1304,10 @@ mod tests {
 
     #[test]
     fn cache_size_is_a_separate_estimate_and_incomplete_scans_are_unknown() {
-        assert_eq!(cache_usage_text(crate::pm::CacheUsage { bytes: 1024, complete: true }), "~1.0 KiB");
-        assert_eq!(cache_usage_text(crate::pm::CacheUsage { bytes: 1024, complete: false }), "Unknown");
+        assert_eq!(cache_usage_text(&CacheSummary { bytes: 1024, unknown_managers: vec![] }), "~1.0 KiB");
+        assert_eq!(cache_usage_text(&CacheSummary { bytes: 1024, unknown_managers: vec!["AUR".into()] }), "~1.0 KiB + unknown");
+        assert_eq!(cache_usage_text(&CacheSummary { bytes: 0, unknown_managers: vec!["Flatpak".into()] }), "Unknown");
+        assert_eq!(cache_usage_text(&CacheSummary::default()), "~0 B");
     }
 
     #[test]
@@ -1315,6 +1332,8 @@ mod tests {
     fn test_card_line_alignment() {
         let card_inner_w = 58;
         let test_cases = vec![
+            ("📁 Cache Now           : ", "~0 B"),
+            ("📁 Cache Now           : ", "~1.0 KiB + unknown"),
             ("📦 Packages to Upgrade : ", "1 (0 custom, 1 default)"),
             ("⏸ Packages Held Back  : ", "1 packages"),
             ("📥 Total Download Size : ", "2.30 MiB"),

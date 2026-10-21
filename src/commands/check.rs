@@ -174,7 +174,7 @@ pub fn cmd_check(config: &Config, args: &[String]) {
         let targets: Vec<String> = res.updates.iter().filter_map(|p| p.candidate.as_ref().filter(|c| !c.is_aur).map(|c| format!("{}/{}", c.repo, p.name))).collect();
         let names = res.updates.iter().map(|p| p.name.clone()).collect();
         match crate::preview::prepare_native_preview(&mut manager, &targets) {
-            Ok(preview) => { ui::render_transaction_plan(&res, &config.options.helper, &external_updates, Some(ui::PlanDetails { preview: &preview, explicit_names: &names, requested: &[], native_cache: None })); }
+            Ok(preview) => { ui::render_transaction_plan(&res, &config.options.helper, &external_updates, Some(ui::PlanDetails { preview: &preview, explicit_names: &names, requested: &[], cache: None })); }
             Err(error) => {
                 eprintln!(":: Native dependency preview unavailable: {error}. Totals below cover listed updates only.");
                 render_transaction_view(&res, &config.options.helper, &external_updates);

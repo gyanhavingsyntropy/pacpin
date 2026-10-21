@@ -17,6 +17,11 @@ impl SourceProvider {
 }
 
 impl IntegrationProvider for SourceProvider {
+    fn cache_usage(&self) -> Option<crate::pm::CacheUsage> {
+        // Downloaded artifacts and build outputs live in owned temporary trees,
+        // not a persistent package cache awaiting --no-cache cleanup.
+        None
+    }
     fn check_options(&self, _policy: crate::scratch::Policy, _no_cache: bool) -> Result<(), crate::runtime::OptionError> {
         // Sources own temporary workspaces under either policy. Their actual
         // recipe/archive capacity remains checked before download/build/install.

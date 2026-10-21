@@ -86,6 +86,11 @@ impl Provider {
     }
 }
 impl IntegrationProvider for Provider {
+    fn cache_usage(&self) -> Option<crate::pm::CacheUsage> {
+        // Arbitrary commands/environments can change backend cache locations.
+        // Neither installed Flatpak runtimes nor the Nix store are cache sizes.
+        Some(crate::pm::CacheUsage::default())
+    }
     fn preview_upgrade(&self, _updates: &[ExternalUpdate]) {
         // Custom flag effects still need explicit review; routine download
         // preparation belongs to the detailed dry-run, not approval chatter.

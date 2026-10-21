@@ -35,6 +35,15 @@ Read [the design contract and professional references](docs/development/design.m
 - Keep onboarding aligned with current feature/config ownership. `wizard/` owns prompts/review; `config/setup.rs` owns exact snapshots, backups and locked persistence. Preserve existing preferences and supplemental files, show effective manager overrides, require final approval, cancel without writes on EOF/q, and test fresh/reconfigure/reset/first-launch/non-TTY paths in the real guest terminal. Per-command scratch/scope flags must not become misleading universal setup defaults.
 - Run the required verification and binary sync below after Rust changes, and the affected disposable-VM scenarios after execution/UI/orchestration changes. State any unverified paths explicitly. Documentation and a passing build are not proof that a transaction releases its lock or that a terminal prompt is visible.
 
+Cache summaries must include eligible planned managers through their adapter's
+explicit cache-usage contract. Preserve known subtotals and name unknown sizes;
+never count an unsupported measurement as zero or installed runtime/store files
+as disposable cache. Sources' temporary artifacts are distinct from retained
+package caches. Use icons with predictable terminal presentation in padded cards
+and verify their rendered borders; testing the same width helper against itself
+does not establish alignment. Explain an unused RAM/storage flag by its actual
+CLI name rather than internal scratch terminology.
+
 ## Required reading for the affected area
 
 These linked contracts are development instructions, not optional background.

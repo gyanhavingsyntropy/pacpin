@@ -164,6 +164,10 @@ pub trait IntegrationProvider: Send + Sync {
         self.check_options(crate::scratch::policy(), no_cache).map_err(|error| error.to_string())
     }
     fn configure_no_cache(&self, _no_cache: bool) {}
+    /// Read-only estimate of retained package/build caches before downloading.
+    /// None means this adapter owns only temporary artifacts; an unknown size
+    /// is Some(CacheUsage::default()), never an assumed empty cache.
+    fn cache_usage(&self) -> Option<crate::pm::CacheUsage>;
     fn cache_command_str(&self) -> Option<String> { None }
     fn execute_cache_cleanup(&self) -> std::io::Result<bool> { Ok(true) }
     fn clean_command_str(&self) -> String;
@@ -570,6 +574,7 @@ mod tests {
     }
 
     impl IntegrationProvider for MockProvider {
+        fn cache_usage(&self) -> Option<crate::pm::CacheUsage> { Some(Default::default()) }
         fn preparation_policy(&self) -> preparation::Policy { preparation::Policy::Unsupported("fixture") }
         fn check_options(&self, _: crate::scratch::Policy, _: bool) -> Result<(), crate::runtime::OptionError> { Ok(()) }
         fn name(&self) -> &'static str { self.label }
@@ -661,6 +666,7 @@ mod tests {
             independent_checked: Arc<AtomicBool>,
         }
         impl IntegrationProvider for Pipeline {
+            fn cache_usage(&self) -> Option<crate::pm::CacheUsage> { Some(Default::default()) }
             fn preparation_policy(&self) -> preparation::Policy { preparation::Policy::Unsupported("fixture") }
             fn name(&self) -> &str { if self.refresh { "Flatpak" } else { "Sources" } }
             fn is_available(&self) -> bool { true }

@@ -47,14 +47,44 @@ pub fn describe_plan(has_sources: bool, has_aur: bool) -> Option<String> {
     describe_managers(has_sources, has_aur, &[])
 }
 pub fn describe_managers(has_sources: bool, has_aur: bool, external: &[&str]) -> Option<String> {
-    if policy() == Policy::Auto { return None; }
+    describe_policy(policy(), has_sources, has_aur, external)
+}
+fn describe_policy(policy: Policy, has_sources: bool, has_aur: bool, external: &[&str]) -> Option<String> {
+    if policy == Policy::Auto { return None; }
     let mut managers = Vec::new();
     if has_sources { managers.push("Sources"); }
     if has_aur { managers.push("Paru"); }
     managers.extend_from_slice(external);
-    if managers.is_empty() { return Some("Scratch preference unused: this plan has no temporary build workspace.".into()); }
+    if managers.is_empty() {
+        let flag = if policy == Policy::Ram { "--use-ram" } else { "--use-storage" };
+        return Some(format!("{flag} has no effect here: no temporary build files are needed. Installed packages still use disk space."));
+    }
     let managers = managers.join(" / ");
-    Some(format!("{:?} temporary workspace for {managers}; root installation space remains required.", policy()))
+    Some(format!("{policy:?} temporary workspace for {managers}; root installation space remains required."))
+}
+
+#[cfg(test)]
+mod description_tests {
+    use super::*;
+    #[test]
+    fn forced_policy_without_build_work_names_the_actual_flag() {
+        for (policy, flag) in [(Policy::Ram, "--use-ram"), (Policy::Storage, "--use-storage")] {
+            let text = describe_policy(policy, false, false, &[]).unwrap();
+            assert!(text.starts_with(flag));
+            assert!(text.contains("no effect here"));
+            assert!(text.contains("Installed packages still use disk space"));
+            assert!(!text.contains("Scratch"));
+        }
+        assert!(describe_policy(Policy::Auto, false, false, &[]).is_none());
+    }
+    #[test]
+    fn policy_descriptions_preserve_each_applicable_manager() {
+        for (sources, aur, external, name) in [(true, false, vec![], "Sources"), (false, true, vec![], "Paru"), (false, false, vec!["custom"], "custom")] {
+            let text = describe_policy(Policy::Ram, sources, aur, &external).unwrap();
+            assert!(text.contains(name));
+            assert!(!text.contains("no effect"));
+        }
+    }
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Capacity {
