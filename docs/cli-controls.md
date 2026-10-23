@@ -9,6 +9,7 @@ forwarded to every backend. Application arguments belong after `--`.
 | `install`, `-S` | Sources/Paru temporary files; native installation retains pacman policy | Invoked native/AUR transaction only; Sources files are already ephemeral | `--dry-run`, `--channel`, refresh, confirmation |
 | `rebuild` | Same typed native/AUR/Sources installation boundary | `--no-cache` / `--clean-cache` forwarded to installation | `--dry-run`, `--enforce-repos`, confirmation; manifest Flatpak rejects scratch/cache overrides before work |
 | Native repository `run`, `try` | New archives and extracted files share RAM/disk workspace | `--no-cache` bypasses archive reuse and leaves existing system cache intact | `--dry-run`, `--bin`, isolation options; app flags after `--` |
+| AUR/Sources/export `run`, `try` | Owned downloads, builds, missing dependencies and app trees use the selected medium; estimates are not reservations | Build/export caches are always private and removed; `--no-cache` also bypasses native dependency archive reuse | Explicit `aur/pkg`, `source-alias/pkg` or declared export; approval/`--noconfirm`, `--dry-run`, `--bin`, app flags after `--` |
 | Installed native `run`, `try` | Rejected: existing installed files cannot be relocated by scratch policy | No package download; existing caches untouched | `--installed`, `--bin`, `--dry-run`, isolation options |
 | Flatpak/Nix/Pipx `run`, `try` | Rejected: these execution adapters do not declare a store/environment relocation capability | Flatpak/Nix reject; Pipx uses an owned temporary environment/cache workspace and cleans it on exit | `--dry-run`; Nix/Pipx require host execution opt-in; Flatpak keeps its own sandbox |
 | `manager NAME --FLAG` | Upgrade scratch flags are irrelevant to standalone actions | Define the explicit cache action in managers.toml | `--dry-run`, confirmation; configured literal commands have separate approval |
@@ -36,6 +37,24 @@ it. They are mutually exclusive, do not elevate package builds, do not consume
 another option's value, and leave arguments after `--` unchanged.
 
 ## Application files and persistence
+
+Explicit `aur/pkg`, configured `source-alias/pkg`, and custom managers with an
+`ephemeral` export contract also support `try`/`run`, scratch selection, dry runs,
+`--bin` and `--no-cache`. Package preparation is separate from app execution:
+AUR/Sources makepkg runs in a private filesystem view even for `run`. Missing
+build/runtime dependencies are extracted privately; existing installed packages
+are reused and never uninstalled. AUR recipes need approval (`--noconfirm` opts
+in without a prompt). AUR virtual-provider choices/cycles fail rather than
+installing host dependencies. Base build tools and Bubblewrap/Paru prerequisites
+must already be installed. Normal install/upgrade dependency handling is unchanged.
+
+These package-tree backends do not run pacman installation scripts or hooks.
+`run` uses a mount view for compiled absolute paths while retaining normal host
+home, project and network access. `try` keeps its private runtime policies below.
+Preparation uses private HOME/cache directories and system makepkg defaults;
+home-directory build configuration and signing credentials are not exposed.
+Declared Sources optimization settings still apply. Scratch checks are estimates,
+not memory reservations or a limit on arbitrary build code.
 
 Scratch placement and application output are separate policies:
 

@@ -46,6 +46,17 @@ pub struct Definition {
     pub flags: BTreeMap<String, UserFlag>,
     #[serde(skip)]
     pub selected_flags: Vec<String>,
+    /// Explicit package-tree export, separate from system installation commands.
+    pub ephemeral: Option<Ephemeral>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Ephemeral {
+    pub command: Vec<String>,
+    /// Package-owned paths relative to {root}; {id} may select the entry point.
+    pub executables: Vec<String>,
+    pub scratch_mib: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,7 +109,7 @@ pub fn validate(file: &ManagerFile) -> Result<(), String> {
             if !definition.check.is_empty() || !definition.verify.is_empty() || !definition.upgrade.is_empty() || !definition.upgrade_ram.is_empty()
                 || !definition.upgrade_storage.is_empty() || !definition.no_cache_args.is_empty()
                 || !definition.cache_cleanup.is_empty() || !definition.clean.is_empty() || !definition.refresh.is_empty() || !definition.prepare.is_empty()
-                || !definition.env.is_empty() || definition.scratch_mib.is_some() {
+                || !definition.env.is_empty() || definition.scratch_mib.is_some() || definition.ephemeral.is_some() {
                 return Err(format!("{name}: core commands are owned by the typed adapter; configure helper/privilege_tool instead"));
             }
         } else if !matches!(definition.adapter.as_str(), "flatpak" | "nix" | "pipx" | "command") {
@@ -113,8 +124,28 @@ pub fn validate(file: &ManagerFile) -> Result<(), String> {
         }
         if let Some(helper) = &definition.helper { crate::config::validate_helper(helper)?; }
         if let Some(tool) = &definition.privilege_tool { crate::config::validate_privilege_tool(tool)?; }
-        if definition.adapter == "command" && (definition.check.is_empty() || definition.upgrade.is_empty() || definition.verify.is_empty()) {
+        let export_only = definition.ephemeral.is_some() && definition.check.is_empty() && definition.upgrade.is_empty() && definition.verify.is_empty();
+        if definition.adapter == "command" && !export_only && (definition.check.is_empty() || definition.upgrade.is_empty() || definition.verify.is_empty()) {
             return Err(format!("{name}: command adapters require check, upgrade, and verify argument arrays"));
+        }
+        if let Some(ephemeral) = &definition.ephemeral {
+            if definition.adapter != "command" { return Err(format!("{name}: ephemeral export belongs to command adapters")); }
+            if !(1..=1_048_576).contains(&ephemeral.scratch_mib) || ephemeral.command.is_empty()
+                || ephemeral.command[0].contains(['{', '}']) || ephemeral.executables.is_empty() || ephemeral.executables.len() > 64 {
+                return Err(format!("{name}: export requires a literal command, executable paths and scratch_mib (1–1048576)"));
+            }
+            for key in ["{id}", "{root}"] {
+                if !ephemeral.command.iter().any(|arg| arg.contains(key)) { return Err(format!("{name}: export command must contain {key}")); }
+            }
+            let literal: Vec<_> = ephemeral.command.iter().map(|arg| arg.replace("{id}", "pkg").replace("{root}", "/private/root")).collect();
+            validate_command(&literal, false)?;
+            for executable in &ephemeral.executables {
+                let path = executable.replace("{id}", "pkg");
+                validate_argument(&path, false)?;
+                if path.is_empty() || !Path::new(&path).components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+                    return Err(format!("{name}: export executable must be a confined relative path"));
+                }
+            }
         }
         for (operation, command, placeholders) in [
             ("check", &definition.check, false), ("refresh", &definition.refresh, false),
@@ -236,6 +267,17 @@ mod tests {
     fn accepts_literal_commands_and_composable_variants() {
         let body = "[managers.custom]\nadapter='command'\nenabled=true\ncheck=['/opt/custom/check']\nverify=['/opt/custom/verify','{id}','{version}']\nupgrade=['/opt/custom/update','--','{id}','{version}']\nupgrade_ram=['/opt/custom/update','--','{id}']\nscratch_mib=32\nno_cache_args=['--no-cache']\n";
         validate(&toml::from_str(body).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn temporary_exports_require_scoped_literal_commands_and_confined_executables() {
+        let prefix = "[managers.demo]\nadapter='command'\nenabled=true\n[managers.demo.ephemeral]\n";
+        let valid = "command=['exporter','--','{id}','{root}']\nexecutables=['usr/bin/{id}']\nscratch_mib=16\n";
+        validate(&toml::from_str(&format!("{prefix}{valid}")).unwrap()).unwrap();
+        for (old, new) in [("'{root}'", "'/tmp'"), ("'{id}'", "'all'"), ("usr/bin/{id}", "../escape"), ("exporter", "{id}"), ("scratch_mib=16", "scratch_mib=0")] {
+            let file: ManagerFile = toml::from_str(&format!("{prefix}{}", valid.replacen(old, new, 1))).unwrap();
+            assert!(validate(&file).is_err(), "{old} -> {new}");
+        }
     }
     #[test]
     fn preparation_requires_explicit_target_scope_and_cannot_override_core() {

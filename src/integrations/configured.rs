@@ -4,6 +4,19 @@ use crate::manager_config::Definition;
 use std::io;
 use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
 
+/// Explicit export contract, separate from an upgrade or installation command.
+pub(crate) fn export_temporary(definition: &Definition, id: &str, root: &std::path::Path, work: &std::path::Path, view: &crate::execution::BuildWorkspace) -> Result<(), String> {
+    let export = definition.ephemeral.as_ref().ok_or("This manager has no temporary export command; configure managers.NAME.ephemeral")?;
+    if !crate::utils::is_safe_pkg_name(id) { return Err("Invalid export identity".into()); }
+    let arguments: Vec<_> = export.command.iter().map(|arg| arg.replace("{id}", id).replace("{root}", &root.to_string_lossy())).collect();
+    let mut command = Command::new(&arguments[0]);
+    command.args(&arguments[1..]).current_dir(work).envs(&definition.env);
+    let mut command = view.command(command, work)?;
+    let status = crate::progress::run(&mut command, crate::progress::Manager::Runtime, "Exporting temporary app", || {}).map_err(|e| e.to_string())?;
+    if !status.success() { return Err(format!("Temporary export failed ({status}); app was not started")); }
+    Ok(())
+}
+
 pub(super) struct Provider {
     name: String,
     definition: Definition,

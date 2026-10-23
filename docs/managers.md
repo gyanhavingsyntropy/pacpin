@@ -1,5 +1,45 @@
 # Manager configuration
 
+## Temporary application exports
+
+Custom managers can explicitly export an application tree for `pin run NAME/id`
+or `pin try NAME/id`. An upgrade command is never reused for this operation.
+Add this alongside the other definitions in `managers.toml`:
+
+```toml
+[managers.demo]
+adapter = "command"
+enabled = true
+# Export-only managers need no check/upgrade/verify commands and are not checked
+# during upgrades. A full command manager may add this same table too.
+[managers.demo.ephemeral]
+command = ["/usr/local/bin/demo-export", "--id", "{id}", "--root", "{root}"]
+executables = ["usr/bin/{id}"]
+scratch_mib = 128
+```
+
+The exporter must create a self-contained tree under `{root}`, return nonzero on
+failure, and leave its declared executable(s) there. Literal arguments only;
+`{id}` and `{root}` are required. Executable paths are relative, confined, and
+may contain `{id}`. This is trusted local configuration, not a recipe fetched
+from metadata. The command runs unprivileged with network access, read-only host
+runtime, private HOME/caches and only its workspace writable. Host credentials,
+manager daemon sockets and privileged stores are not exposed. A backend which
+needs those resources must use its existing backend instead; exporting is not a
+promise to relocate Nix/Flatpak stores.
+
+`--use-ram`/`--use-storage` select the owned workspace and `scratch_mib` supplies
+initial capacity headroom. `--dry-run` does not execute the exporter. All export
+work/caches are fresh and removed on exit; `--no-cache` does not prune external
+stores. Installation hooks/services are not run. App output follows normal
+`run`/`try` persistence policies, independently of preparation storage.
+
+Built-in Flatpak/Nix/Pipx modes keep their existing capabilities and restrictions.
+Explicit `aur/pkg` and configured `source-alias/pkg` targets use the shared
+package preparation path rather than a custom export command.
+
+## Manager definitions
+
 Run `pin config init` to create `managers.toml`, `sources.toml`, and `hooks.toml`
 beside `config.toml`. Existing files are never overwritten. Setup does this too.
 The folder follows XDG_CONFIG_HOME, otherwise `~/.config/pacpin`.

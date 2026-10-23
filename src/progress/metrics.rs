@@ -120,14 +120,14 @@ pub(super) fn phase_text(manager: Manager, text: &str, previous: &str) -> String
     if let Some(transfer) = super::transfers::footer(manager, text) { return transfer; }
     let clean = clean_text(text);
     let lower = clean.to_lowercase();
-    if matches!(manager, Manager::Aur | Manager::Sources) {
+    if matches!(manager, Manager::Aur | Manager::Sources | Manager::Runtime) {
         if lower.starts_with("==> starting build()") || lower.starts_with("==> starting check()") {
             return "Building packages".into();
         }
         if ["==> starting package()", "==> entering fakeroot", "==> creating package", "==> compressing package"].iter().any(|marker| lower.starts_with(marker)) {
             return "Packaging source".into();
         }
-        if lower.starts_with("==> finished making:") { return "Build complete; awaiting installation".into(); }
+        if lower.starts_with("==> finished making:") { return if manager == Manager::Runtime { "Build complete; checking artifact" } else { "Build complete; awaiting installation" }.into(); }
         // Configure/compiler output is not a package-manager lifecycle signal.
         // In particular, "checking ...", optional feature failures and password
         // checks must not replace Building or suspend the footer for sudo.
@@ -141,6 +141,15 @@ pub(super) fn phase_text(manager: Manager, text: &str, previous: &str) -> String
                 return previous.into();
             }
         }
+    }
+    // Temporary builders/exporters never run a system package transaction.
+    // Keep their explicit phase unless makepkg emitted a lifecycle marker.
+    if manager == Manager::Runtime {
+        if lower.starts_with("error:") || lower.starts_with("==> error:") { return "Preparation failed".into(); }
+        if lower.starts_with("==> retrieving sources") { return "Downloading build inputs".into(); }
+        if lower.starts_with("==> validating source files") { return "Verifying build inputs".into(); }
+        if lower.starts_with("==> extracting sources") { return "Extracting build inputs".into(); }
+        return previous.into();
     }
     match lower.as_str() {
         "pacpin_progress phase=build" => return "Building packages".into(),

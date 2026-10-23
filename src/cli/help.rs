@@ -25,8 +25,8 @@ pub(super) fn print_help() {
     println!("      --MANAGER.FLAG           Apply a custom flag defined in managers.toml");
     println!("      --keep-going             Skip failed checks/unsupported manager options; report incomplete work");
     println!("                               Also try Sources after a verified AUR build failure");
-    println!("      --use-ram                Use tmpfs for Sources / Paru builds and native run/try files");
-    println!("      --use-storage            Use disk for Sources / Paru builds and native run/try files");
+    println!("      --use-ram                Use tmpfs for supported builds and temporary app files");
+    println!("      --use-storage            Use disk for supported builds and temporary app files");
     println!("      --noconfirm              Bypass interactive confirmation prompt");
     println!("  -S [flags] [repo/]pkg        Install packages (auto-pins repo/pkg with companion cascade)");
     println!("  -S github:owner/project      Install a reviewed direct upstream release (--channel alpha)");
@@ -71,8 +71,10 @@ pub(super) fn print_help() {
     println!("  needrestart                  Inspect processes holding outdated libraries or kernel in RAM");
     println!();
     println!("{}", "Power Tools & Ephemeral Execution:".bold());
-    println!("  run [options] [repo/]pkg     Run package directly on host without installing (like 'nix run')");
-    println!("  try [options] [repo/]pkg     Run package in isolated ephemeral sandbox (air-gapped bwrap)");
+    println!("  run [options] [backend/]pkg  Prepare a temporary app; normal home/project writes persist");
+    println!("  try [options] [backend/]pkg  Prepare a temporary app; isolated runtime by default");
+    println!("    Backends: native repos, aur, configured Sources/exports, Flatpak, Nix, Pipx");
+    println!("    AUR/Sources build dependencies stay private; backend stores retain their limits.");
     println!(
         "  history [id]                 View transaction history timeline or inspect a transaction"
     );

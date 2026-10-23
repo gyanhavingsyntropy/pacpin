@@ -454,7 +454,14 @@ pub(super) fn verify_elf(path: &Path, required: bool) -> Result<(), String> {
 }
 
 fn build(plan: &Plan, work: &Path, artifact: &Path) -> Result<PathBuf, String> {
-    if plan.recipe.format == Format::Source { return super::build::execute(plan, work, artifact); }
+    build_with_view(plan, work, artifact, None)
+}
+
+fn build_with_view(plan: &Plan, work: &Path, artifact: &Path, view: Option<&crate::execution::BuildWorkspace>) -> Result<PathBuf, String> {
+    if plan.recipe.format == Format::Source { return match view {
+        Some(view) => super::build::execute_with_view(plan, work, artifact, Some(view)),
+        None => super::build::execute(plan, work, artifact),
+    }; }
     if unsafe { libc::geteuid() } == 0 {
         return Err("Source packaging must run unprivileged, not through sudo/pkexec".into());
     }
@@ -512,6 +519,7 @@ fn build(plan: &Plan, work: &Path, artifact: &Path) -> Result<PathBuf, String> {
         .env("BUILDDIR", work)
         .env("SRCDEST", work)
         .env("LOGDEST", work);
+    if let Some(view) = view { command = view.command(command, work)?; }
     let status = crate::progress::run(&mut command, crate::progress::Manager::Sources, "Packaging verified source", || {}).map_err(|_| "Cannot launch makepkg")?;
     if !status.success() {
         return Err(format!("Local source packaging failed in {} (makepkg exit status: {status}); another process may have consumed scratch space or quota during packaging", work.display()));
@@ -541,6 +549,35 @@ fn build(plan: &Plan, work: &Path, artifact: &Path) -> Result<PathBuf, String> {
         Ok(())
     })?;
     Ok(packages[0].clone())
+}
+
+/// Own the artifact/build workspace until temporary execution finishes. This
+/// path deliberately never calls installation, pinning or transaction logging.
+pub(crate) struct TemporaryPackage {
+    _work: Workdir,
+    pub archive: PathBuf,
+}
+
+pub(crate) fn prepare_temporary(config: &Config, plan: &Plan, view: &crate::execution::BuildWorkspace) -> Result<TemporaryPackage, String> {
+    let mut work = Workdir::new_for_plan(plan, None)?;
+    download(plan, &mut work)?;
+    let artifact = prepare_build(plan, &mut work)?;
+    let archive = if plan.recipe.format == Format::Native { artifact } else {
+        build_with_view(plan, &work.0, &artifact, Some(view))?
+    };
+    crate::archive::footprint(&archive)?;
+    let manager = crate::db::AlpmManager::with_repo_order(&config.repo_order).map_err(|e| e.to_string())?;
+    let loaded = manager.handle().pkg_load(archive.to_string_lossy().as_ref(), true, alpm::SigLevel::NONE).map_err(|e| e.to_string())?;
+    validate_output(plan, &loaded)?;
+    Ok(TemporaryPackage { _work: work, archive })
+}
+
+fn validate_output(plan: &Plan, loaded: &alpm::Pkg) -> Result<(), String> {
+    if loaded.name() != plan.name || loaded.version().as_str() != plan.version
+        || !matches!(loaded.arch(), Some(arch) if arch == std::env::consts::ARCH || arch == "any") {
+        return Err("Native package identity, version, or architecture differs from the approved plan".into());
+    }
+    Ok(())
 }
 
 pub fn execute(config: &mut Config, plan: &Plan, needed: bool) -> Result<(), String> {
@@ -594,15 +631,7 @@ fn execute_inner(config: &mut Config, plan: &Plan, needed: bool, permit: Option<
             alpm::SigLevel::NONE,
         )
         .map_err(|_| "Artifact is not a valid Arch package")?;
-    if loaded.name() != plan.name
-        || loaded.version().as_str() != plan.version
-        || !matches!(loaded.arch(), Some(arch) if arch == std::env::consts::ARCH || arch == "any")
-    {
-        return Err(
-            "Native package identity, version, or architecture differs from the approved plan"
-                .into(),
-        );
-    }
+    validate_output(plan, &loaded)?;
     let installed = manager.handle().localdb().pkg(plan.name.as_str()).ok();
     if let Some(permit) = permit {
         let dependencies = loaded.depends().into_iter().map(|d| d.to_string()).collect::<Vec<_>>();

@@ -9,6 +9,8 @@ use std::sync::{Mutex, OnceLock};
 
 mod capture;
 mod resources;
+mod build_workspace;
+pub(crate) use build_workspace::{BuildWorkspace, package_mounts, readonly_runtime, supports_ro_overlay};
 pub use resources::remove_owned_tree;
 pub(crate) use capture::{capture_output, capture_output_with_limit};
 pub(crate) use capture::capture_output_observed;

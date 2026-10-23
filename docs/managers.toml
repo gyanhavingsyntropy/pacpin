@@ -64,3 +64,13 @@ no_cache_args = ["--pip-args=--no-cache-dir"]
 # [managers.nix.flags.collect-garbage]
 # command = ["nix-collect-garbage"]
 # args = [] # optional arguments added to only this manager's upgrade command
+
+# Optional temporary application export: pin run demo/app or pin try demo/app
+# This is separate from upgrade commands and never installs into the host.
+# [managers.demo]
+# adapter = "command"
+# enabled = true
+# [managers.demo.ephemeral]
+# command = ["/usr/local/bin/demo-export", "--id", "{id}", "--root", "{root}"]
+# executables = ["usr/bin/{id}"]
+# scratch_mib = 128

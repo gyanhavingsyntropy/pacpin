@@ -13,6 +13,7 @@ pub use git::Revision as GitRevision;
 use crate::config::Config;
 pub use provider::SourceProvider;
 pub use install::clear_prefetched;
+pub(crate) use install::prepare_temporary;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};

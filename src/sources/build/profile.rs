@@ -36,6 +36,7 @@ pub(super) fn run_makepkg(
     profile: &Path,
     flag: &str,
     label: &str,
+    view: Option<&crate::execution::BuildWorkspace>,
 ) -> Result<(), String> {
     let mut command = Command::new("makepkg");
     command
@@ -64,6 +65,7 @@ pub(super) fn run_makepkg(
     ] {
         command.env(key, path);
     }
+    if let Some(view) = view { command = view.command(command, work)?; }
     let status = crate::progress::run(
         &mut command,
         crate::progress::Manager::Sources,

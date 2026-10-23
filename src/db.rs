@@ -18,6 +18,8 @@ use alpm::{Alpm, SigLevel};
 use glob::Pattern;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+mod dependencies;
+pub(crate) use dependencies::package_satisfies;
 
 /// Resolve native repository targets in configured priority order. ALPM checks
 /// exact names across all eligible repositories before considering providers.

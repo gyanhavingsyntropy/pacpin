@@ -19,7 +19,7 @@
 2. **True Resolver Engine**: Synthesizes explicit qualified package targets (`repo/pkg`) instead of blind `pacman -Su` commands, preventing unexpected repository hopping.
 3. **Opt-In Vendor Stickiness**: Keep packages bound to their originating repository (`%INSTALLED_DB%`) during upgrades so they don't unexpectedly jump between sync repositories (e.g. `core` ➔ `cachyos`), displaying a distinct `[sticky]` badge in transactions.
 4. **BIOS-Style Repository Priority Menu**: Interactively reorder your system's repository search priority using arrow keys and instant promotion/demotion (`pacpin repos`).
-5. **Ephemeral Package Sandbox (`pacpin try [repo/]pkg [args...]`)**: Download and execute native Arch packages in a Bubblewrap (`bwrap`) container with unshared namespaces, read-only system mounts, private in-memory `/tmp`, SHA256 verification, and archive traversal guards. Flatpak apps use Flatpak's own sandbox; Nix and Pipx execute on the host only with explicit `pin run` or `--no-sandbox`.
+5. **Ephemeral Package Sandbox (`pacpin try [repo/]pkg [args...]`)**: Prepare native packages, explicit `aur/pkg` targets, configured `source-alias/pkg` recipes, or declared custom exports without system installation or pins. AUR/Sources builds use a private Bubblewrap filesystem view with missing dependencies extracted into the workspace. `try` isolates app execution; `run` preserves normal home/project writes. Flatpak apps use Flatpak's own sandbox; Nix and Pipx require host execution opt-in and retain their backend-specific storage limits.
 6. **Post-Upgrade Restart Inspector (`needrestart`)**: Automatically inspect running processes holding deleted `.so` libraries in RAM (`/proc/*/maps`) and verify running kernel vs installed modules (supporting Arch, CachyOS, XanMod, RT, TKG, and Bochs kernels), advising on exact service restart commands (`sudo systemctl restart <srv>`) with zero noise when nothing needs restarting.
 7. **Scrollable Checkbox TUI with Batch Shortcuts**: Interactive viewport checklist (`Space` toggle, `Enter` confirm) with one-key batch actions (`[a]` All, `[n]` None, `[p]` Pure Only, `[i]` Invert, `/` Search) for orphan management and setup.
 8. **Configurable Package Manager Integrations**: Check Flatpak, modern flake-backed Nix profiles, Pipx, and custom managers alongside Pacman/AUR. Preview exact scoped targets, stop on failed checks/transactions, and explicitly declare manager-specific flags and cleanup actions in [managers.toml](docs/managers.md).
@@ -218,8 +218,23 @@ pin -Syu --keep-going                      # continue eligible managers; report 
 pin run --use-ram extra/jq -- . input.json  # downloads + extracted files in RAM; host execution
 pin try --use-storage extra/jq -- . input.json # disk files; Bubblewrap isolation
 pin run --dry-run --use-ram extra/jq        # inspect the workspace policy without downloading
+pin run aur/hello -- --version             # review/build AUR code without installing it
+pin try source-alias/package --use-storage # configured Sources recipe, private app runtime
 pin rebuild --use-storage --no-cache --dry-run # preview declared native/AUR/Sources work
 ```
+
+Temporary AUR/Sources preparation requires installed `makepkg`, Bubblewrap with
+read-only overlay support, and Paru for AUR recipe fetching. Missing native or
+exact-name AUR dependencies are prepared privately; existing system dependencies
+are reused without changes. Ambiguous AUR virtual providers and dependency cycles
+fail explicitly. Build and runtime files follow `--use-ram`/`--use-storage`;
+`--no-cache` bypasses native archive reuse, and owned build caches are always
+discarded. Builds can still exceed estimates, and installation scripts/hooks are
+not run, so applications requiring system integration may not work temporarily.
+Normal AUR installs can still leave build dependencies installed; normal Sources
+builds still require their declared build dependencies to be installed first.
+See [temporary exports](docs/managers.md#temporary-application-exports) for other
+managers and [output persistence](docs/cli-controls.md#application-files-and-persistence).
 
 `--sources-only`, `--aur-only` and `--external-only` are mutually exclusive. Each excludes unrelated manager upgrades and native repository refresh, including when spelled `-Syu`; AUR helpers can still install required build dependencies through pacman. Keep the native system current before AUR updates. Scoped runs do not remove orphans automatically; use `pin orphans -c` separately.
 

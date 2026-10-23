@@ -7,18 +7,33 @@
         assert_eq!(super::footer_cleanup_row(18, 18, 2), 17);
     }
 
-    use super::*;
+use super::*;
+
+#[test]
+fn temporary_source_display_is_preparation_and_resets_on_all_paths() {
+    assert_eq!(display_manager(Manager::Sources), Manager::Sources);
+    temporary_source_preparation(|| {
+        assert_eq!(display_manager(Manager::Sources), Manager::Runtime);
+        assert_eq!(display_manager(Manager::Aur), Manager::Aur);
+        assert_eq!(std::thread::spawn(|| display_manager(Manager::Sources)).join().unwrap(), Manager::Sources);
+        temporary_source_preparation(|| assert_eq!(display_manager(Manager::Sources), Manager::Runtime));
+        assert_eq!(display_manager(Manager::Sources), Manager::Runtime);
+    });
+    assert_eq!(display_manager(Manager::Sources), Manager::Sources);
+    let _ = std::panic::catch_unwind(|| temporary_source_preparation(|| panic!("fixture")));
+    assert_eq!(display_manager(Manager::Sources), Manager::Sources);
+}
     #[test]
     fn build_logs_cannot_impersonate_authentication_verification_or_installation() {
-        for manager in [Manager::Aur, Manager::Sources] {
+        for manager in [Manager::Aur, Manager::Sources, Manager::Runtime] {
             for line in ["checking for a working compiler... yes", "checking password support... no", "installing headers in pkgdir", "optional feature test failed", "gcc -Dfilename=authentication.c -c source.c"] {
                 assert_eq!(phase_text(manager, line, "Building packages"), "Building packages", "{line}");
             }
             assert_eq!(phase_text(manager, "==> Starting package()...", "Building packages"), "Packaging source");
             assert_eq!(phase_text(manager, "installing staged binaries", "Packaging source"), "Packaging source");
-            assert_eq!(phase_text(manager, "==> Finished making: package 1-1", "Packaging source"), "Build complete; awaiting installation");
-            assert_eq!(phase_text(manager, "(1/1) upgrading package [####] 100%", "Packaging source"), if manager == Manager::Aur { "Installing packages (100%, 1/1)" } else { "Installing packages" });
-            assert_eq!(phase_text(manager, "==> ERROR: A failure occurred in build().", "Building packages"), "Operation failed");
+            assert_eq!(phase_text(manager, "==> Finished making: package 1-1", "Packaging source"), if manager == Manager::Runtime { "Build complete; checking artifact" } else { "Build complete; awaiting installation" });
+            assert_eq!(phase_text(manager, "(1/1) upgrading package [####] 100%", "Packaging source"), if manager == Manager::Aur { "Installing packages (100%, 1/1)" } else if manager == Manager::Runtime { "Packaging source" } else { "Installing packages" });
+            assert_eq!(phase_text(manager, "==> ERROR: A failure occurred in build().", "Building packages"), if manager == Manager::Runtime { "Preparation failed" } else { "Operation failed" });
         }
     }
     #[test]

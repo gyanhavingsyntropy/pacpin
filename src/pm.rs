@@ -14,6 +14,8 @@ use crate::db::AlpmManager;
 use crate::journal::TransactionJournal;
 
 mod cache;
+mod ephemeral;
+pub(crate) use ephemeral::{fetch_aur_recipe, aur_recipe_inputs, build_aur_archive};
 mod cache_usage;
 mod continuation;
 mod install;

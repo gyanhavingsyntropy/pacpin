@@ -241,6 +241,27 @@ pub(crate) fn extract(
     max_entries: usize,
     max_bytes: u64,
 ) -> Result<(), String> {
+    extract_inner(archive_path, target_dir, max_entries, max_bytes, false)
+}
+
+/// Native packages can use absolute links into their installation root. Rebase
+/// those links into the private root; never create a link to the host filesystem.
+pub(crate) fn extract_package(archive_path: &Path, target_dir: &Path) -> Result<(), String> {
+    extract_inner(archive_path, target_dir, crate::download::MAX_ARCHIVE_ENTRIES, crate::download::MAX_UNPACKED_BYTES, true)?;
+    crate::download::validate_symlink_traversal(target_dir, 32)
+}
+
+fn package_link(path: &Path, link: &str) -> Result<String, String> {
+    if !link.starts_with('/') { return Ok(link.into()); }
+    let target = relative_path(link.trim_start_matches('/'))?;
+    if target.as_os_str().is_empty() || link.chars().any(char::is_control) { return Err("Unsafe absolute package link".into()); }
+    let mut rebased = PathBuf::new();
+    for _ in path.parent().unwrap_or(Path::new("")).components() { rebased.push(".."); }
+    rebased.push(target);
+    rebased.into_os_string().into_string().map_err(|_| "Non-UTF-8 package link".into())
+}
+
+fn extract_inner(archive_path: &Path, target_dir: &Path, max_entries: usize, max_bytes: u64, package: bool) -> Result<(), String> {
     let metadata = fs::symlink_metadata(target_dir).map_err(|e| e.to_string())?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err("Archive extraction root must be a real directory".into());
@@ -321,7 +342,8 @@ pub(crate) fn extract(
                 header_text(la::archive_entry_pathname(entry))?.ok_or("Missing archive path")?;
             let path = relative_path(&name)?;
             let hardlink = header_text(la::archive_entry_hardlink(entry))?;
-            let symlink = header_text(la::archive_entry_symlink(entry))?;
+            let symlink = header_text(la::archive_entry_symlink(entry))?
+                .map(|link| if package { package_link(&path, &link) } else { Ok(link) }).transpose()?;
             let kind = la::archive_entry_filetype(entry);
             // Tar hardlink headers may have filetype 0 in libarchive.
             if !(matches!(kind, la::AE_IFREG | la::AE_IFDIR | la::AE_IFLNK)
@@ -355,6 +377,8 @@ pub(crate) fn extract(
                 {
                     return Err("Unsafe link target in archive".into());
                 }
+                let link = CString::new(link.as_bytes()).map_err(|_| "NUL in archive link")?;
+                la::archive_entry_set_symlink(entry, link.as_ptr());
             } else if kind == la::AE_IFLNK {
                 return Err("Missing symlink target".into());
             }
@@ -887,6 +911,41 @@ mod tests {
         let link = fixture.0.join("link");
         std::os::unix::fs::symlink(&fifo, &link).unwrap();
         assert!(extract(&link, &dest, 10, 100).is_err());
+    }
+
+    #[test]
+    fn package_absolute_links_rebase_without_weakening_source_archives() {
+        let fixture = Fixture::new();
+        let mut builder = tar::Builder::new(Vec::new());
+        add_file(&mut builder, "opt/app/app", b"executable");
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_mode(0o777); header.set_size(0); header.set_cksum();
+        builder.append_link(&mut header, "usr/bin/app", "/opt/app/app").unwrap();
+        let archive = fixture.save(&builder.into_inner().unwrap());
+        let root = fixture.destination("package");
+        extract_package(&archive, &root).unwrap();
+        assert_eq!(fs::read_link(root.join("usr/bin/app")).unwrap(), Path::new("../../opt/app/app"));
+        assert_eq!(fs::read(root.join("usr/bin/app")).unwrap(), b"executable");
+        assert!(extract(&archive, &fixture.destination("source"), 100, 4096).is_err());
+        for target in ["/../../etc/passwd", "/", "/a\n"] { assert!(package_link(Path::new("usr/bin/app"), target).is_err()); }
+    }
+
+    #[test]
+    fn rebased_package_links_still_reject_intermediate_escape_and_cycles() {
+        let fixture = Fixture::new();
+        for links in [vec![("dir/alias", "."), ("bad", "/dir/alias/../../outside")], vec![("loop", "/loop")]] {
+            let mut builder = tar::Builder::new(Vec::new());
+            for (name, link) in links {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_mode(0o777); header.set_size(0); header.set_cksum();
+                builder.append_link(&mut header, name, link).unwrap();
+            }
+            let archive = fixture.save(&builder.into_inner().unwrap());
+            let root = fixture.destination(&format!("links-{}", fs::read_dir(&fixture.0).unwrap().count()));
+            assert!(extract_package(&archive, &root).is_err());
+        }
     }
 
     #[test]

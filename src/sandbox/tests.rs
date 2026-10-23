@@ -46,11 +46,15 @@ use super::workspace::{SandboxGuard, create_secure_temp_dir, create_secure_temp_
 
     #[test]
     fn test_host_only_providers_require_explicit_opt_in() {
+        let config = crate::config::Config::default();
         for target in ["nix/fastfetch", "nixpkgs#ripgrep", "pipx/cowsay"] {
-            assert!(host_only_provider(parse_target(target).0));
+            let backend = super::routing::resolve(parse_target(target).0, &config, &[]).unwrap();
+            assert!(backend.check_options(&TryOptions::default(), crate::scratch::Policy::Auto).is_err());
         }
-        assert!(!host_only_provider(parse_target("flatpak/org.gnome.Calculator").0));
-        assert!(!host_only_provider(parse_target("extra/jq").0));
+        for target in ["flatpak/org.gnome.Calculator", "extra/jq"] {
+            let backend = super::routing::resolve(parse_target(target).0, &config, &[]).unwrap();
+            assert!(backend.check_options(&TryOptions::default(), crate::scratch::Policy::Auto).is_ok());
+        }
     }
 
     #[test]

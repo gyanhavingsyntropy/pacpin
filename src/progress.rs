@@ -40,6 +40,21 @@ static SOURCE: Mutex<SourceState> = Mutex::new(SourceState {
 });
 thread_local! { static BACKGROUND: Cell<bool> = const { Cell::new(false) }; }
 thread_local! { static SOURCE_DISPLAY: RefCell<Option<Footer>> = const { RefCell::new(None) }; }
+thread_local! { static TEMPORARY_SOURCE: Cell<bool> = const { Cell::new(false) }; }
+
+/// Reused Sources builders are preparation here, never an installed upgrade.
+/// Scope is thread-local and reset on errors/panics; concurrent upgrades retain
+/// their own Sources identity. Only the display owner maps that identity.
+pub(crate) fn temporary_source_preparation<T>(work: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset { fn drop(&mut self) { TEMPORARY_SOURCE.set(self.0); } }
+    let _reset = Reset(TEMPORARY_SOURCE.replace(true));
+    work()
+}
+
+fn display_manager(manager: Manager) -> Manager {
+    if manager == Manager::Sources && TEMPORARY_SOURCE.get() { Manager::Runtime } else { manager }
+}
 static TERMINAL: Mutex<Option<(libc::termios, u16)>> = Mutex::new(None);
 static VIEW: Mutex<Option<(u16, u16, u16)>> = Mutex::new(None);
 static SESSION_VIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -417,6 +432,7 @@ struct Footer {
 }
 impl Footer {
     fn new(manager: Manager, raw_input: bool) -> io::Result<Self> {
+        let manager = display_manager(manager);
         Self::create(manager, raw_input, true)
     }
 
@@ -703,6 +719,7 @@ pub fn run_observed(
     on_ready: impl FnMut(),
     on_line: impl FnMut(&str),
 ) -> io::Result<ExitStatus> {
+    let manager = display_manager(manager);
     let result = run_observed_with_stdin(command, manager, label, on_ready, on_line, None);
     if !result.as_ref().is_ok_and(|status| status.success()) { failed(manager); }
     result
@@ -711,6 +728,7 @@ pub fn run_observed(
 /// Preserve explicitly prepared input (e.g. approved cache-clean answers)
 /// while sharing terminal ownership, output relay and child tracking.
 pub fn run_with_stdin(command: &mut Command, manager: Manager, label: &str, stdin: Stdio) -> io::Result<ExitStatus> {
+    let manager = display_manager(manager);
     let result = run_observed_with_stdin(command, manager, label, || {}, |_| {}, Some(stdin));
     if !result.as_ref().is_ok_and(|status| status.success()) { failed(manager); }
     result

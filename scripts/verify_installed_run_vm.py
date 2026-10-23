@@ -98,7 +98,8 @@ package() {
                         if path.exists():
                             shutil.rmtree(path)
             self.case("installed-prefix-conflict", ["run", "--installed", f"pacpin-ui/{name}"], success=False, expected_error="unqualified")
-            self.case("explicit-repo-never-falls-back", ["run", f"pacpin-ui/{name}"], success=False, expected_error="not found in repository")
+            self.case("explicit-repo-never-falls-back", ["run", f"pacpin-ui/{name}"], success=False, expected_error="was not found in the selected repositories")
+            assert "PACPIN_EXEC_VERSION=" not in transcript(self.root / "explicit-repo-never-falls-back.raw.txt")
             self.case("explicit-installed-missing", ["run", "--installed", "pacpin-ui-not-installed"], success=False, expected_error="not installed")
             shutil.copyfile(archives[2], self.repo / archives[2].name)
             shutil.copyfile(dependency_archive, self.repo / dependency_archive.name)
@@ -140,7 +141,15 @@ package() {
                 frames = json.loads((self.root / f"{case}.frames.json").read_text())
                 assert any("App:" in frame and "Download" in frame and "%" in frame and "KiB" in frame for frame in frames)
                 assert "Found 2 package(s)" in text
-                self.case(f"{mode}-ram-reserve-refusal", [mode, "--use-ram", f"pacpin-ui/{name}"], success=False, expected_error="2.5 GiB OS reserve")
+                # The selected guest's allocation can change. Accept only a
+                # verified RAM execution or the explicit OS-reserve refusal.
+                case = f"{mode}-ram-policy"
+                self.case(case, [mode, "--use-ram", f"pacpin-ui/{name}"], allow_ram_refusal=True)
+                text = transcript(self.root / f"{case}.raw.txt")
+                if self.results[-1]["status"] == 0:
+                    assert "PACPIN_APP_FS=tmpfs" in text and "PACPIN_EXEC_VERSION=2" in text
+                else:
+                    assert "2.5 GiB OS reserve" in text and "PACPIN_EXEC_VERSION=" not in text
                 self.case(f"{mode}-preview-no-app-execution", [mode, "--dry-run", "--use-storage", "--no-cache", f"pacpin-ui/{name}"])
                 text = transcript(self.root / f"{mode}-preview-no-app-execution.raw.txt")
                 assert "Dry-run:" in text and "PACPIN_EXEC_VERSION" not in text and "Fetching '" not in text

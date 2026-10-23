@@ -19,8 +19,13 @@ use colored::Colorize;
 use std::process::exit;
 
 mod entrypoints;
+mod export;
 mod mounts;
 mod native;
+mod package_root;
+mod prepared;
+mod routing;
+mod launch;
 mod providers;
 mod workspace;
 #[cfg(test)]
@@ -79,41 +84,36 @@ impl TryOptions {
 
 pub fn cmd_try(target: &str, args: &[String], options: &TryOptions) {
     let (prefix, pkg) = parse_target(target);
-    if options.no_cache && matches!(prefix, Some("flatpak" | "nix" | "nixpkgs")) {
-        eprintln!("Error: --no-cache is unsupported for this run/try backend. Its installed runtime/store is not a disposable cache.");
-        exit(2);
-    }
-    if crate::scratch::policy() != crate::scratch::Policy::Auto
-        && matches!(prefix, Some("flatpak" | "nix" | "nixpkgs" | "pipx"))
-    {
-        eprintln!("Error: --use-ram/--use-storage is unsupported for {prefix:?} run/try: this backend owns its store or environment and cannot guarantee relocation. Native repository packages support these flags.");
-        exit(2);
+    if !crate::utils::is_safe_pkg_name(pkg) {
+        eprintln!("Error: invalid package identity"); exit(2);
     }
     if options.installed && prefix.is_some() {
         eprintln!("Error: --installed requires an unqualified native package name; omit the repository/provider prefix.");
         exit(2);
     }
-    if options.dry_run && matches!(prefix, Some("flatpak" | "nix" | "nixpkgs" | "pipx")) {
-        if !crate::journal::TransactionJournal::is_safe_pkg_name(pkg) {
-            eprintln!("Error: invalid package identity"); exit(2);
-        }
-        if host_only_provider(prefix) && !options.no_sandbox {
-            eprintln!("Error: Nix and Pipx require run or --no-sandbox"); exit(2);
-        }
+    let config = crate::config::load_config();
+    let repositories = if prefix.is_some() { crate::db::AlpmManager::discover_repos() } else { Vec::new() };
+    let backend = match routing::resolve(prefix, &config, &repositories) {
+        Ok(backend) => backend,
+        Err(error) => { eprintln!("Error: {error}"); exit(2); }
+    };
+    if let Err(error) = backend.check_options(options, crate::scratch::policy()) {
+        eprintln!("Error: {error}"); exit(2);
+    }
+    use routing::Backend;
+    if options.dry_run && matches!(backend, Backend::Flatpak | Backend::Nix | Backend::Pipx) {
         println!(":: Dry-run: backend {:?} would run {pkg:?} with arguments {args:?}; no command executed.{}", prefix, if options.no_cache { " Pipx environment reuse disabled." } else { "" });
         exit(0);
     }
 
-    let res = match prefix {
-        Some("flatpak") => try_flatpak(pkg, args),
-        provider if host_only_provider(provider) && !options.no_sandbox => Err(
-            "Nix and Pipx run their programs on the host. Use 'pin run' or pass --no-sandbox to opt in to host execution."
-                .to_string(),
-        ),
-        Some("nix") | Some("nixpkgs") => try_nix(pkg, args),
-        Some("pipx") => try_pipx(pkg, args, options.no_cache),
-        Some(repo) => try_pacman(Some(repo), pkg, args, options),
-        None => try_pacman(None, pkg, args, options),
+    let res = match backend {
+        Backend::Aur => prepared::try_aur(&config, pkg, args, options),
+        Backend::Flatpak => try_flatpak(pkg, args),
+        Backend::Nix => try_nix(pkg, args),
+        Backend::Pipx => try_pipx(pkg, args, options.no_cache),
+        Backend::Source(alias) => prepared::try_source(&config, alias, pkg, args, options),
+        Backend::Export(manager) => export::try_export(&config, manager, pkg, args, options),
+        Backend::Native(repo) => try_pacman(&config, repo, pkg, args, options),
     };
 
     match res {
@@ -123,8 +123,4 @@ pub fn cmd_try(target: &str, args: &[String], options: &TryOptions) {
             exit(1);
         }
     }
-}
-
-fn host_only_provider(prefix: Option<&str>) -> bool {
-    matches!(prefix, Some("nix" | "nixpkgs" | "pipx"))
 }

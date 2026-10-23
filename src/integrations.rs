@@ -113,6 +113,7 @@ fn write_flatpak_cache(path: &std::path::Path, content: &[u8]) -> std::io::Resul
 mod builtin;
 #[path = "integrations/configured.rs"]
 mod configured;
+pub(crate) use configured::export_temporary;
 pub(crate) mod preparation;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -222,7 +223,7 @@ impl IntegrationsManager {
             }
         }
         for (name, definition) in &config.manager_file.managers {
-            if definition.adapter == "command" && definition.enabled == Some(true) {
+            if definition.adapter == "command" && definition.enabled == Some(true) && !definition.upgrade.is_empty() {
                 providers.push(Arc::new(configured::Provider::new(name.clone(), definition.clone())));
             }
         }

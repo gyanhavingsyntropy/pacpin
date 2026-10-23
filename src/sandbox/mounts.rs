@@ -46,26 +46,7 @@ pub(super) fn should_bind_cwd(cwd: &Path, home: &Path) -> bool {
 }
 
 #[allow(unused_imports)]
-pub(super) fn add_host_runtime_mounts(command: &mut Command) {
-    for dir in &["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"] {
-        let path = Path::new(dir);
-        if path.exists() {
-            command.arg("--ro-bind").arg(path).arg(path);
-        }
-    }
-}
-
-pub(super) fn supports_ro_overlay() -> bool {
-    let mut probe = Command::new("bwrap");
-    probe.args(["--unshare-all", "--die-with-parent", "--new-session"]);
-    add_host_runtime_mounts(&mut probe);
-    probe.args([
-        "--overlay-src", "/usr/share", "--overlay-src", "/etc",
-        "--ro-overlay", "/usr/share", "--proc", "/proc", "--dev", "/dev",
-        "--tmpfs", "/tmp", "--", "/usr/bin/true",
-    ]);
-    crate::execution::capture_output(&mut probe).is_ok_and(|output| output.status.success())
-}
+pub(super) use crate::execution::{readonly_runtime as add_host_runtime_mounts, supports_ro_overlay};
 
 pub(super) fn add_package_data_mounts(
     command: &mut Command,

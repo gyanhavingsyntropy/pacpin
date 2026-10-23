@@ -83,6 +83,10 @@ pub(super) fn check_capacity(plan: &Plan, work: &Path) -> Result<(), String> {
 }
 
 pub(super) fn execute(plan: &Plan, work: &Path, input: &Path) -> Result<PathBuf, String> {
+    execute_with_view(plan, work, input, None)
+}
+
+pub(super) fn execute_with_view(plan: &Plan, work: &Path, input: &Path, view: Option<&crate::execution::BuildWorkspace>) -> Result<PathBuf, String> {
     if unsafe { libc::geteuid() } == 0 {
         return Err("Source compilation must run unprivileged".into());
     }
@@ -165,7 +169,7 @@ pub(super) fn execute(plan: &Plan, work: &Path, input: &Path) -> Result<PathBuf,
     for path in [work.join("tmp"), work.join("cache/cargo")] {
         fs::create_dir_all(path).map_err(|e| e.to_string())?;
     }
-    run_makepkg(work, &config_path, "--noarchive", "Compiling source code")?;
+    run_makepkg(work, &config_path, "--noarchive", "Compiling source code", view)?;
     let installed_payload = work
         .join("pkg")
         .join(&plan.name)
@@ -220,6 +224,7 @@ pub(super) fn execute(plan: &Plan, work: &Path, input: &Path) -> Result<PathBuf,
         &config_path,
         "--repackage",
         "Packaging compiled source",
+        view,
     )?;
     let packages: Vec<_> = fs::read_dir(work)
         .map_err(|e| e.to_string())?

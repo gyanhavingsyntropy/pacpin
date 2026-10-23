@@ -101,7 +101,9 @@ impl Drop for SandboxGuard {
     fn drop(&mut self) {
         unregister_cleanup_target(&self.sandbox_dir);
         if self.sandbox_dir.exists() {
-            let _ = fs::remove_dir_all(&self.sandbox_dir);
+            if let Err(error) = crate::execution::remove_owned_tree(&self.sandbox_dir) {
+                eprintln!(":: Warning: Cannot remove temporary app workspace {}: {error}", self.sandbox_dir.display());
+            }
         }
         for tarball in &self.downloaded_tarballs {
             unregister_cleanup_target(tarball);

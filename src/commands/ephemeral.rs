@@ -87,12 +87,12 @@ fn print_missing_target(mode: Mode) {
                     .bold()
             );
             eprintln!("Usage: pacpin run [options] [repo/]package [arguments...]");
-            eprintln!("Runs a native repository or installed package, Flatpak, Nix, or Pipx target on the host.");
+            eprintln!("Runs native/installed, aur/pkg, source-alias/pkg, custom exports, Flatpak, Nix or Pipx targets.");
             eprintln!();
             eprintln!("Options:");
             eprintln!("  --dry-run              Preview without downloading or starting the application");
-            eprintln!("  --no-cache             Native: bypass archive cache; Pipx: bypass environment reuse");
-            eprintln!("  --use-ram/--use-storage Keep repository downloads and extracted files in RAM/on disk");
+            eprintln!("  --no-cache             Bypass native archive reuse; build/export caches stay private; Pipx disables reuse");
+            eprintln!("  --use-ram/--use-storage Keep owned downloads/builds/package trees in RAM/on disk");
             eprintln!("  --installed            Run the installed native package instead of a repository download");
             eprintln!(
                 "  --sandbox              Run in Bubblewrap container (unsandboxed by default)"
@@ -114,12 +114,12 @@ fn print_missing_target(mode: Mode) {
                     .bold()
             );
             eprintln!("Usage: pacpin try [options] [repo/]package [arguments...]");
-            eprintln!("Runs native Arch packages in a Bubblewrap container; Flatpak uses its own sandbox.");
+            eprintln!("Runs native, aur/pkg, source-alias/pkg or declared exports in Bubblewrap; Flatpak owns its sandbox.");
             eprintln!();
             eprintln!("Options:");
             eprintln!("  --dry-run              Preview without downloading or starting the application");
-            eprintln!("  --no-cache             Native: bypass archive cache; Pipx: bypass environment reuse");
-            eprintln!("  --use-ram/--use-storage Keep repository downloads and extracted files in RAM/on disk");
+            eprintln!("  --no-cache             Bypass native archive reuse; build/export caches stay private; Pipx disables reuse");
+            eprintln!("  --use-ram/--use-storage Keep owned downloads/builds/package trees in RAM/on disk");
             eprintln!("  --installed            Test the installed native package with Bubblewrap isolation");
             eprintln!("  --no-sandbox, --bare   Bypass Bubblewrap containerization and run directly on host");
             eprintln!("  --net, --network       Share host network access (unshared by default)");

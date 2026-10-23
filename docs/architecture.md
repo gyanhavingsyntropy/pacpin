@@ -52,7 +52,15 @@ exceptions below remain explicit migration targets.
 | `execution/capture.rs` | Bounded concurrent output capture, optional stream observation, timeout and descendant cleanup; no UI policy |
 | `execution/tests.rs` | Preserved cancellation, resource-registry and bounded-capture checks |
 | `sandbox.rs` | Native/provider app routing and TryOptions facade (about 135 lines) |
-| `sandbox/native.rs` | Native app archive preparation, aggregate downloads and launch |
+| `sandbox/native.rs` | Native/installed app preparation and shared aggregate archive downloads |
+| `sandbox/package_root.rs` | Private dependency graph, capacity checks, archive identity and runtime dependency verification; no installation or pins |
+| `sandbox/routing.rs` | One typed backend identity for dispatch and scratch/cache/isolation validation; reject ambiguous prefixes |
+| `sandbox/prepared.rs`, `sandbox/export.rs` | AUR/Sources/export preparation orchestration and guard lifetimes through app exit |
+| `sandbox/launch.rs` | Shared app launch policy, runtime mounts and output persistence; preparation footer retired before app execution |
+| `progress::temporary_source_preparation` | Thread-local scoped display mapping: reused Sources operations use App/Preparing rather than an upgrade stage; reset on every exit |
+| `execution/build_workspace.rs` | Neutral command wrapper for read-only host runtime and owned writable build work; shared package overlays |
+| `pm/ephemeral.rs` | Paru recipe-only fetch, bounded declarative .SRCINFO/PKGBUILD reads and makepkg without dependency-install flags |
+| `db/dependencies.rs` | Version/provides satisfaction for loaded archive Pkg values; native selection stays in find_sync_package; final root checked by ALPM |
 | `sandbox/providers.rs` | Backend-specific Flatpak/Nix/Pipx ephemeral operations |
 | `sandbox/mounts.rs` | Bubblewrap probes and permitted host mounts |
 | `sandbox/workspace.rs` | App resource guard, private directories and conservative stale cleanup |
