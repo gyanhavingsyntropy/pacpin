@@ -23,6 +23,7 @@ use crate::utils::{is_safe_install_target, is_safe_pkg_name};
 #[derive(Default)]
 struct Snapshot {
     installed: BTreeSet<String>,
+    directories: BTreeMap<String, String>,
     repos: BTreeMap<String, BTreeSet<String>>,
     flatpak_user: BTreeMap<String, String>,
     flatpak_system: BTreeMap<String, String>,
@@ -139,7 +140,8 @@ fn make_plan(
         let (alias, name) = target.split_once('/').ok_or("Source manifest entries need alias/package")?;
         if !config.sources.get(alias).is_some_and(|s| s.packages.contains_key(name)) { return Err(format!("No source recipe for '{target}'")); }
         if !seen.insert(name.to_string()) { return Err(format!("Duplicate package '{name}'")); }
-        if !snapshot.installed.contains(name) { plan.install.push(target.clone()); }
+        let installed = if config.sources[alias].packages[name].install_dir.is_some() { snapshot.directories.get(name).is_some_and(|owner| owner == alias) } else { snapshot.installed.contains(name) };
+        if !installed { plan.install.push(target.clone()); }
         else if enforce_repos && crate::sources::owner(config, name) != Some(alias) { plan.enforce_repo.push(target.clone()); }
     }
 
@@ -151,6 +153,7 @@ fn make_plan(
             Some((repo, name)) => (Some(repo.to_string()), name),
             None => (None, value.as_str()),
         };
+        if snapshot.directories.contains_key(name) { return Err(format!("'{name}' is a directory Source; remove it explicitly before requesting native ownership")); }
         if !seen.insert(name.to_string()) {
             return Err(format!(
                 "Package '{}' appears more than once in [packages].",
@@ -387,11 +390,12 @@ pub fn cmd_rebuild(mut config: Config, args: &[String]) -> Result<(), String> {
             ));
         }
     }
-    let snapshot = collect_snapshot(&manager, &config.packages)?;
+    let mut snapshot = collect_snapshot(&manager, &config.packages)?;
+    for receipt in crate::sources::directory::inventory(&config)? { snapshot.directories.insert(receipt.package, receipt.source); }
     let plan = make_plan(&config, &snapshot, options.enforce_repos)?;
     print_plan(&plan);
     if (!plan.flatpak_user.is_empty() || !plan.flatpak_system.is_empty())
-        && (crate::scratch::policy() != crate::scratch::Policy::Auto || options.no_cache)
+        && (crate::scratch::policy() != crate::scratch::Policy::Auto || options.no_cache || crate::cleanup::temporary())
     {
         return Err("Manifest Flatpak installation does not support scratch/cache overrides. Apply the native/AUR/Sources manifest separately or omit these flags; no packages have been changed.".into());
     }
@@ -473,6 +477,10 @@ pub fn cmd_capture(config: Config, args: &[String]) -> Result<(), String> {
     }
     let glob_pins = ResolverEngine::compile_glob_pins(&config.pins);
     let mut captured = PackageManifest::default();
+    for receipt in crate::sources::directory::inventory(&config)? {
+        if manager.handle().localdb().pkg(receipt.package.as_str()).is_ok() { return Err("Directory inventory conflicts with native package ownership".into()); }
+        captured.sources.push(format!("{}/{}", receipt.source, receipt.package));
+    }
     let mut ambiguous = 0usize;
 
     for pkg in manager.handle().localdb().pkgs() {

@@ -46,6 +46,10 @@ impl Drop for Workspace {
 pub fn describe_plan(has_sources: bool, has_aur: bool) -> Option<String> {
     describe_managers(has_sources, has_aur, &[])
 }
+pub(crate) fn describe_directory_plan() -> Option<String> {
+    if policy() == Policy::Auto { return None; }
+    Some(format!("{:?} temporary downloads/builds for Sources; installed application files use their configured install_dir.", policy()))
+}
 pub fn describe_managers(has_sources: bool, has_aur: bool, external: &[&str]) -> Option<String> {
     describe_policy(policy(), has_sources, has_aur, external)
 }

@@ -76,3 +76,12 @@ Use `PATH="$HOME/.cargo/bin:$PATH"` for Rust commands. Run:
 4. Sync the release to `$HOME/.local/bin/pacpin` and verify byte equality. Preserve the `pin` symlink. Prefer atomic replacement; do not leave a failed staging file.
 
 After editing code, check the changed behavior and related modules/command paths in the user-specified disposable VM using scenarios appropriate to the change. For terminal, progress, scheduling, or manager orchestration changes, verify the actual CLI using a real terminal emulator. Unit tests or PTY recordings alone do not establish that the screen is correct. Check rendered screen and scrollback as well as command logs and installed versions. Adapt environment-specific fixtures to the selected guest while preserving their isolation and safety checks. If that VM is unavailable, continue independent checks and explicitly report VM verification as incomplete; do not silently substitute another VM.
+
+Retained source directories and cleanup policy cross installation, upgrade,
+rebuild, discovery, capture, hooks, removal and temporary execution. Inspect these
+consumers together. Reuse `preparation` for private dependencies and preserve the
+runtime-only native archive closure. Directory ownership is receipt-based;
+imports must never be moved or deleted implicitly. Verify NTFS-compatible
+current-link publication in a disposable guest when changing filesystem behavior,
+and retain cancellation/cleanup publication ordering. Cleanup flags do not
+implicitly authorize external runtime pruning or garbage collection.

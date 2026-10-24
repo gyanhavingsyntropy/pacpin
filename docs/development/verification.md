@@ -120,3 +120,13 @@ PACPIN_DISPOSABLE_VM=1 python /tmp/verify_upgrade_ui_vm.py /tmp/pacpin \
 ```
 
 Use a fresh output directory. The verifier requires a Garuda live overlay running under VirtualBox and a regular user. It temporarily replaces only the guest pacman configuration, uses an isolated guest database/cache and small fixtures, and restores the config in `finally`. Native and source transactions use real pacman/makepkg; `--aur` also builds the small real AUR `hello` package with real paru and needs Internet access. Integration executables are controlled fixtures; Pipx metadata checks use PyPI. An explicit packaging-failure fixture simulates makepkg failure. A small read interposer slows the local source artifact so resizing and interruption can be observed without large allocations. Preserve `results.json`, relevant rendered screens, and screenshots before shutting down the ephemeral live guest.
+
+For directory Sources and cleanup policy changes, run the guarded
+`scripts/verify_directory_cleanup_vm.py` in the selected guest's real Kitty
+terminal. Verify new/adopted inventories, original-byte preservation, current-link
+updates on Linux and a small guest-only NTFS3 loop filesystem, checksum failure
+and cancellation, source-only checks/upgrade, manifest capture/rebuild, removal,
+hooks, cache/temporary composition, private build dependencies absent from ALPM,
+real AUR compilation, strict/keep-going external capability behavior, failed
+cleanup, terminal restoration and owned-resource cleanup. Never adopt or upgrade
+the user's actual installation just to exercise the implementation.

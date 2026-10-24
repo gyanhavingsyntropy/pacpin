@@ -54,6 +54,9 @@ pub(super) fn resolve<'a>(
 
 impl Backend<'_> {
     pub fn check_options(self, options: &TryOptions, scratch: Policy) -> Result<(), String> {
+        if crate::cleanup::temporary() && matches!(self, Self::Flatpak | Self::Nix | Self::Pipx) {
+            return Err("--cleanup=temporary is unsupported for this backend-owned runtime/store; its retained files cannot be classified as temporary build dependencies".into());
+        }
         if options.no_cache && matches!(self, Self::Flatpak | Self::Nix) {
             return Err("--no-cache is unsupported for this run/try backend. Its installed runtime/store is not a disposable cache".into());
         }

@@ -30,6 +30,7 @@ mod pacman_config;
 mod journal;
 mod orphans;
 mod preview;
+mod preparation;
 mod privilege;
 mod progress;
 mod repo_menu;
@@ -45,6 +46,7 @@ mod utils;
 mod wizard;
 
 mod cli;
+mod cleanup;
 mod execution;
 
 pub use commands::upgrade::parse_install_flags;

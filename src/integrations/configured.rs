@@ -176,6 +176,9 @@ impl IntegrationProvider for Provider {
     }
     fn check_options(&self, policy: crate::scratch::Policy, no_cache: bool) -> Result<(), crate::runtime::OptionError> {
         use crate::runtime::OptionError;
+        if crate::cleanup::temporary() && self.definition.temporary_cleanup.is_empty() {
+            return Err(OptionError::Unsupported(format!("{} has no --cleanup=temporary contract; declare temporary_cleanup in managers.toml. Installed runtimes and store generations are preserved.", self.name)));
+        }
         if self.template_for(policy).is_empty() { return Err(OptionError::Unsupported(format!("{} does not support {policy:?} scratch; declare a matching upgrade variant in managers.toml", self.name))); }
         if no_cache && self.definition.no_cache_args.is_empty() && self.definition.cache_cleanup.is_empty() {
             return Err(OptionError::Unsupported(format!("{} does not support --no-cache; declare no_cache_args or cache_cleanup in managers.toml. Unused installed packages/generations are not caches.", self.name)));
@@ -185,7 +188,7 @@ impl IntegrationProvider for Provider {
             crate::scratch::choose(policy, footprint, 128).map_err(OptionError::Invalid)?;
         }
         let prepare = if self.preparation_policy_for(policy, no_cache) == super::preparation::Policy::BeforeStage { &self.definition.prepare[..] } else { &[] };
-        for command in [&self.definition.upgrade[..], self.template_for(policy), &self.definition.verify, &self.definition.cache_cleanup, prepare] {
+        for command in [&self.definition.upgrade[..], self.template_for(policy), &self.definition.verify, &self.definition.cache_cleanup, &self.definition.temporary_cleanup, prepare] {
             if !command.is_empty() && !crate::is_command_available(&command[0]) { return Err(OptionError::Invalid(format!("{} executable '{}' is unavailable", self.name, command[0]))); }
         }
         Ok(())
@@ -197,6 +200,7 @@ impl IntegrationProvider for Provider {
             let command = &self.definition.flags[flag].command;
             if !command.is_empty() { commands.push(UpgradeAction::Command(builtin::display(command))); }
         }
+        if crate::cleanup::temporary() { commands.push(UpgradeAction::Command(builtin::display(&self.definition.temporary_cleanup))); }
         Ok(commands)
     }
     fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> io::Result<bool> {
@@ -242,6 +246,7 @@ impl IntegrationProvider for Provider {
             let command = &self.definition.flags[flag].command;
             if !command.is_empty() && !self.run(command, "Running configured action")? { return Ok(false); }
         }
+        if crate::cleanup::temporary() && !self.run(&self.definition.temporary_cleanup, "Removing temporary resources")? { return Ok(false); }
         Ok(true)
     }
     fn cache_command_str(&self) -> Option<String> {

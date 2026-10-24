@@ -107,6 +107,12 @@ pub fn unregister_cleanup_target(path: &Path) {
     CLEANUP_TARGETS.unregister(path);
 }
 
+/// Commit an owned resource without allowing interruption cleanup to delete
+/// the newly published application. Only a short filesystem action is allowed.
+pub(crate) fn publish_cleanup_target<T>(path: &Path, action: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    CLEANUP_TARGETS.publish(path, action)
+}
+
 pub fn cleanup_active_targets() {
     CLEANUP_TARGETS.cleanup();
 }

@@ -114,3 +114,45 @@ runs retain Pipx's normal reuse policy.
 This table reviews pacpin's invocation controls. Pacman compatibility flags
 retain pacman's operation-specific rules; it does not promise a generic dry-run
 for legacy forwarded operations or migrate every legacy external command caller.
+
+## Cleanup policy
+
+`--cleanup=temporary`, `--cleanup=cache`, and `--cleanup=temporary,cache` apply
+to install, upgrade, manifest rebuild, try and run. Repeated selections compose;
+application arguments after `--` and values of other options remain untouched.
+Unknown policies and unrelated commands are rejected before work.
+
+- `cache` uses the existing scoped `--no-cache` contract. The older flag remains
+  supported. Failed-manager caches remain available for recovery.
+- `temporary` builds AUR/compiled Sources with the shared private preparation
+  engine used by try/run. Missing build dependencies, build trees and build
+  caches are temporary; existing installed dependencies are reused unchanged.
+  Only requested packages and their actual runtime dependency closure are passed
+  to pacman. Native dependencies in that closure are marked as dependencies;
+  preexisting explicit packages remain explicit. Nothing sweeps unrelated orphans.
+- Native binary installs have no temporary build dependencies. Prebuilt Sources
+  and temporary app preparation already remove their owned workspaces. App
+  output from `run` still persists normally.
+- Private AUR preparation requires Paru, makepkg and Bubblewrap read-only
+  overlays. Arbitrary helper flags and nested helper refresh/sysupgrade operations
+  are refused before installation. Full `pin -Syu --cleanup=temporary` remains
+  supported through the outer upgrade coordinator. Actual makepkg failures may
+  permit guarded `--keep-going`; capacity, cancellation, native and unknown
+  failures retain their fatal contracts.
+- External upgrades require an explicit `temporary_cleanup` command in
+  managers.toml; absence is an unsupported capability and follows the existing
+  strict/`--keep-going` preflight policy. No automatic Flatpak runtime pruning or
+  Nix garbage collection is implied. Flatpak/Nix/Pipx try/run cannot promise this
+  private dependency lifecycle and reject `temporary`; declared private exports
+  already have automatic workspace cleanup.
+
+```sh
+pin -S aur/hello --cleanup=temporary
+pin -Syu --cleanup=temporary,cache --use-ram --keep-going
+pin rebuild --cleanup=temporary --dry-run
+pin run --cleanup=temporary aur/hello -- --version
+```
+
+A Source's `install_dir` chooses a retained application container independently
+of temporary placement. It does not turn try/run into a permanent installation.
+See [directory installation and adoption](sources.md#retained-applications-on-another-filesystem).

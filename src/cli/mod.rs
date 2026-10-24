@@ -79,6 +79,10 @@ pub(crate) fn run() {
         exit(0);
     }
 
+    match crate::cleanup::parse(&mut args) {
+        Ok(policy) => crate::cleanup::initialize(policy),
+        Err(error) => { eprintln!("Error: {error}"); exit(2); }
+    }
     let cli_privilege_override = match runtime::extract_privilege_override(&mut args) {
         Ok(tool) => tool.map(str::to_string),
         Err(error) => { eprintln!("Error: {error}"); exit(2); }
@@ -168,6 +172,8 @@ pub(crate) fn run() {
     let cmd = &args[0];
     if args.as_slice() == ["config", "validate"] {
         println!(":: Configuration valid: {} manager definitions, {} Sources recipes, {} hooks.", config.manager_file.managers.len(), config.sources.len(), config.hooks.len());
+    } else if cmd == "source" {
+        if let Err(error) = crate::commands::source::run(&config, &args[1..]) { eprintln!("Error: {error}"); exit(1); }
     } else if cmd == "manager" {
         let Some(name) = args.get(1) else { eprintln!("Usage: pin manager NAME --FLAG [--dry-run] [--noconfirm]"); exit(2); };
         let flags: Vec<String> = args[2..].iter().filter(|arg| !matches!(arg.as_str(), "--dry-run" | "-n" | "--noconfirm")).cloned().collect();

@@ -6,7 +6,7 @@ use colored::Colorize;
 
 use super::{
     AurOperation, check_lock, check_package_conflicts, execute_aur, helper_privilege_args,
-    transaction_cache_cleanup, validate_aur_scratch, wait_for_lock, with_download_progress,
+    transaction_cache_cleanup, wait_for_lock, with_download_progress,
 };
 use super::validation::verify_target_and_dependencies_delay;
 use super::pinning::RepositoryPinPlan;
@@ -98,6 +98,9 @@ pub fn build_install_commands(
     };
 
     if !aur_targets.is_empty() {
+        if crate::cleanup::temporary() {
+            command_strs.push(format!("Internal: review and build AUR recipes with private dependencies; {privilege_tool} pacman -U requested packages and runtime dependencies; remove private workspace ({})", aur_targets.join(" ")));
+        } else {
         let mut cmd = vec![helper, aur_op, "--aur"];
         if privilege_tool != "sudo" && std::path::Path::new(helper).file_name().is_some_and(|name| name == "paru") {
             cmd.extend(["--sudo", privilege_tool]);
@@ -129,6 +132,7 @@ pub fn build_install_commands(
             .collect();
         s.push_str(&quoted_targets.join(" "));
         command_strs.push(s);
+        }
     }
 
     (command_strs, pacman_op, aur_op)
@@ -431,7 +435,12 @@ pub fn install(
     }
 
     let helper_flags = if aur_targets.is_empty() { Vec::new() } else { helper_privilege_args(&config.options.helper, &config.options.privilege_tool)? };
-    if !aur_targets.is_empty() { validate_aur_scratch(config, &options.forwarded_flags)?; }
+    if !aur_targets.is_empty() {
+        super::check_aur_options(config, crate::scratch::policy(), &options.forwarded_flags).map_err(|e| e.to_string())?;
+        if crate::cleanup::temporary() && (options.refresh || options.sysupgrade) {
+            return Err("Private AUR installation cannot combine refresh/sysupgrade helper operations; run a full upgrade first or use pin -Syu --cleanup=temporary".into());
+        }
+    }
     if !aur_targets.is_empty() && !options.dry_run {
         crate::preview::check_package_root_capacity(0, 0)?;
     }

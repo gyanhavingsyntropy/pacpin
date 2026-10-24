@@ -28,7 +28,7 @@
 11. **Companion Cascade Detection**: Automatically detects split packages (sharing `%BASE%`) and prefix-related dependencies when pinning or installing to prevent version desynchronization.
 12. **Transaction Snapshots & Rollback**: Logs transaction state to `~/.local/state/pacpin/history.jsonl` and enables 1-click package rollback (`pacpin rollback`) directly from the local pacman cache.
 13. **Single-Confirmation**: Prompts once before execution; passes `--noconfirm` to low-level runners (`pacman` and `paru`).
-14. **Upstream Sources (experimental)**: GitHub, GitLab, HTTPS catalogs, and local/company catalogs share declarative recipes and the same verified native-install pipeline. Recipes can package prebuilt releases or compile verified source archives/release-tagged Git unprivileged. Optimization inherits makepkg by default; CPU, level and LTO overrides are opt-in per recipe in sources.toml. Use `pin -S alias/package`; [recipes and trust limits](docs/sources.md), [source compilation and optimization](docs/source-builds.md).
+14. **Upstream Sources (experimental)**: GitHub, GitLab, HTTPS catalogs, and local/company catalogs share declarative recipes and verified installation. Optional install_dir retains relocatable apps on another drive, with receipt-based updates and explicit adoption of existing apps. Recipes can package prebuilt releases or compile verified source archives/release-tagged Git unprivileged. Optimization inherits makepkg by default; CPU, level and LTO overrides are opt-in per recipe in sources.toml. Use `pin -S alias/package`; [recipes and trust limits](docs/sources.md), [source compilation and optimization](docs/source-builds.md).
 
 ---
 
@@ -231,14 +231,14 @@ fail explicitly. Build and runtime files follow `--use-ram`/`--use-storage`;
 `--no-cache` bypasses native archive reuse, and owned build caches are always
 discarded. Builds can still exceed estimates, and installation scripts/hooks are
 not run, so applications requiring system integration may not work temporarily.
-Normal AUR installs can still leave build dependencies installed; normal Sources
-builds still require their declared build dependencies to be installed first.
+Without --cleanup=temporary, AUR installs can leave build dependencies installed; Sources
+builds require their declared build dependencies to be installed first.
 See [temporary exports](docs/managers.md#temporary-application-exports) for other
 managers and [output persistence](docs/cli-controls.md#application-files-and-persistence).
 
 `--sources-only`, `--aur-only` and `--external-only` are mutually exclusive. Each excludes unrelated manager upgrades and native repository refresh, including when spelled `-Syu`; AUR helpers can still install required build dependencies through pacman. Keep the native system current before AUR updates. Scoped runs do not remove orphans automatically; use `pin orphans -c` separately.
 
-`--use-ram` and `--use-storage` are mutually exclusive, invocation-only preferences for Sources/Paru temporary workspaces and native repository `run`/`try` files. Defaults retain automatic Sources allocation and the helper's existing AUR workspace; native `run`/`try` checks `TMPDIR` then `/var/tmp`. Forced RAM requires tmpfs, quotas/inodes and the 2.5 GiB OS reserve; it never silently falls back to disk. Forced storage requires a writable non-tmpfs filesystem, using `TMPDIR` or `/var/tmp`. No mount or filesystem repair is performed. AUR build footprints are unknown: the starting capacity check cannot guarantee a large compilation will fit. Tmpfs can also be swapped by Linux. These flags do not move already-installed files, native pacman installation downloads, helper metadata, or installed build dependencies out of root. Root installation capacity remains required. Manifest `rebuild` forwards scratch/cache policy to native/AUR/Sources installation; a manifest Flatpak installation rejects these overrides before changing packages.
+`--use-ram` and `--use-storage` are mutually exclusive, invocation-only preferences for Sources/Paru temporary workspaces and native repository `run`/`try` files. Defaults retain automatic Sources allocation and the helper's existing AUR workspace; native `run`/`try` checks `TMPDIR` then `/var/tmp`. Forced RAM requires tmpfs, quotas/inodes and the 2.5 GiB OS reserve; it never silently falls back to disk. Forced storage requires a writable non-tmpfs filesystem, using `TMPDIR` or `/var/tmp`. No mount or filesystem repair is performed. AUR build footprints are unknown: the starting capacity check cannot guarantee a large compilation will fit. Tmpfs can also be swapped by Linux. These flags do not move already-installed files, native pacman installation downloads, helper metadata, or installed build dependencies out of root. Root capacity remains required for system package installation; retained directory Sources check their destination instead. Manifest `rebuild` forwards scratch/cache policy to native/AUR/Sources installation; a manifest Flatpak installation rejects these overrides before changing packages.
 
 Paru receives a private clone directory and makepkg directory environment overrides. Successful temporary workspaces are removed; failed AUR workspaces are retained with their path for inspection (RAM contents disappear on reboot). Custom clone/makepkg/chroot/local-repository flags conflict with this policy; other helpers fail explicitly rather than ignoring the request. Sources retain their automatic temporary-workspace cleanup.
 
@@ -423,7 +423,7 @@ Building `pacpin` requires `pacman` / `libalpm`, `libarchive` (system libraries 
 sudo pacman -S --needed base-devel git rust pacman libarchive pkgconf
 ```
 
-Bubblewrap is optional until you use native `pin try` or `pin run --sandbox`.
+Bubblewrap is required for isolated try/run preparation and private dependency builds selected by `--cleanup=temporary`.
 It is not installed by `pin init`: on first use, pacpin offers to install it
 through its normal package-install workflow and verifies that isolation works.
 Without an interactive terminal (or with `--noconfirm`), a missing Bubblewrap
@@ -450,3 +450,20 @@ License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>
 This is free software: you are free to change and redistribute it.
 There is NO WARRANTY, to the extent permitted by law.
 ```
+
+### Retained applications and temporary build cleanup
+
+Source recipes can set `install_dir` to a dedicated application container on
+another drive. The stable application path is `install_dir/current`; verified
+updates switch that link atomically. `pin source adopt ALIAS/PKG --from EXISTING
+--version VERSION` references an existing app without changing or deleting its
+original files. `pin source list`, normal Sources checks/upgrades, capture/rebuild,
+hooks and removal share the receipt inventory. See [directory Sources](docs/sources.md#retained-applications-on-another-filesystem).
+
+`--cleanup=temporary` keeps newly needed AUR/compiled Sources build dependencies
+in the shared private preparation workspace and removes it after installation.
+Only requested packages and actual runtime dependencies are installed. Combine
+with `cache` (`--cleanup=temporary,cache`) for existing scoped no-cache behavior.
+Try/run already clean their private preparation; user-created app files retain
+their normal persistence. External managers require an explicit cleanup capability
+and follow strict/keep-going eligibility. See [cleanup policy](docs/cli-controls.md#cleanup-policy).

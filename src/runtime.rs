@@ -90,10 +90,24 @@ pub fn manager_flags(flags: &[String]) -> Vec<String> {
         .cloned()
         .collect()
 }
+
+/// The exact upgrade arguments admitted to preflight also reach execution.
+/// Consume invocation controls without confusing an option's value with a flag.
+pub(crate) fn upgrade_manager_flags(flags: &[String]) -> Vec<String> {
+    let flags = manager_flags(flags);
+    let mut value = false;
+    flags.into_iter().filter(|flag| {
+        if value { value = false; return true; }
+        value = crate::commands::cli::takes_value(flag);
+        !matches!(flag.as_str(), "-y" | "--refresh" | "-yy" | "-u" | "--sysupgrade" | "-uu"
+            | "-c" | "--clean" | "--autoremove" | "-n" | "--dry-run" | "--noconfirm" | "--needed"
+            | "--no-cache" | "--clean-cache")
+    }).collect()
+}
 pub fn parse(args: &mut Vec<String>) -> Result<Policy, String> {
     let upgrade = crate::commands::cli::is_upgrade_invocation(args)
         && !crate::commands::cli::is_refresh_only_invocation(args);
-    let install = args.first().is_some_and(|s| {
+    let install = crate::commands::cli::supports_preparation(args) && args.first().is_some_and(|s| {
         matches!(s.as_str(), "install" | "rebuild") || s.starts_with("-S") && s[2..].chars().all(|c| matches!(c, 'y' | 'n'))
     });
     let manager_action = args.first().is_some_and(|s| s == "manager");
@@ -268,5 +282,12 @@ mod tests {
         assert!(UpgradeScope::Aur.includes_aur());
         assert!(!UpgradeScope::Aur.includes_runner("Sources"));
         assert!(UpgradeScope::All.includes_native());
+    }
+    #[test]
+    fn upgrade_preflight_and_execution_share_only_forwarded_manager_arguments() {
+        let input = args(&["--noconfirm", "--no-cache", "--autoremove", "--keep-going", "--aur-only"]);
+        assert!(upgrade_manager_flags(&input).is_empty());
+        let input = args(&["--ignore", "--no-cache", "--overwrite", "--noconfirm", "--needed"]);
+        assert_eq!(upgrade_manager_flags(&input), args(&["--ignore", "--no-cache", "--overwrite", "--noconfirm"]));
     }
 }

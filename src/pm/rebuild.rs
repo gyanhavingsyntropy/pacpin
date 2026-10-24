@@ -5,7 +5,7 @@ pub fn validate_rebuild(config: &Config, packages: &[String]) -> Result<(), Stri
     if !super::workspace::is_paru(&config.options.helper) {
         return Err("AUR rebuild hooks currently require Paru".into());
     }
-    super::validate_aur_scratch(config, &[])?;
+    super::check_aur_options(config, crate::scratch::policy(), &[]).map_err(|e| e.to_string())?;
     let manager = AlpmManager::with_repo_order(&config.repo_order).map_err(|e| e.to_string())?;
     for name in packages {
         if !crate::utils::is_safe_pkg_name(name) || crate::sources::owner(config, name).is_some() {

@@ -41,3 +41,16 @@ plans and excludes only the failed target. Global Sources setup failures remain
 manager failures. Keep incomplete/nonzero, unknown counts, pending orphan cleanup
 and verified hook conditions consistent in both cases. Failed target metadata
 cannot enter prefetch, installation or cleanup through another result vector.
+
+- `--cleanup=temporary` is an invocation policy shared by install, upgrade, rebuild
+  and try/run; `cache` reuses no-cache. Build-only private archives must never
+  enter the native runtime installation closure. Preserve installed dependencies,
+  explicit reasons, guarded AUR build-failure continuation and actual cleanup
+  errors. External managers require an explicit temporary_cleanup capability;
+  unsupported options use the same eligibility/keep-going policy as scratch.
+- Source install_dir is a dedicated retained container with a stable current link,
+  not a relocated native database. Receipts supply discovery/version identity;
+  missing pinned paths are incomplete checks. Existing applications require
+  explicit adoption via --from into a new container and remain outside deletion
+  ownership. Review source-only/mixed discovery, upgrades, hooks, capture/rebuild,
+  removal, native rollback rejection and try/run's independent temporary semantics.

@@ -22,7 +22,6 @@ mod entrypoints;
 mod export;
 mod mounts;
 mod native;
-mod package_root;
 mod prepared;
 mod routing;
 mod launch;
@@ -64,6 +63,13 @@ pub struct TryOptions {
 }
 
 impl TryOptions {
+    pub(crate) fn preparation(&self) -> crate::preparation::Options {
+        crate::preparation::Options {
+            no_cache: self.no_cache, allow_unverified: self.allow_unverified,
+            noconfirm: self.noconfirm,
+            prefix: if self.is_run_mode { "pacpin-run" } else { "pacpin-try" },
+        }
+    }
     pub fn for_run() -> Self {
         Self {
             no_sandbox: true,

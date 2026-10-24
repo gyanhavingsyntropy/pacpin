@@ -228,7 +228,7 @@ package() {{
                 path.unlink()
         run("sudo", "-n", "pacman", "-Syy", "--noconfirm")
 
-    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello", orphan_choice=None, expect_no_orphan_prompt=False, orphans=None, cache=None, cancel_manager=None, completed_before_cache=None, cancel_marker=None, password_prompt="PACPIN_AUTH_PASSWORD:", resize_password=False, cwd=None, confirm_action=None, source_package="pacpin-ui-source", source_version="2.0.0-1", confirm_response="y"):
+    def case(self, name, args, native=False, source=False, success=True, resize=False, confirm=False, width=80, cancel=False, expected_error=None, aur=False, password=False, repeat=1, timeout=None, selection=False, selection_cancel=False, repo_menu=False, selection_wait=False, selection_delay=0.6, selection_wait_cancel=False, source_completed=False, allow_ram_refusal=False, aur_package="hello", orphan_choice=None, expect_no_orphan_prompt=False, orphans=None, cache=None, cancel_manager=None, completed_before_cache=None, cancel_marker=None, password_prompt="PACPIN_AUTH_PASSWORD:", resize_password=False, cwd=None, confirm_action=None, source_package="pacpin-ui-source", source_version="2.0.0-1", confirm_response="y", prepare_confirm=False):
         result = self.root / f"{name}.status"
         result.unlink(missing_ok=True)
         raw = self.root / f"{name}.raw.txt"
@@ -266,6 +266,7 @@ package() {{
             time.sleep(.05)
         self.rc("send-text", "--stdin", input=f"bash {shlex.quote(str(shell))}\n")
         snapshots, resized, confirmed, cancelled = [], False, False, False
+        preparation_confirmed = False
         answered_passwords = 0
         pending_password_since = None
         password_visibility_failures = []
@@ -308,6 +309,10 @@ package() {{
                 self.results.append({"case": name, "status": None, "failures": ["sudo requested authentication again in the same transaction"], "password_prompts": prompts})
                 self.rc("send-key", "ctrl+c")
                 raise AssertionError(f"{name}: sudo requested authentication again in the same transaction")
+            if prepare_confirm and not preparation_confirmed and "Proceed with temporary preparation?" in screen:
+                self.rc("send-text", "--stdin", input="y")
+                self.rc("send-key", "enter")
+                preparation_confirmed = True
             if confirm and not confirmed and "Proceed with installation?" in screen:
                 if confirm_action is not None:
                     confirm_action()
@@ -406,6 +411,8 @@ package() {{
         before, after = [self.root / f"{name}.term-{part}" for part in ["before", "after"]]
         if before.read_text() != after.read_text():
             failures.append("terminal settings not restored")
+        if prepare_confirm and not preparation_confirmed:
+            failures.append("private recipe preparation confirmation was not exercised")
         if confirm and not confirmed:
             failures.append("confirmation prompt not exercised")
         if selection and (not selection_enter or not any("Pacman: Download" in frame and "Showing " in frame for frame in snapshots)):

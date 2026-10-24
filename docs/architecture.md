@@ -378,3 +378,37 @@ checks regression and focused CLI audit are recorded in
 Typed discovery outcomes, shared continuation eligibility, scoped hooks and
 required footer skip causes are covered in
 [the discovery continuation report](verification/2026-10-17-discovery-continuation.md).
+
+## Retained Sources and private-build cleanup
+
+`preparation/` owns private dependency roots, bounded native archive fetching and
+workspace lifetime. Native try/run, AUR/Sources/export preparation and
+`pm/private_build` share it; it never imports application launching or command
+handlers. Sandbox entry-point selection remains in `sandbox/prepared`.
+`cleanup` parses invocation-only policy before ordinary option routing, preserves
+argv delimiters/values and normalizes cache intent into the existing no-cache
+lifecycle. The AUR boundary installs only the actual runtime closure of privately
+built targets. Typed makepkg build failures retain guarded continuation; arbitrary
+preparation/native errors do not become continuation permits.
+
+`sources/directory` owns configured retained installations, explicit adoption,
+removal, receipt inventory and operation preflight. `directory/storage` owns
+bounded records, canonical destinations, locks and versioned current-link
+publication. `sources/install` reuses verified downloads and payload validation;
+portable archives avoid making an Arch package. Compiled outputs reuse makepkg
+and inspected package extraction. `SourceProvider` combines native inventory with
+directory receipt inventory and retains exact per-target discovery failures.
+Capture/rebuild, source commands, hooks and removal consume this same boundary.
+Imported applications remain outside deletion ownership.
+
+`execution::publish_cleanup_target` runs one short atomic filesystem action under
+the cleanup registry lock and relinquishes resource ownership only on success.
+It must never launch a child, enter progress rendering, or recursively register
+resources while holding that lock. This prevents handled cancellation from
+removing a just-published generation. Registry tests use isolated instances.
+External `temporary_cleanup` commands remain explicit adapter capabilities;
+no manager's installed runtimes or store generations are inferred to be temporary.
+
+Upgrade capability preflight and manager execution share
+`runtime::upgrade_manager_flags`; confirmation/cache/orphan controls must never
+be mistaken for custom helper arguments. Preserve option values when filtering.

@@ -7,6 +7,7 @@ mod provider;
 mod discovery;
 mod build;
 mod git;
+pub(crate) mod directory;
 pub use build::BuildRecipe;
 pub use git::Revision as GitRevision;
 
@@ -68,6 +69,11 @@ fn prefix() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Recipe {
+    /// Retain a relocatable application outside ALPM's installation root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_dir: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub version_scheme: VersionScheme,
     /// Selection window: this many recent API pages, 20 entries per page.
     #[serde(default = "one_page")]
     pub release_pages: u32,
@@ -101,6 +107,10 @@ pub struct Recipe {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildRecipe>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VersionScheme { #[default] Semver, Arch }
 
 fn one_page() -> u32 {
     1
@@ -161,6 +171,7 @@ pub fn valid_digest(value: &str) -> bool {
 
 pub fn validate_config(config: &Config) -> Result<(), String> {
     let native = crate::db::AlpmManager::discover_repos();
+    let mut directories: Vec<&Path> = Vec::new();
     for (alias, source) in &config.sources {
         if !crate::utils::is_safe_pkg_name(alias) || alias == "aur" || native.contains(alias) {
             return Err(format!(
@@ -191,6 +202,13 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
             }
         }
         for (name, recipe) in &source.packages {
+            directory::validate(recipe)?;
+            if let Some(path) = &recipe.install_dir {
+                if directories.iter().any(|other| path.starts_with(other) || other.starts_with(path)) {
+                    return Err("Source install_dir paths cannot overlap".into());
+                }
+                directories.push(path);
+            }
             if !(1..=20).contains(&recipe.release_pages) {
                 return Err("release_pages must be between 1 and 20".into());
             }
@@ -327,15 +345,19 @@ pub fn install_targets(
         );
         build::preview(plan);
         build::check_prerequisites(config, plan, None)?;
+        directory::preflight(config, &plan.alias, &plan.name, &plan.recipe)?;
+        if let Some(path) = &plan.recipe.install_dir { println!(":: Installation directory: {} (retained, managed without pacman)", path.display()); }
     }
     if options.dry_run {
-        if let Some(description) = crate::scratch::describe_plan(true, false) { println!("Dry-Run: {description}"); }
+        let description = if plans.iter().all(|plan| plan.recipe.install_dir.is_some()) { crate::scratch::describe_directory_plan() }
+            else { crate::scratch::describe_plan(true, false) };
+        if let Some(description) = description { println!("Dry-Run: {description}"); }
         return Ok(Vec::new());
     }
     install::confirm(options.noconfirm)?;
     let mut installed = Vec::new();
     for plan in plans {
-        install::execute(config, &plan, options.needed)?;
+        install::execute(config, &plan, options.needed, options.noconfirm)?;
         installed.push(format!("{}/{}", plan.alias, plan.name));
     }
     Ok(installed)
@@ -400,7 +422,7 @@ pub fn install_direct(
         return Ok(Vec::new());
     }
     install::confirm(options.noconfirm)?;
-    install::execute(config, &plan, options.needed)?;
+    install::execute(config, &plan, options.needed, options.noconfirm)?;
     Ok(vec![format!("{}/{}", plan.alias, plan.name)])
 }
 

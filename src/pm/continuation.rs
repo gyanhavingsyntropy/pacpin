@@ -35,12 +35,12 @@ pub struct AurExecution {
 }
 
 #[derive(Default)]
-struct FailureEvidence {
+pub(super) struct FailureEvidence {
     build_failed: bool,
     native_seen: bool,
 }
 impl FailureEvidence {
-    fn observe(&mut self, line: &str) {
+    pub(super) fn observe(&mut self, line: &str) {
         let lower = line.to_lowercase();
         if line.starts_with("==> ERROR:")
             && [
@@ -71,7 +71,7 @@ impl FailureEvidence {
             self.native_seen = true;
         }
     }
-    fn verify(&self) -> Result<(), String> {
+    pub(super) fn verify(&self) -> Result<(), String> {
         if self.native_seen {
             return Err("The AUR stage invoked or failed a native installation; recovery must be assessed first".into());
         }
@@ -366,6 +366,24 @@ pub fn execute_aur(
     // AUR output sizes are unknown; retain the root reserve check at the shared
     // execution boundary as well as the native installer's own space checks.
     crate::preview::check_package_root_capacity(0, 0).map_err(io::Error::other)?;
+    if crate::cleanup::temporary() {
+        let checkpoint = if keep_going && matches!(operation, AurOperation::Install) { NativeCheckpoint::capture() }
+            else { Err("--keep-going continuation was not requested for an eligible operation".into()) };
+        return match super::private_build::aur(config, targets, options) {
+            Ok(status) => Ok(AurExecution { status, verification: Ok(()), continuation: Err("AUR stage completed successfully".into()) }),
+            Err(super::private_build::Failure::Build(error)) => {
+                use std::os::unix::process::ExitStatusExt;
+                eprintln!(":: {error}");
+                let continuation = (|| {
+                    let permit = AurBuildFailurePermit { checkpoint: checkpoint?, failed_packages: targets.iter().map(|target| target.rsplit('/').next().unwrap_or(target).to_owned()).collect(), installation_attempted: AtomicBool::new(false) };
+                    permit.validate()?;
+                    Ok(permit)
+                })();
+                Ok(AurExecution { status: ExitStatus::from_raw(1 << 8), verification: Ok(()), continuation })
+            }
+            Err(error) => Err(io::Error::other(error.to_string())),
+        };
+    }
     let checkpoint = if !keep_going {
         Err("--keep-going was not requested".into())
     } else if !super::workspace::is_paru(&config.options.helper)

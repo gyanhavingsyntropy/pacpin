@@ -34,6 +34,11 @@ pub(super) fn check_prerequisites(
     if !crate::is_command_available("makepkg") {
         return Err("Source builds require makepkg".into());
     }
+    if crate::cleanup::temporary() {
+        // Declared tools/dependencies will be resolved in the shared private
+        // build root before any compiler or native installation is started.
+        return crate::preparation::check_capability();
+    }
     let manager =
         crate::db::AlpmManager::with_repo_order(&config.repo_order).map_err(|e| e.to_string())?;
     let missing: Vec<_> = build

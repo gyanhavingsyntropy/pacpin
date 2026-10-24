@@ -1,8 +1,6 @@
 //! App workspace lifetime and conservative stale-workspace cleanup.
 use std::{env, fs};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-use crate::execution::{register_cleanup_target, unregister_cleanup_target};
 
 pub fn clean_stale_sandboxes() {
     if let Ok(xdg_runtime) = env::var("XDG_RUNTIME_DIR") {
@@ -29,7 +27,7 @@ pub fn clean_stale_sandboxes() {
         for entry in entries.flatten() {
             let p = entry.path();
             if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if (name.starts_with("pacpin-run-") || name.starts_with("pacpin-try-"))
+                if (name.starts_with("pacpin-run-") || name.starts_with("pacpin-try-") || name.starts_with("pacpin-build-"))
                     && p.is_dir()
                     && should_clean_stale_sandbox(&p)
                 {
@@ -54,7 +52,7 @@ pub(super) fn should_clean_stale_sandbox(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    if !name.starts_with("pacpin-run-") && !name.starts_with("pacpin-try-") {
+    if !name.starts_with("pacpin-run-") && !name.starts_with("pacpin-try-") && !name.starts_with("pacpin-build-") {
         return false;
     }
     if let Some((_, suffix)) = name.rsplit_once("-pid") {
@@ -75,44 +73,7 @@ pub(super) fn should_clean_stale_sandbox(path: &Path) -> bool {
         .is_some_and(|age| age >= std::time::Duration::from_secs(24 * 60 * 60))
 }
 
-pub(super) struct SandboxGuard {
-    pub(super) sandbox_dir: PathBuf,
-    pub(super) downloaded_tarballs: Vec<PathBuf>,
-}
-
-impl SandboxGuard {
-    pub fn new(sandbox_dir: PathBuf) -> Self {
-        register_cleanup_target(sandbox_dir.clone());
-        Self {
-            sandbox_dir,
-            downloaded_tarballs: Vec::new(),
-        }
-    }
-
-    pub fn register_tarball(&mut self, tarball: &Path) {
-        let p = tarball.to_path_buf();
-        if self.downloaded_tarballs.contains(&p) {
-            register_cleanup_target(p);
-        }
-    }
-}
-
-impl Drop for SandboxGuard {
-    fn drop(&mut self) {
-        unregister_cleanup_target(&self.sandbox_dir);
-        if self.sandbox_dir.exists() {
-            if let Err(error) = crate::execution::remove_owned_tree(&self.sandbox_dir) {
-                eprintln!(":: Warning: Cannot remove temporary app workspace {}: {error}", self.sandbox_dir.display());
-            }
-        }
-        for tarball in &self.downloaded_tarballs {
-            unregister_cleanup_target(tarball);
-            if tarball.exists() {
-                let _ = fs::remove_file(tarball);
-            }
-        }
-    }
-}
+pub(super) use crate::preparation::{SandboxGuard, create_secure_temp_dir_in};
 
 #[cfg(test)]
 pub(super) fn create_secure_temp_dir(prefix: &str) -> Result<PathBuf, String> {
@@ -121,38 +82,6 @@ pub(super) fn create_secure_temp_dir(prefix: &str) -> Result<PathBuf, String> {
         .and_then(|runtime| private_runtime_subdir(Path::new(&runtime), sub).ok())
         .unwrap_or_else(env::temp_dir);
     create_secure_temp_dir_in(prefix, &base_dir)
-}
-
-pub(super) fn create_secure_temp_dir_in(prefix: &str, base_dir: &Path) -> Result<PathBuf, String> {
-
-    #[cfg(unix)]
-    use std::os::unix::fs::DirBuilderExt;
-
-    for _ in 0..100 {
-        let mut random_bytes = [0u8; 16];
-        if let Ok(mut f) = fs::File::open("/dev/urandom") {
-            use std::io::Read;
-            let _ = f.read_exact(&mut random_bytes);
-        } else {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let pid = std::process::id() as u128;
-            random_bytes = (nanos ^ (pid << 64)).to_le_bytes();
-        }
-        let hex = random_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-        let target = base_dir.join(format!("{}-pid{}-{}", prefix, std::process::id(), hex));
-
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        builder.mode(0o700);
-
-        if builder.create(&target).is_ok() {
-            return Ok(target);
-        }
-    }
-    Err("Failed to create secure sandbox directory with exclusive permissions".to_string())
 }
 
 #[cfg(test)]

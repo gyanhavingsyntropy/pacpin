@@ -216,7 +216,7 @@ pub fn cmd_upgrade(
     }
     let no_cache = config.options.no_cache
         || extra_flags.iter().any(|flag| flag == "--no-cache" || flag == "--clean-cache");
-    let manager_flags = crate::runtime::manager_flags(extra_flags);
+    let manager_flags = crate::runtime::upgrade_manager_flags(extra_flags);
     let actionable = !res.updates.is_empty() || !external_updates.is_empty()
         || requested_targets.items.iter().any(|item| item.status != RequestedStatus::AlreadyCurrent);
     let aur_preflight = if actionable { preflight::aur_targets(&res, &requested_targets) } else { Vec::new() };
@@ -448,28 +448,7 @@ pub fn cmd_upgrade(
         );
     }
 
-    let forwarded_pacman_flags: Vec<&str> = manager_flags
-        .iter()
-        .filter(|f| {
-            let s = f.as_str();
-            s != "-y"
-                && s != "--refresh"
-                && s != "-yy"
-                && s != "-u"
-                && s != "--sysupgrade"
-                && s != "-uu"
-                && s != "-c"
-                && s != "--clean"
-                && s != "--autoremove"
-                && s != "-n"
-                && s != "--dry-run"
-                && s != "--noconfirm"
-                && s != "--needed"
-                && s != "--no-cache"
-                && s != "--clean-cache"
-        })
-        .map(|s| s.as_str())
-        .collect();
+    let forwarded_pacman_flags: Vec<&str> = manager_flags.iter().map(String::as_str).collect();
 
     if !aur_targets.is_empty() {
         if let Err(error) = pm::helper_privilege_args(&config.options.helper, &config.options.privilege_tool) {
@@ -514,7 +493,12 @@ pub fn cmd_upgrade(
     }
 
     let external_scratch: Vec<_> = ext_providers.iter().filter(|p| p.name() != "Sources" && external_updates.iter().any(|u| u.runner == p.name())).map(|p| p.name()).collect();
-    if let Some(description) = crate::scratch::describe_managers(external_updates.iter().any(|u| u.runner == "Sources"), !aur_targets.is_empty() || hook_plan.has_aur(), &external_scratch) { println!(":: {description}"); }
+    let directories_only = !external_updates.is_empty() && external_updates.iter().all(|update| update.runner == "Sources" && crate::sources::directory::target(config, &update.id).is_some())
+        && aur_targets.is_empty() && !hook_plan.has_aur() && external_scratch.is_empty();
+    let description = if directories_only { crate::scratch::describe_directory_plan() } else {
+        crate::scratch::describe_managers(external_updates.iter().any(|u| u.runner == "Sources"), !aur_targets.is_empty() || hook_plan.has_aur(), &external_scratch)
+    };
+    if let Some(description) = description { println!(":: {description}"); }
     execution_plan.render(dry_run);
     if dry_run {
         if keep_going { println!("Dry-Run: --keep-going skips failed manager discovery and unsupported options, and permits independent Sources after a verified AUR build failure; skipped or failed work keeps the run unsuccessful."); }

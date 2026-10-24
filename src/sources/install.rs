@@ -457,17 +457,7 @@ fn build(plan: &Plan, work: &Path, artifact: &Path) -> Result<PathBuf, String> {
     build_with_view(plan, work, artifact, None)
 }
 
-fn build_with_view(plan: &Plan, work: &Path, artifact: &Path, view: Option<&crate::execution::BuildWorkspace>) -> Result<PathBuf, String> {
-    if plan.recipe.format == Format::Source { return match view {
-        Some(view) => super::build::execute_with_view(plan, work, artifact, Some(view)),
-        None => super::build::execute(plan, work, artifact),
-    }; }
-    if unsafe { libc::geteuid() } == 0 {
-        return Err("Source packaging must run unprivileged, not through sudo/pkexec".into());
-    }
-    if !crate::is_command_available("makepkg") {
-        return Err("Source packaging requires makepkg (pacman package); install it first".into());
-    }
+pub(super) fn unpack_payload(plan: &Plan, work: &Path, artifact: &Path) -> Result<PathBuf, String> {
     let payload = work.join("payload");
     fs::create_dir(&payload).map_err(|e| e.to_string())?;
     fs::set_permissions(&payload, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
@@ -493,6 +483,7 @@ fn build_with_view(plan: &Plan, work: &Path, artifact: &Path, view: Option<&crat
             return Err("Declared binary escapes payload root or is not a file".into());
         }
         verify_elf(&binary, false)?;
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
     }
     let provenance = serde_json::json!({"schema":1,"source":plan.alias,"package":plan.name,"tag":plan.tag,"version":plan.version,"sha256":plan.asset.sha256});
     // create_new: reject an archive supplied provenance file/symlink.
@@ -509,6 +500,21 @@ fn build_with_view(plan: &Plan, work: &Path, artifact: &Path, view: Option<&crat
     // Integrity and executable validation are complete. Release the download
     // before makepkg writes the output package, keeping the peak smaller.
     fs::remove_file(artifact).map_err(|e| format!("Cannot release verified source artifact: {e}"))?;
+    Ok(root)
+}
+
+fn build_with_view(plan: &Plan, work: &Path, artifact: &Path, view: Option<&crate::execution::BuildWorkspace>) -> Result<PathBuf, String> {
+    if plan.recipe.format == Format::Source { return match view {
+        Some(view) => super::build::execute_with_view(plan, work, artifact, Some(view)),
+        None => super::build::execute(plan, work, artifact),
+    }; }
+    if unsafe { libc::geteuid() } == 0 {
+        return Err("Source packaging must run unprivileged, not through sudo/pkexec".into());
+    }
+    if !crate::is_command_available("makepkg") {
+        return Err("Source packaging requires makepkg (pacman package); install it first".into());
+    }
+    let root = unpack_payload(plan, work, artifact)?;
     // This is a locally generated, quoted recipe. No upstream PKGBUILD or install script executes.
     fs::write(work.join("PKGBUILD"), pkgbuild(plan, &root)).map_err(|e| e.to_string())?;
     let mut command = Command::new("makepkg");
@@ -580,26 +586,79 @@ fn validate_output(plan: &Plan, loaded: &alpm::Pkg) -> Result<(), String> {
     Ok(())
 }
 
-pub fn execute(config: &mut Config, plan: &Plan, needed: bool) -> Result<(), String> {
-    execute_inner(config, plan, needed, None)
+fn private_build_options(config: &Config, noconfirm: bool) -> crate::preparation::Options {
+    crate::preparation::Options { no_cache: crate::cleanup::cache() || config.options.no_cache, allow_unverified: false, noconfirm, prefix: "pacpin-build" }
+}
+
+fn private_build_root<'a>(config: &'a Config, plan: &Plan, options: &'a crate::preparation::Options) -> Result<Option<crate::preparation::PackageRoot<'a>>, String> {
+    if !crate::cleanup::temporary() || plan.recipe.build.is_none() { return Ok(None); }
+    let build = plan.recipe.build.as_ref().unwrap();
+    let mut root = crate::preparation::PackageRoot::new(config, &plan.name, options, build.initial_bytes())?;
+    let mut dependencies = build.makedepends.clone();
+    dependencies.extend(plan.recipe.depends.clone());
+    crate::progress::package_preparation(crate::progress::Manager::Sources, || root.ensure_dependencies(&dependencies))?;
+    Ok(Some(root))
+}
+
+/// Extract portable releases directly on their destination filesystem. This
+/// avoids compressing a full Arch package merely to unpack it again.
+pub(super) fn directory_payload(config: &Config, plan: &Plan, stage: &Path, noconfirm: bool) -> Result<PathBuf, String> {
+    let preparation = private_build_options(config, noconfirm);
+    let mut private = private_build_root(config, plan, &preparation)?;
+    let (mut work, artifact) = if let Some(prefetched) = take_prefetched(plan) {
+        (prefetched.work, prefetched.artifact)
+    } else {
+        let mut work = Workdir::new_for_plan(plan, None)?;
+        let artifact = download(plan, &mut work)?;
+        (work, artifact)
+    };
+    if plan.recipe.format == Format::Source {
+        let input = prepare_build(plan, &mut work)?;
+        let package = build_with_view(plan, &work.0, &input, private.as_ref().map(|root| &root.view))?;
+        let (bytes, inodes) = crate::archive::footprint(&package)?;
+        check_destination_capacity(stage, bytes, inodes)?;
+        crate::archive::extract_package(&package, stage)?;
+        if let Some(root) = private.as_mut() { root.cleanup(crate::progress::Manager::Sources)?; }
+        return Ok(stage.join("opt").join(&plan.name));
+    }
+    let (bytes, inodes) = if plan.recipe.format == Format::Archive { crate::archive::footprint(&artifact)? }
+        else { (fs::metadata(&artifact).map_err(|e| e.to_string())?.len(), 1) };
+    check_destination_capacity(stage, bytes, inodes)?;
+    crate::progress::operation(crate::progress::Manager::Sources, "Extracting application directory", || unpack_payload(plan, stage, &artifact))
+}
+
+fn check_destination_capacity(path: &Path, bytes: u64, inodes: u64) -> Result<(), String> {
+    let space = capacity(path)?;
+    let memory = mem_available_bytes().unwrap_or(0);
+    if fits(space, bytes.saturating_add(BUILD_RESERVE), inodes.saturating_add(16), memory) { Ok(()) }
+    else { Err(format!("Insufficient installation-directory capacity: {}", crate::scratch::describe(space, bytes, inodes, memory))) }
+}
+
+pub fn execute(config: &mut Config, plan: &Plan, needed: bool, noconfirm: bool) -> Result<(), String> {
+    execute_inner(config, plan, needed, None, noconfirm)
 }
 pub fn execute_independent(config: &mut Config, plan: &Plan, permit: &crate::pm::AurBuildFailurePermit) -> Result<(), String> {
-    execute_inner(config, plan, true, Some(permit))
+    execute_inner(config, plan, true, Some(permit), true)
 }
-fn execute_inner(config: &mut Config, plan: &Plan, needed: bool, permit: Option<&crate::pm::AurBuildFailurePermit>) -> Result<(), String> {
+fn execute_inner(config: &mut Config, plan: &Plan, needed: bool, permit: Option<&crate::pm::AurBuildFailurePermit>, noconfirm: bool) -> Result<(), String> {
     // Revalidate even cached plans; never bypass policy at the privilege boundary.
     validate_config(config)?;
     if !plan.persist_source && config.sources.get(&plan.alias) != Some(&plan.source) {
         return Err("Source configuration changed after planning; check again".into());
     }
-    crate::pm::check_lock()?;
     super::build::check_prerequisites(config, plan, permit)?;
+    if plan.recipe.install_dir.is_some() {
+        return super::directory::execute(config, plan, needed, permit, noconfirm);
+    }
+    crate::pm::check_lock()?;
     if let Some(permit) = permit {
         permit.validate()?;
         let manager = crate::db::AlpmManager::with_repo_order(&config.repo_order).map_err(|e| e.to_string())?;
         crate::pm::ensure_independent(&manager, &plan.name, &plan.recipe.depends, permit.failed_packages())?;
     }
     crate::preview::check_package_root_capacity(0, 0)?;
+    let preparation = private_build_options(config, noconfirm);
+    let mut private = private_build_root(config, plan, &preparation)?;
     let (mut work, artifact) = if let Some(prefetched) = take_prefetched(plan) {
         println!(
             ":: Using prefetched artifact for {}/{} ({})",
@@ -619,7 +678,8 @@ fn execute_inner(config: &mut Config, plan: &Plan, needed: bool, permit: Option<
         artifact
     } else {
         let artifact = crate::progress::operation(crate::progress::Manager::Sources, "Checking source build space", || prepare_build(plan, &mut work))?;
-        build(plan, &work.0, &artifact)?
+        if let Some(root) = &private { build_with_view(plan, &work.0, &artifact, Some(&root.view))? }
+        else { build(plan, &work.0, &artifact)? }
     };
     let manager =
         crate::db::AlpmManager::with_repo_order(&config.repo_order).map_err(|e| e.to_string())?;
@@ -653,6 +713,11 @@ fn execute_inner(config: &mut Config, plan: &Plan, needed: bool, permit: Option<
         crate::pm::continuation_archive_check(config, &package, &plan.name)?;
         permit.begin_source_install()?;
     }
+    let status = if let Some(root) = private.as_mut() {
+        root.add_archive(&package, &plan.name)?;
+        let archives = root.installation_archives(std::slice::from_ref(&package))?;
+        crate::pm::install_archives(config, &archives, std::slice::from_ref(&plan.name), needed, noconfirm, crate::progress::Manager::Sources)?
+    } else {
     let mut command = crate::privilege::command(&config.options.privilege_tool);
     command.args(["pacman", "-U", "--noconfirm"]);
     command.args(crate::progress::pacman_progress_args());
@@ -660,9 +725,10 @@ fn execute_inner(config: &mut Config, plan: &Plan, needed: bool, permit: Option<
         command.arg("--needed");
     }
     command.arg("--").arg(&package);
-    if !crate::progress::run(&mut command, crate::progress::Manager::Sources, "Installing source package", || {})
+    crate::progress::run(&mut command, crate::progress::Manager::Sources, "Installing source package", || {})
         .map_err(|_| "Cannot launch native package transaction")?
-        .success()
+    };
+    if !status.success()
     {
         return Err("Native source package transaction failed; package files may already have changed. Check the package before retrying".into());
     }
@@ -677,6 +743,8 @@ fn execute_inner(config: &mut Config, plan: &Plan, needed: bool, permit: Option<
         return Err("Pacman did not install the approved version (possibly held by IgnorePkg); source ownership was not saved".into());
     }
     drop(fresh);
+    if let Some(root) = private.as_mut() { root.cleanup(crate::progress::Manager::Sources)?; }
+    drop(private);
     // Persist ownership only after pacman's successful transaction.
     config.pins.insert(plan.name.clone(), plan.alias.clone());
     crate::config::mutate_config(|current| {

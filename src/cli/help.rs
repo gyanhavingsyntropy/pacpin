@@ -19,6 +19,8 @@ pub(super) fn print_help() {
     println!("      -y, --refresh            Refresh sync databases with the selected privilege tool");
     println!("      -c, --clean              Prompt to clean all orphans during upgrade");
     println!("      --no-cache               Clean caches for successful native/AUR transactions");
+    println!("      --cleanup=POLICY         temporary, cache, or temporary,cache; shared by install/upgrade/rebuild/try/run");
+    println!("                               temporary keeps AUR/compiled Sources build dependencies private");
     println!("      --sources-only           Upgrade configured Sources only");
     println!("      --aur-only               Upgrade AUR targets only (build dependencies may use pacman)");
     println!("      --external-only          Upgrade enabled external managers only");
@@ -31,6 +33,8 @@ pub(super) fn print_help() {
     println!("  -S [flags] [repo/]pkg        Install packages (auto-pins repo/pkg with companion cascade)");
     println!("  -S github:owner/project      Install a reviewed direct upstream release (--channel alpha)");
     println!("  -S source-alias/pkg          Install a configured upstream release (see docs/sources.md)");
+    println!("  source list                 List retained directory Sources (install_dir in sources.toml)");
+    println!("  source adopt alias/pkg      Reference an existing app: --from PATH --version VERSION");
     println!("  -Sp, --print-uris <pkg...>   Print package and dependency download URIs");
     println!("  -Sl, --list [repo...]        List packages in sync repositories");
     println!("  -Sg, --groups [group...]     List package groups or packages in a group");

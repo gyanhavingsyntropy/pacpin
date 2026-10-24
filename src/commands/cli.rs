@@ -4,6 +4,27 @@ pub(crate) fn takes_value(arg: &str) -> bool {
     matches!(arg, "--ignore" | "--ignoregroup" | "--config" | "--cachedir" | "--root" | "-r" | "--dbpath" | "-b" | "--logfile" | "--gpgdir" | "--hookdir" | "--overwrite" | "--assume-installed" | "--color" | "--arch" | "--print-format" | "--channel")
 }
 
+/// Shared role classification for preparation/cleanup controls. Values and
+/// explicit targets are not manager-operation selectors.
+pub(crate) fn supports_preparation(args: &[String]) -> bool {
+    let Some(command) = args.first() else { return false; };
+    if matches!(command.as_str(), "install" | "upgrade" | "up" | "rebuild" | "try" | "run") { return true; }
+    if is_refresh_only_invocation(args) { return false; }
+    if is_upgrade_invocation(args) { return true; }
+    if !command.starts_with("-S") || !command[2..].chars().all(|c| matches!(c, 'y' | 'n')) { return false; }
+    let mut value = false;
+    for arg in &args[1..] {
+        if value { value = false; continue; }
+        if arg == "--" { break; }
+        value = takes_value(arg);
+        if matches!(arg.as_str(), "--search" | "--info" | "--downloadonly" | "--print" | "--print-uris" | "--list" | "--groups" | "--clean")
+            || arg.starts_with('-') && !arg.starts_with("--") && arg[1..].chars().any(|c| "siwplgc".contains(c)) {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn parse_pacman_cli_args(args: &[String]) -> (Vec<String>, Vec<String>) {
     let mut targets = Vec::new();
     let mut flags = Vec::new();
@@ -152,4 +173,21 @@ pub fn pacman_files_needs_sudo(args: &[String]) -> bool {
             false
         }
     })
+}
+
+#[cfg(test)]
+mod preparation_role_tests {
+    use super::*;
+    fn args(values: &[&str]) -> Vec<String> { values.iter().map(|value| (*value).into()).collect() }
+    #[test]
+    fn excludes_queries_download_only_and_refresh_but_preserves_values_and_targets() {
+        for values in [vec!["-Sy"], vec!["-S", "--downloadonly", "app"], vec!["-Syu", "-w"], vec!["-Ss", "app"], vec!["-S", "-i", "app"]] {
+            assert!(!supports_preparation(&args(&values)), "{values:?}");
+        }
+        for values in [vec!["-S", "--ignore", "--downloadonly", "app"], vec!["-S", "--", "--search"], vec!["-Syu"], vec!["rebuild"], vec!["run", "app", "--", "--info"]] {
+            assert!(supports_preparation(&args(&values)), "{values:?}");
+        }
+        let mut input = args(&["-S", "--downloadonly", "app", "--no-cache"]);
+        assert!(crate::runtime::parse(&mut input).is_err());
+    }
 }

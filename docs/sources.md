@@ -1,7 +1,7 @@
 # Upstream release sources and builds (experimental)
 
 GitHub, GitLab, HTTPS catalogs, and local catalogs share one release-selection,
-verification, packaging, and installation pipeline. A configured alias is used
+verification and installation boundaries; optional install_dir selects retained directory installation. A configured alias is used
 in `pin -S alias/package`. Direct provider targets use the same `provider:target`
 shape as `flatpak:remote`: no hand-written alias is needed for reviewed recipes.
 Signed Arch repositories still use pacman.conf/ALPM,
@@ -84,7 +84,7 @@ pin -Syu
 This uses the full bundle, not just an executable. Recipes must match actual
 archive layouts; optional `root = "app-directory"` selects a nested payload.
 Successful installation saves an exact source pin. Source ownership remains
-active even when native repository pinning is disabled. `pin unpin` relinquishes it.
+active even when native repository pinning is disabled. For native-packaged Sources, `pin unpin` relinquishes it. Directory Sources retain receipt inventory independently; unpinning is not removal or migration.
 
 ## GitLab/company instances
 
@@ -152,7 +152,7 @@ adapter; no company-specific updater is necessary.
 
 ## Common recipe options
 
-- `format = "archive"`: tar with libarchive-supported compression. Payload is
+- `format = "archive"`: tar with libarchive-supported compression. Without install_dir, payload is
   installed under `/opt/<package>` with declared `/usr/bin` links. No downloaded
   PKGBUILD or install script executes during packaging.
 - `format = "binary"`: ELF executable/ELF AppImage; use
@@ -173,7 +173,8 @@ adapter; no company-specific updater is necessary.
 - `tag` fixes a release. Explicit `sha256` requires a fixed tag. Otherwise a
   digest from the API, catalog, or checksum-file asset is mandatory.
 - Builds use unprivileged system `makepkg`; dependencies, conflicts, hooks,
-  database locks, and installation remain pacman's responsibility.
+  database locks, and native installation remain pacman's responsibility. Directory
+  applications use receipt inventory and their own publication lock.
 
 ## Declarative rebuilding and update checks
 
@@ -210,6 +211,100 @@ are cleaned on normal exit and SIGINT/SIGTERM, not guaranteed after SIGKILL/powe
 
 Install sources separately from native/AUR targets. Explicit source installs
 reject native transaction/refresh/sysupgrade flags; `pin -Syu` is the combined
-update workflow. ZIP files, remote compilation/scripts, non-semantic version
-ordering, signature-policy configuration, and private cross-origin token
+update workflow. ZIP files, remotely supplied build commands, signature-policy
+configuration, and private cross-origin token
 downloads are not supported in this initial implementation.
+
+## Retained applications on another filesystem
+
+Set `install_dir` in a configured package recipe to install a relocatable
+application without pacman. This supports `archive`, `binary` and compiled
+`source` recipes; native package relocation is deliberately unsupported.
+The entire payload is retained, not just the declared executable.
+
+```toml
+[sources.portable]
+kind = "github"
+[sources.portable.packages.myapp]
+project = "owner/project"
+asset = "myapp-{arch}.tar.xz"
+format = "archive"
+root = "myapp"                 # omit when the archive already has the right root
+binaries = { myapp = "bin/myapp" }
+install_dir = "/mnt/apps/myapp" # dedicated, initially absent application container
+# checksum_asset = "SHA256SUMS" # needed if the API has no artifact digest
+```
+
+```sh
+pin -S portable/myapp --dry-run
+pin -S portable/myapp
+pin source list
+pin upgrade --sources-only
+pin -R portable/myapp --dry-run
+```
+
+The executable is `/mnt/apps/myapp/current/bin/myapp`. Versions live beneath
+`install_dir/versions`; `current` is a relative symlink switched atomically only
+after verification. This works without directory-exchange support, including on
+NTFS3. Symlink support, execute permissions, writable space, quotas and archive
+layout still have to work on the chosen filesystem. Filesystem support does not
+establish that every upstream application works on that filesystem.
+
+The parent must already exist, be owned by the invoking user, and use its
+canonical path. Installation directories must not overlap each other or protected
+system directories. Runtime dependencies must already be installed; directory
+installation never automatically installs dependencies or runs native hooks,
+scriptlets, services or desktop/Steam registration. Use a relocatable upstream
+build and register its `current` path with the consuming application yourself.
+Do not create a second manager definition for the same installation. ALPM does
+not register directory apps as dependency consumers. If a native runtime is needed
+only by a directory app, keep it explicit (`pin keep PACKAGE`) so native orphan
+cleanup does not consider it unused.
+
+Receipt and container records bind source identity, destination and payload inode.
+Update discovery reads these records rather than the pacman database. Successful
+installs/adoptions retain a source pin; a missing mounted drive or missing receipt
+for a pinned directory is an incomplete check, not “no updates.” `--keep-going`
+can exclude the failed target while healthy Sources continue. Removal revalidates
+ownership and deletes only the dedicated container. Native and directory targets
+must be removed separately. `capture`, manifest `rebuild`, Sources scope, history
+and version-change hooks include directory applications. Native cache rollback
+cannot restore them. Installed trees are managed package files; keep personal
+settings/documents outside the version directories.
+
+### Reference an existing installation
+
+Choose a **new** dedicated `install_dir`, then explicitly adopt the existing app:
+
+```sh
+pin source adopt portable/myapp --from /mnt/existing/myapp --version 1.2.3-1 --dry-run
+pin source adopt portable/myapp --from /mnt/existing/myapp --version 1.2.3-1
+```
+
+Adoption checks declared executables and records the supplied version, but does
+not claim upstream checksum verification. It creates a new container whose
+`current` link references the existing app. The original directory receives no
+files, is not moved, and is never deleted by updates, cleanup or removal of the
+new container. After the next update, `current` selects a verified managed version;
+the original remains yours to remove separately. Existing unmanaged destinations
+are refused even with `--noconfirm`. Symlinked `--from` paths are resolved once.
+
+### Vendor release versions, including Proton-CachyOS
+
+Semantic versions remain the default. For portable releases using date/vendor
+tags, opt in to `version_scheme = "arch"`, set `version_prefix`, and filter the
+variant with `tag_pattern`. For example Proton-CachyOS's `cachyos-…-slr` tags can
+use `version_prefix = "cachyos-"` and `tag_pattern = "cachyos-*-slr"`.
+Hyphens in the remaining version become dots and `-1` is appended:
+`11.0-20261020-slr` becomes `11.0.20261020.slr-1`. Selection uses ALPM version
+ordering; normalization collisions are refused. This option requires
+`install_dir` and a stable/prerelease channel. Asset patterns still receive the
+unmodified stripped tag as `{version}`. Select an asset matching your CPU and
+verify the archive root/executable mappings against that specific variant.
+
+`--use-ram`/`--use-storage` select temporary download/build files, independently of
+`install_dir`. Archives extract on the destination filesystem; old and new versions
+coexist until publication succeeds. Old owned versions are then removed. Never
+count `--no-cache` or `--cleanup=cache` as reclaiming an installed directory or
+eliminating peak update space. In-flight generations are protected by the shared
+cancellation registry; publication relinquishes cleanup ownership atomically.

@@ -41,6 +41,15 @@ static SOURCE: Mutex<SourceState> = Mutex::new(SourceState {
 thread_local! { static BACKGROUND: Cell<bool> = const { Cell::new(false) }; }
 thread_local! { static SOURCE_DISPLAY: RefCell<Option<Footer>> = const { RefCell::new(None) }; }
 thread_local! { static TEMPORARY_SOURCE: Cell<bool> = const { Cell::new(false) }; }
+thread_local! { static PREPARATION_OWNER: RefCell<Option<Manager>> = const { RefCell::new(None) }; }
+
+pub(crate) fn package_preparation<T>(manager: Manager, work: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Manager>);
+    impl Drop for Reset { fn drop(&mut self) { PREPARATION_OWNER.with(|owner| *owner.borrow_mut() = self.0.take()); } }
+    let previous = PREPARATION_OWNER.with(|owner| owner.replace(Some(manager)));
+    let _reset = Reset(previous);
+    work()
+}
 
 /// Reused Sources builders are preparation here, never an installed upgrade.
 /// Scope is thread-local and reset on errors/panics; concurrent upgrades retain
@@ -53,7 +62,10 @@ pub(crate) fn temporary_source_preparation<T>(work: impl FnOnce() -> T) -> T {
 }
 
 fn display_manager(manager: Manager) -> Manager {
-    if manager == Manager::Sources && TEMPORARY_SOURCE.get() { Manager::Runtime } else { manager }
+    let manager = if manager == Manager::Sources && TEMPORARY_SOURCE.get() { Manager::Runtime } else { manager };
+    if manager == Manager::Runtime {
+        PREPARATION_OWNER.with(|owner| *owner.borrow()).unwrap_or(manager)
+    } else { manager }
 }
 static TERMINAL: Mutex<Option<(libc::termios, u16)>> = Mutex::new(None);
 static VIEW: Mutex<Option<(u16, u16, u16)>> = Mutex::new(None);

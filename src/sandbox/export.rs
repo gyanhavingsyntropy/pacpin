@@ -1,8 +1,6 @@
 //! Explicit custom-manager exports share temporary runtime and cleanup policy.
-use super::{
-    package_root::{confirm_build, PackageRoot},
-    TryOptions,
-};
+use crate::preparation::{confirm_build, PackageRoot};
+use super::TryOptions;
 
 pub(super) fn try_export(
     config: &crate::config::Config,
@@ -29,10 +27,11 @@ pub(super) fn try_export(
         options.noconfirm,
     )?;
     let view = crate::progress::session_view();
+    let preparation = options.preparation();
     let root = PackageRoot::new(
         config,
         pkg,
-        options,
+        &preparation,
         export.scratch_mib.saturating_mul(1_048_576),
     )?;
     // Preparation sees host runtime read-only. The export destination is the
@@ -40,6 +39,7 @@ pub(super) fn try_export(
     let prepare_view = crate::execution::BuildWorkspace {
         root: root.work.join("empty"),
         overlay: root.view.overlay,
+        readonly_paths: root.view.readonly_paths.clone(),
     };
     crate::integrations::export_temporary(definition, pkg, &root.root, &root.work, &prepare_view)?;
     crate::download::validate_symlink_traversal(&root.root, 32)?;

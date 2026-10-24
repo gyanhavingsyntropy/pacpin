@@ -9,3 +9,13 @@
 - External APIs must distinguish success, failure, skipped/unsupported work and partial/uncertain outcomes. Preserve diagnostics and propagate failures; an empty list or completed download must not imply a successful check or install. Check child exit status and allow package managers to release locks before forceful cancellation.
 - When changing an external interaction, enumerate its callers, migrate affected bypasses to the shared boundary, and test the common contract plus each affected manager path. Record remaining legacy bypasses honestly; a rule in this file does not mean they have been refactored.
 - Regression checks must verify cleanup of program-owned resources such as database locks and temporary workspaces, not merely that a PID stopped. Use architecture checks for new bypasses and document any existing exceptions during migration.
+
+- Private build preparation belongs to `preparation`, independently of application
+  launching. Install/rebuild paths must select the actual runtime archive closure
+  and call the native installation boundary; never install all prepared archives
+  or borrow sandbox UI/app lifecycle as an installer.
+- Retained Sources go through `sources::directory`, including adoption, inventory,
+  publication and removal. Never infer directory ownership from an executable or
+  delete an imported application's original path. Atomic link publication uses
+  `execution::publish_cleanup_target`; its short closure cannot enter the UI,
+  register resources or launch processes while the registry lock is held.

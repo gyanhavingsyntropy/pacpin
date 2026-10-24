@@ -1,8 +1,5 @@
 //! Private dependency roots. No ALPM transaction or system dependency install.
-use super::{
-    workspace::{create_secure_temp_dir_in, SandboxGuard},
-    TryOptions,
-};
+use super::{create_secure_temp_dir_in, Options, SandboxGuard};
 use crate::{config::Config, db::AlpmManager, execution::BuildWorkspace};
 use std::{
     collections::HashSet,
@@ -11,21 +8,22 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(super) struct PackageRoot<'a> {
+pub(crate) struct PackageRoot<'a> {
     pub root: PathBuf,
     pub work: PathBuf,
     pub manager: AlpmManager,
     pub view: BuildWorkspace,
     config: &'a Config,
-    options: &'a TryOptions,
+    options: &'a Options,
     guard: SandboxGuard,
     archives: Vec<PathBuf>,
     names: HashSet<String>,
     building: HashSet<String>,
     resolving: HashSet<String>,
+    pub build_failed: bool,
 }
 
-pub(super) fn confirm_build(label: &str, noconfirm: bool) -> Result<(), String> {
+pub(crate) fn confirm_build(label: &str, noconfirm: bool) -> Result<(), String> {
     println!(":: {label}. Build code runs as your user in a private filesystem view; no system packages will be installed.");
     if noconfirm {
         return Ok(());
@@ -47,27 +45,27 @@ pub(super) fn confirm_build(label: &str, noconfirm: bool) -> Result<(), String> 
 }
 
 impl<'a> PackageRoot<'a> {
+    pub fn cleanup(&mut self, manager: crate::progress::Manager) -> Result<(), String> {
+        crate::progress::operation(manager, "Removing temporary build dependencies", || {
+            self.guard.cleanup()
+        })?;
+        println!(":: Removed private build workspace and its temporary dependencies.");
+        Ok(())
+    }
     pub fn new(
         config: &'a Config,
         pkg: &str,
-        options: &'a TryOptions,
+        options: &'a Options,
         bytes: u64,
     ) -> Result<Self, String> {
         crate::execution::init_signal_handlers();
         if unsafe { libc::geteuid() } == 0 {
             return Err("Temporary package preparation must run as a regular user".into());
         }
-        super::mounts::check_bwrap_capability()?;
-        let overlay = crate::execution::supports_ro_overlay();
-        if !overlay {
-            return Err("AUR, Sources and export try/run require Bubblewrap read-only overlays; no system packages were changed".into());
-        }
+        super::check_capability()?;
+        let overlay = true;
         let base = crate::scratch::choose(crate::scratch::policy(), bytes, 128)?;
-        let prefix = if options.is_run_mode {
-            "pacpin-run"
-        } else {
-            "pacpin-try"
-        };
+        let prefix = options.prefix;
         let work = create_secure_temp_dir_in(&format!("{prefix}-{pkg}"), &base)?;
         let guard = SandboxGuard::new(work.clone());
         let root = work.join("root");
@@ -80,6 +78,7 @@ impl<'a> PackageRoot<'a> {
             view: BuildWorkspace {
                 root: root.clone(),
                 overlay,
+                readonly_paths: vec![PathBuf::from(&crate::pacman_config::snapshot()?.option("DBPath")[0])],
             },
             root,
             work,
@@ -91,6 +90,7 @@ impl<'a> PackageRoot<'a> {
             names: HashSet::new(),
             building: HashSet::new(),
             resolving: HashSet::new(),
+            build_failed: false,
         })
     }
 
@@ -169,9 +169,9 @@ impl<'a> PackageRoot<'a> {
     fn resolve_dependency(&mut self, dependency: &str) -> Result<(), String> {
         if crate::db::find_sync_package(self.manager.handle(), dependency).is_ok() {
             let targets = self.manager.resolve_download_urls(None, dependency)?;
-            let (bytes, inodes) = super::native::ephemeral_footprint(&targets);
+            let (bytes, inodes) = super::downloads::ephemeral_footprint(&targets);
             self.capacity(bytes, inodes)?;
-            let archives = super::native::fetch_targets(
+            let archives = super::downloads::fetch_targets(
                 &targets,
                 self.options,
                 &self.work.join("downloads"),
@@ -192,6 +192,20 @@ impl<'a> PackageRoot<'a> {
     }
 
     pub fn build_aur(&mut self, pkg: &str) -> Result<PathBuf, String> {
+        for archive in &self.archives {
+            let package = self
+                .manager
+                .handle()
+                .pkg_load(
+                    archive.as_os_str().as_encoded_bytes().to_vec(),
+                    true,
+                    alpm::SigLevel::NONE,
+                )
+                .map_err(|e| e.to_string())?;
+            if package.name() == pkg {
+                return Ok(archive.clone());
+            }
+        }
         if self.building.len() >= 32 || !self.building.insert(pkg.into()) {
             return Err(format!(
                 "Cyclic or excessively deep temporary AUR dependency: {pkg}"
@@ -224,7 +238,11 @@ impl<'a> PackageRoot<'a> {
         dependencies.push("base-devel".into());
         self.ensure_dependencies(&dependencies)?;
         self.capacity(128 * 1024 * 1024, 128)?;
-        let archives = crate::pm::build_aur_archive(&recipe, &work, &self.view)?;
+        let archives =
+            crate::pm::build_aur_archive(&recipe, &work, &self.view).map_err(|error| {
+                self.build_failed |= error.build_failed;
+                error.to_string()
+            })?;
         // Split outputs are inspected, but only the requested package is merged.
         let mut target = None;
         for archive in archives {
@@ -316,7 +334,7 @@ impl<'a> PackageRoot<'a> {
         Ok(())
     }
 
-    pub fn executable(&self, archive: &Path, pkg: &str) -> Result<PathBuf, String> {
+    pub fn validate_runtime(&self) -> Result<(), String> {
         // Revalidate every runtime dependency against the final combined root.
         // This detects a dependency displaced by a newer prepared package.
         let packages = self
@@ -350,19 +368,146 @@ impl<'a> PackageRoot<'a> {
                 missing.target()
             ));
         }
-        let (_, _, owned) = crate::archive::executable_footprint(archive)?;
-        let mut executables = Vec::new();
-        for path in owned {
-            let path = self.root.join(path);
-            if !crate::utils::is_executable_file(&path) {
+        Ok(())
+    }
+
+    /// Select only the requested packages and their actual runtime closure.
+    /// Build-only archives never cross the installation boundary.
+    pub fn installation_archives(&self, targets: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+        self.validate_runtime()?;
+        select_installation_archives(&self.manager, &self.archives, targets)
+    }
+}
+
+fn select_installation_archives(
+    manager: &AlpmManager,
+    archives: &[PathBuf],
+    targets: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    let packages = archives
+        .iter()
+        .map(|path| {
+            manager
+                .handle()
+                .pkg_load(
+                    path.as_os_str().as_encoded_bytes().to_vec(),
+                    true,
+                    alpm::SigLevel::NONE,
+                )
+                .map(|package| (path, package))
+                .map_err(|e| e.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut pending = targets.to_vec();
+    let mut selected = Vec::new();
+    while let Some(path) = pending.pop() {
+        if selected.contains(&path) {
+            continue;
+        }
+        let (_, package) = packages
+            .iter()
+            .find(|(candidate, _)| **candidate == path)
+            .ok_or("Requested archive is not owned by private preparation")?;
+        selected.push(path);
+        for dependency in package.depends() {
+            let dependency = dependency.to_string();
+            if manager
+                .handle()
+                .localdb()
+                .pkgs()
+                .find_satisfier(dependency.as_str())
+                .is_some()
+            {
                 continue;
             }
-            let resolved = path.canonicalize().map_err(|e| e.to_string())?;
-            if !resolved.starts_with(&self.root) {
-                return Err("Temporary executable escapes its package root".into());
-            }
-            executables.push(path);
+            let (path, _) = packages
+                .iter()
+                .find(|(_, p)| crate::db::package_satisfies(p, &dependency))
+                .ok_or_else(|| format!("Missing prepared runtime dependency: {dependency}"))?;
+            pending.push((*path).clone());
         }
-        super::entrypoints::select_executable(executables, pkg, self.options.bin.as_deref())
+    }
+    Ok(selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::test_support::{AlpmFixture, FixturePackage};
+    fn package(directory: &Path, name: &str, depends: &[&str], provides: &[&str]) -> PathBuf {
+        let path = directory.join(format!("{name}.pkg.tar"));
+        let mut archive = tar::Builder::new(fs::File::create(&path).unwrap());
+        let mut info = format!("pkgname = {name}\npkgbase = {name}\npkgver = 2-1\npkgdesc = fixture\nsize = 1\narch = any\nlicense = custom\n");
+        for value in depends {
+            info += &format!("depend = {value}\n");
+        }
+        for value in provides {
+            info += &format!("provides = {value}\n");
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(info.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, ".PKGINFO", info.as_bytes())
+            .unwrap();
+        archive.finish().unwrap();
+        path
+    }
+    #[test]
+    fn installation_selects_runtime_closure_without_build_only_packages() {
+        let fixture = AlpmFixture::new(&[], &[]);
+        let directory = PathBuf::from(fixture.manager.handle().dbpath());
+        let app = package(&directory, "app", &["runtime>=2"], &[]);
+        let runtime = package(&directory, "runtime", &[], &[]);
+        let compiler = package(&directory, "compiler", &[], &[]);
+        let archives = vec![compiler.clone(), app.clone(), runtime.clone()];
+        let selected =
+            select_installation_archives(&fixture.manager, &archives, std::slice::from_ref(&app))
+                .unwrap();
+        assert_eq!(selected, [app, runtime]);
+        assert!(!selected.contains(&compiler));
+    }
+    #[test]
+    fn installed_dependencies_are_reused_and_missing_or_unowned_archives_fail() {
+        let fixture = AlpmFixture::new(&[FixturePackage::new("runtime", "2-1")], &[]);
+        let directory = PathBuf::from(fixture.manager.handle().dbpath());
+        let app = package(&directory, "app", &["runtime>=2"], &[]);
+        let archives = vec![app.clone()];
+        assert_eq!(
+            select_installation_archives(&fixture.manager, &archives, &archives).unwrap(),
+            archives
+        );
+        let missing = package(&directory, "missing-app", &["absent"], &[]);
+        assert!(select_installation_archives(
+            &fixture.manager,
+            std::slice::from_ref(&missing),
+            std::slice::from_ref(&missing)
+        )
+        .is_err());
+        assert!(select_installation_archives(
+            &fixture.manager,
+            &archives,
+            &[directory.join("foreign.pkg.tar")]
+        )
+        .is_err());
+    }
+    #[test]
+    fn runtime_virtual_provisions_keep_constraints() {
+        let fixture = AlpmFixture::new(&[], &[]);
+        let directory = PathBuf::from(fixture.manager.handle().dbpath());
+        let app = package(&directory, "app", &["virtual>=2"], &[]);
+        let provider = package(&directory, "provider", &[], &["virtual=2"]);
+        let archives = vec![app.clone(), provider.clone()];
+        assert_eq!(
+            select_installation_archives(&fixture.manager, &archives, std::slice::from_ref(&app))
+                .unwrap(),
+            [app.clone(), provider]
+        );
+        let too_old = package(&directory, "old-provider", &[], &["virtual=1"]);
+        assert!(
+            select_installation_archives(&fixture.manager, &[app.clone(), too_old], &[app])
+                .is_err()
+        );
     }
 }

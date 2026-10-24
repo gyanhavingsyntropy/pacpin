@@ -38,6 +38,8 @@ pub(crate) fn supports_ro_overlay() -> bool {
 pub(crate) struct BuildWorkspace {
     pub root: PathBuf,
     pub overlay: bool,
+    /// Explicit caller-owned metadata needed at its configured absolute path.
+    pub readonly_paths: Vec<PathBuf>,
 }
 
 /// Merge prepared package trees into their absolute paths without installing them.
@@ -115,6 +117,14 @@ impl BuildWorkspace {
         }
         command.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
         command.arg("--bind").arg(&work).arg(&work);
+        // Bind after private /tmp setup: a valid custom metadata directory can
+        // live there. Shared execution does not discover manager configuration.
+        for path in &self.readonly_paths {
+            if !path.is_absolute() || !path.is_dir() {
+                return Err("Build metadata paths must be existing absolute directories".into());
+            }
+            command.arg("--ro-bind").arg(path).arg(path);
+        }
         command.arg("--chdir").arg(&cwd);
         for (name, value) in [
             ("PATH", "/usr/local/bin:/usr/bin:/bin"),
@@ -178,6 +188,7 @@ mod tests {
         let view = BuildWorkspace {
             root: work.0.join("missing"),
             overlay: false,
+            readonly_paths: Vec::new(),
         };
         let mut original = Command::new("makepkg");
         original
@@ -221,10 +232,28 @@ mod tests {
         let view = BuildWorkspace {
             root: work.0.join("missing"),
             overlay: false,
+            readonly_paths: Vec::new(),
         };
         let mut command = Command::new("true");
         command.current_dir("/");
         assert!(view.command(command, &work.0).is_err());
+    }
+
+    #[test]
+    fn custom_metadata_is_readonly_and_bound_after_private_tmp_setup() {
+        let work = Work::new();
+        let metadata = work.0.join("metadata");
+        fs::create_dir(&metadata).unwrap();
+        let view = BuildWorkspace { root: work.0.join("missing"), overlay: false, readonly_paths: vec![metadata.clone()] };
+        let mut original = Command::new("true"); original.current_dir(&work.0);
+        let command = view.command(original, &work.0).unwrap();
+        let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        let tmp = args.windows(2).position(|pair| pair == ["--tmpfs", "/tmp"]).unwrap();
+        let bind = args.windows(3).position(|pair| pair == ["--ro-bind", metadata.to_str().unwrap(), metadata.to_str().unwrap()]).unwrap();
+        assert!(bind > tmp);
+        let invalid = BuildWorkspace { readonly_paths: vec!["relative".into()], ..view };
+        let mut original = Command::new("true"); original.current_dir(&work.0);
+        assert!(invalid.command(original, &work.0).is_err());
     }
 
     #[test]

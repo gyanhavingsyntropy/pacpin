@@ -77,3 +77,4 @@ pub fn check_pacman_lock() {
         exit(1);
     }
 }
+pub(crate) mod source;

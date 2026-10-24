@@ -46,13 +46,13 @@ pin -S cmark-build/cmark-local --use-storage
 pin upgrade --sources-only
 ```
 
-Install declared build dependencies explicitly first. Missing plain-name
+Without --cleanup=temporary, install declared build dependencies explicitly first. Missing plain-name
 `makedepends` or tools fail preflight before a full upgrade starts native
 transactions. Pacpin does not silently install a build toolchain. Runtime
 dependencies in `depends` remain checked by pacman when installing the package.
 
 Commands stage an installable tree under `output`; it is installed beneath
-`/opt/<package>` with the declared `/usr/bin` links. `root` optionally selects a
+`/opt/<package>` with the declared `/usr/bin` links by default; install_dir instead retains the compiled application behind its current link. `root` optionally selects a
 subdirectory of the checkout/archive; it must stay inside that tree. `jobs`
 sets make/Ninja/CMake/Cargo parallelism preferences; commands can override them.
 
@@ -155,3 +155,15 @@ Source-code builds are excluded from independent continuation after AUR failure:
 arbitrary build commands have unverified dependency effects. Prebuilt Sources
 retain their existing guarded continuation contract. Upgrade scope, hooks,
 approval, footer and ownership use the ordinary Sources pipeline.
+
+## Private build dependencies for installation
+
+`--cleanup=temporary` reuses the private package-preparation engine from try/run.
+Missing declared build dependencies are extracted privately instead of installed
+into the system. The compiler runs unprivileged in the read-only host view with
+only the owned build workspace writable. Requested output and actual runtime
+packages still use the normal native installation boundary; `install_dir` output
+uses the retained directory backend and requires installed runtime dependencies.
+Without this flag, ordinary Sources builds retain their existing prerequisite
+checks and unprivileged makepkg behavior. The flag does not make a package's
+incorrect dependency metadata correct or turn build estimates into reservations.

@@ -430,6 +430,28 @@ fn checksum_asset(
     checksum_line(&bytes, asset)
 }
 
+struct ReleaseVersion { semantic: Option<Version>, upstream: String, package: String }
+impl ReleaseVersion {
+    fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        match (&self.semantic, &other.semantic) {
+            (Some(left), Some(right)) => left.cmp_precedence(right),
+            _ => alpm::vercmp(self.package.as_str(), other.package.as_str()),
+        }
+    }
+}
+fn release_version(recipe: &Recipe, value: &str, prerelease: bool) -> Result<Option<ReleaseVersion>, String> {
+    if recipe.version_scheme == super::VersionScheme::Semver {
+        let Ok(version) = Version::parse(value) else { return Ok(None); };
+        if !accepts(&recipe.channel, &version, prerelease) { return Ok(None); }
+        return Ok(Some(ReleaseVersion { upstream: version.to_string(), package: arch_version(&version), semantic: Some(version) }));
+    }
+    if value.is_empty() || value.len() > 200 || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b)) {
+        return Err("Vendor release version contains unsupported characters".into());
+    }
+    if matches!(recipe.channel, Channel::Stable) && prerelease || matches!(recipe.channel, Channel::Prerelease) && !prerelease { return Ok(None); }
+    Ok(Some(ReleaseVersion { semantic: None, upstream: value.into(), package: format!("{}-1", value.replace('-', ".")) }))
+}
+
 pub fn select(
     alias: &str,
     name: &str,
@@ -459,18 +481,14 @@ pub fn select(
                 .strip_prefix(&recipe.version_prefix)
                 .unwrap_or(&release.tag)
         });
-        let Ok(version) = Version::parse(value) else {
-            continue;
-        };
-        if accepts(&recipe.channel, &version, release.prerelease) {
-            matches.push((version, release));
-        }
+        let Some(version) = release_version(recipe, value, release.prerelease)? else { continue; };
+        matches.push((version, release));
     }
-    matches.sort_by(|a, b| b.0.cmp_precedence(&a.0));
-    let (version, release) = matches.first().ok_or_else(|| format!("No matching semantic release for '{alias}/{name}' (check channel, tag_pattern, and version_prefix)"))?;
+    matches.sort_by(|a, b| b.0.compare(&a.0));
+    let (version, release) = matches.first().ok_or_else(|| format!("No matching release for '{alias}/{name}' (check channel, tag_pattern, and version_prefix)"))?;
     if matches
         .get(1)
-        .is_some_and(|other| other.0.cmp_precedence(version).is_eq())
+        .is_some_and(|other| other.0.compare(version).is_eq())
     {
         return Err("Ambiguous releases with identical version precedence".into());
     }
@@ -483,7 +501,7 @@ pub fn select(
     let asset_pattern = recipe
         .asset
         .replace("{arch}", std::env::consts::ARCH)
-        .replace("{version}", &version.to_string())
+        .replace("{version}", &version.upstream)
         .replace("{tag}", &release.tag);
     let pattern = glob::Pattern::new(&asset_pattern).map_err(|_| "Invalid asset pattern")?;
     let assets: Vec<_> = release
@@ -527,7 +545,7 @@ pub fn select(
     let package_version = release
         .package_version
         .clone()
-        .unwrap_or_else(|| arch_version(version));
+        .unwrap_or_else(|| version.package.clone());
     if !package_version
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b".:+_-".contains(&b))
@@ -535,7 +553,7 @@ pub fn select(
     {
         return Err("Invalid package version".into());
     }
-    if recipe.format != Format::Native && package_version != arch_version(version) {
+    if recipe.format != Format::Native && package_version != version.package {
         return Err("package_version overrides are only valid for native packages".into());
     }
     Ok(Plan {
@@ -554,8 +572,23 @@ pub fn select(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn vendor_versions_are_explicit_bounded_and_ordered_without_weakening_semver() {
+        let mut recipe = recipe();
+        assert!(release_version(&recipe, "11.0-20261020-slr", false).unwrap().is_none());
+        recipe.version_scheme = super::super::VersionScheme::Arch;
+        recipe.channel = Channel::Stable;
+        let first = release_version(&recipe, "11.0-20260930-slr", false).unwrap().unwrap();
+        let next = release_version(&recipe, "11.0-20261020-slr", false).unwrap().unwrap();
+        assert!(next.compare(&first).is_gt());
+        assert_eq!(next.package, "11.0.20261020.slr-1");
+        assert_eq!(next.upstream, "11.0-20261020-slr");
+        assert!(release_version(&recipe, "11.0-20261020-slr", true).unwrap().is_none());
+        assert!(release_version(&recipe, "bad/../tag", false).is_err());
+    }
     fn recipe() -> Recipe {
         Recipe {
+            install_dir: None, version_scheme: super::VersionScheme::Semver,
             build: None,
             release_pages: 1,
             project: "owner/app".into(),

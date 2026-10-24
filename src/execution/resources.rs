@@ -40,6 +40,17 @@ impl Registry {
             }
         }
     }
+
+    /// Serialize a short atomic publication against cancellation cleanup.
+    /// The action must not register resources, launch children or enter the UI.
+    pub(super) fn publish<T>(&self, path: &Path, action: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        let mut paths = self.0.lock().map_err(|_| io::Error::other("Cleanup registry is poisoned"))?;
+        if is_terminating() { return Err(io::Error::new(io::ErrorKind::Interrupted, "Invocation is stopping")); }
+        if !paths.iter().any(|target| target == path) { return Err(io::Error::other("Publication resource is not registered")); }
+        let result = action()?;
+        paths.retain(|target| target != path);
+        Ok(result)
+    }
 }
 
 fn remove_cleanup_path(path: &Path) {
@@ -107,6 +118,20 @@ pub fn remove_owned_tree(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
+    #[test]
+    fn publication_relinquishes_cleanup_only_after_success() {
+        let root = std::env::temp_dir().join(format!("pacpin-publication-registry-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let retained = root.join("retained"); let failed = root.join("failed");
+        fs::create_dir(&retained).unwrap(); fs::create_dir(&failed).unwrap();
+        let registry = Registry::new(); registry.register(retained.clone()); registry.register(failed.clone());
+        registry.publish(&retained, || Ok(())).unwrap();
+        assert!(registry.publish(&failed, || Err::<(), _>(io::Error::other("injected publication failure"))).is_err());
+        registry.cleanup();
+        assert!(retained.is_dir()); assert!(!failed.exists());
+        assert!(registry.publish(&retained, || Ok(())).is_err());
+        remove_owned_tree(&root).unwrap();
+    }
     #[test]
     fn restricted_build_directories_and_links_cleanup_without_touching_targets() {
         let root =

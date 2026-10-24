@@ -220,3 +220,22 @@ resolution and Flatpak/Nix runtime/store requirements remain manager-owned.
 Files are loaded once per invocation. Command templates add parsing/validation
 work; scripts and package-manager operations determine their own runtime. Do
 not claim this config produces faster upgrades without measurements.
+
+### Temporary resource cleanup
+
+An external manager can explicitly support `--cleanup=temporary`:
+
+```toml
+[managers.my-manager]
+# ... existing check/upgrade/verify configuration ...
+temporary_cleanup = ["my-manager", "clean-transaction-build-resources"]
+```
+
+This is literal argv, executed as the regular user only after every approved
+upgrade for that manager has been verified and configured actions have succeeded.
+It must remove only temporary resources introduced by that operation, preserving
+preexisting packages, runtime dependencies and user data. It is distinct from
+`cache_cleanup` and `clean`. A failed cleanup leaves the manager unsuccessful;
+failed upgrades never invoke it. Missing capability is rejected or skipped under
+`--keep-going` before actions. Core pacman/AUR operations remain typed and cannot
+be overridden by this command. Built-ins do not implicitly prune runtimes/stores.

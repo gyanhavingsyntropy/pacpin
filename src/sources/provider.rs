@@ -25,7 +25,9 @@ impl IntegrationProvider for SourceProvider {
     fn check_options(&self, _policy: crate::scratch::Policy, _no_cache: bool) -> Result<(), crate::runtime::OptionError> {
         // Sources own temporary workspaces under either policy. Their actual
         // recipe/archive capacity remains checked before download/build/install.
-        for plan in self.approved.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|p| p.recipe.build.is_some()) {
+        for plan in self.approved.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            super::directory::preflight(&self.config, &plan.alias, &plan.name, &plan.recipe).map_err(crate::runtime::OptionError::Invalid)?;
+            if plan.recipe.build.is_none() { continue; }
             super::build::check_prerequisites(&self.config, plan, None).map_err(crate::runtime::OptionError::Invalid)?;
             let build = plan.recipe.build.as_ref().unwrap();
             crate::scratch::choose(_policy, build.initial_bytes(), build.scratch_inodes.saturating_add(32)).map_err(crate::runtime::OptionError::Invalid)?;
@@ -36,7 +38,7 @@ impl IntegrationProvider for SourceProvider {
         "Sources"
     }
     fn is_available(&self) -> bool {
-        self.config
+        self.config.sources.values().any(|source| source.packages.values().any(|recipe| recipe.install_dir.is_some())) || self.config
             .pins
             .values()
             .any(|alias| self.config.sources.contains_key(alias))
@@ -60,7 +62,9 @@ impl IntegrationProvider for SourceProvider {
             let preparation = if plan.git.is_some() { "fetch approved Git revision and build" }
                 else if plan.recipe.build.is_some() { "download, verify and build source archive" }
                 else { "download and verify release; package if needed" };
-            Ok(UpgradeAction::Internal(format!("{} -> {}: {preparation}; install local package via {} pacman -U; remove temporary workspace", update.id, update.version, self.config.options.privilege_tool)))
+            let install = if let Some(directory) = &plan.recipe.install_dir { format!("atomically update directory {} without pacman", directory.display()) }
+                else { format!("install local package via {} pacman -U", self.config.options.privilege_tool) };
+            Ok(UpgradeAction::Internal(format!("{} -> {}: {preparation}; {install}; remove temporary workspace", update.id, update.version)))
         }).collect()
     }
     fn execute_upgrade(&self, updates: &[ExternalUpdate]) -> Result<bool, io::Error> {
@@ -79,7 +83,7 @@ impl IntegrationProvider for SourceProvider {
                 .ok_or_else(|| io::Error::other("Source update changed after approval"))?;
             // Execute the exact catalog selection shown before confirmation,
             // not a new "latest" lookup after the user approves.
-            install::execute(&mut config, plan, true).map_err(io::Error::other)?;
+            install::execute(&mut config, plan, true, true).map_err(io::Error::other)?;
         }
         Ok(true)
     }
@@ -140,7 +144,7 @@ impl SourceProvider {
                     .map(|pattern| format!("--ignore={pattern}"))
                     .collect()
             };
-        let targets: Vec<_> = manager
+        let mut targets: Vec<_> = manager
             .handle()
             .localdb()
             .pkgs()
@@ -149,10 +153,22 @@ impl SourceProvider {
                 if ignored(p.name(), &ignore_flags) {
                     return None;
                 }
-                owner(&self.config, p.name())
+                owner(&self.config, p.name()).filter(|alias| self.config.sources[*alias].packages[p.name()].install_dir.is_none())
                     .map(|alias| (format!("{alias}/{}", p.name()), p.version().to_string()))
             })
             .collect();
+        let mut directory_failures = Vec::new();
+        for (alias, source) in &self.config.sources {
+            for (name, recipe) in &source.packages {
+                if recipe.install_dir.is_none() || ignored(name, &ignore_flags) { continue; }
+                match super::directory::installed(&self.config, alias, name) {
+                    Ok(Some(receipt)) if manager.handle().localdb().pkg(name.as_str()).is_err() => targets.push((format!("{alias}/{name}"), receipt.version)),
+                    Ok(Some(_)) => directory_failures.push((format!("{alias}/{name}"), "Directory application conflicts with a pacman-installed package of the same name".to_owned())),
+                    Ok(None) => {},
+                    Err(error) => directory_failures.push((format!("{alias}/{name}"), error)),
+                }
+            }
+        }
         drop(manager);
         let checked = super::discovery::check_targets(&targets, |target, installed| {
             let plan = plan(&self.config, target)?;
@@ -167,11 +183,15 @@ impl SourceProvider {
                 name: p.name.clone(),
                 repo: p.alias.clone(),
                 version: p.version.clone(),
+                installed_version: targets.iter().find(|(target, _)| *target == format!("{}/{}", p.alias, p.name)).map(|(_, version)| version.clone()),
                 ..ExternalUpdate::default()
             })
             .collect();
         *self.approved.lock().unwrap_or_else(|e| e.into_inner()) = plans;
         let mut report = crate::discovery::Report::updates(self.name(), Ok(updates));
+        for (target, error) in directory_failures {
+            report.record(crate::discovery::Manager::Source(target), crate::discovery::Phase::Updates, Err(error));
+        }
         for failure in failures {
             report.record(failure.manager, failure.phase, Err(failure.detail));
         }

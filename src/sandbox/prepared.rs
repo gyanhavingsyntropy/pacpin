@@ -1,6 +1,6 @@
 //! Adapt package-producing backends to the common temporary launcher.
+use crate::preparation::{confirm_build, PackageRoot};
 use super::{
-    package_root::{confirm_build, PackageRoot},
     TryOptions,
 };
 
@@ -18,9 +18,10 @@ pub(super) fn try_aur(
         return Ok(0);
     }
     let view = crate::progress::session_view();
-    let mut root = PackageRoot::new(config, pkg, options, 128 * 1024 * 1024)?;
+    let preparation = options.preparation();
+    let mut root = PackageRoot::new(config, pkg, &preparation, 128 * 1024 * 1024)?;
     let archive = root.build_aur(pkg)?;
-    let executable = root.executable(&archive, pkg)?;
+    let executable = executable(&root, &archive, pkg, options)?;
     drop(view);
     super::launch::launch(&root.root, &executable, pkg, args, options, false, true)
 }
@@ -53,13 +54,32 @@ pub(super) fn try_source(
         options.noconfirm,
     )?;
     let view = crate::progress::session_view();
-    let mut root = PackageRoot::new(config, pkg, options, bytes)?;
+    let preparation = options.preparation();
+    let mut root = PackageRoot::new(config, pkg, &preparation, bytes)?;
     root.ensure_dependencies(&dependencies)?;
     let prepared = crate::progress::temporary_source_preparation(|| {
         crate::sources::prepare_temporary(config, &plan, &root.view)
     })?;
     root.add_archive(&prepared.archive, pkg)?;
-    let executable = root.executable(&prepared.archive, pkg)?;
+    let executable = executable(&root, &prepared.archive, pkg, options)?;
     drop(view);
     super::launch::launch(&root.root, &executable, pkg, args, options, false, true)
+}
+
+fn executable(root: &PackageRoot<'_>, archive: &std::path::Path, pkg: &str, options: &TryOptions) -> Result<std::path::PathBuf, String> {
+    root.validate_runtime()?;
+        let (_, _, owned) = crate::archive::executable_footprint(archive)?;
+        let mut executables = Vec::new();
+        for path in owned {
+            let path = root.root.join(path);
+            if !crate::utils::is_executable_file(&path) {
+                continue;
+            }
+            let resolved = path.canonicalize().map_err(|e| e.to_string())?;
+            if !resolved.starts_with(&root.root) {
+                return Err("Temporary executable escapes its package root".into());
+            }
+            executables.push(path);
+        }
+        super::entrypoints::select_executable(executables, pkg, options.bin.as_deref())
 }

@@ -74,3 +74,7 @@ no_cache_args = ["--pip-args=--no-cache-dir"]
 # command = ["/usr/local/bin/demo-export", "--id", "{id}", "--root", "{root}"]
 # executables = ["usr/bin/{id}"]
 # scratch_mib = 128
+
+# Custom adapters may explicitly declare a transaction-owned temporary cleanup:
+# temporary_cleanup = ["your-manager", "clean-transaction-build-resources"]
+# This is separate from cache_cleanup and installed-runtime/store pruning.

@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 pub const DEFAULT_MANAGERS: &str = include_str!("../docs/managers.toml");
-pub const DEFAULT_SOURCES: &str = "# Release and source-build recipes; same [sources.alias] schema as config.toml.\n# Existing recipes in config.toml remain supported. Duplicate aliases are errors.\n# format='source' uses a per-package [sources.ALIAS.packages.PACKAGE.build] table.\n# build.optimization defaults to inherited makepkg settings; native CPU, level\n# and LTO overrides are opt-in. See docs/sources.md for complete recipes.\n[sources]\n";
+pub const DEFAULT_SOURCES: &str = "# Release and source-build recipes; same [sources.alias] schema as config.toml.\n# Existing recipes in config.toml remain supported. Duplicate aliases are errors.\n# Optional install_dir='/absolute/app-container' retains a portable app outside\n# pacman; its stable entry point is install_dir/current. Existing apps require\n# explicit 'pin source adopt alias/pkg --from PATH --version VERSION'.\n# format='source' uses a per-package [sources.ALIAS.packages.PACKAGE.build] table.\n# build.optimization defaults to inherited makepkg settings; native CPU, level\n# and LTO overrides are opt-in. See docs/sources.md for complete recipes.\n[sources]\n";
 pub const DEFAULT_HOOKS: &str = "# Post-update actions; same [hooks.name] schema as config.toml.\n# Runs only after verified installed version changes in a successful upgrade.\n# [hooks.example]\n# watch = [\"mutter\", \"gnome-shell\"]\n# action = \"script\"\n# command = [\"/absolute/path/rebuild-blur\"]\n[hooks]\n";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,6 +34,8 @@ pub struct Definition {
     pub no_cache_args: Vec<String>,
     /// Removes caches only; separate from explicit unused-package pruning.
     pub cache_cleanup: Vec<String>,
+    /// Explicit cleanup of resources introduced solely for this transaction.
+    pub temporary_cleanup: Vec<String>,
     pub clean: Vec<String>,
     pub refresh: Vec<String>,
     /// Optional literal download-only command, run before this manager's stage.
@@ -108,7 +110,7 @@ pub fn validate(file: &ManagerFile) -> Result<(), String> {
             }
             if !definition.check.is_empty() || !definition.verify.is_empty() || !definition.upgrade.is_empty() || !definition.upgrade_ram.is_empty()
                 || !definition.upgrade_storage.is_empty() || !definition.no_cache_args.is_empty()
-                || !definition.cache_cleanup.is_empty() || !definition.clean.is_empty() || !definition.refresh.is_empty() || !definition.prepare.is_empty()
+                || !definition.cache_cleanup.is_empty() || !definition.temporary_cleanup.is_empty() || !definition.clean.is_empty() || !definition.refresh.is_empty() || !definition.prepare.is_empty()
                 || !definition.env.is_empty() || definition.scratch_mib.is_some() || definition.ephemeral.is_some() {
                 return Err(format!("{name}: core commands are owned by the typed adapter; configure helper/privilege_tool instead"));
             }
@@ -154,6 +156,7 @@ pub fn validate(file: &ManagerFile) -> Result<(), String> {
             ("upgrade", &definition.upgrade, true), ("upgrade_ram", &definition.upgrade_ram, true),
             ("upgrade_storage", &definition.upgrade_storage, true), ("clean", &definition.clean, false),
             ("cache_cleanup", &definition.cache_cleanup, false),
+            ("temporary_cleanup", &definition.temporary_cleanup, false),
         ] {
             if command.is_empty() { continue; }
             validate_command(command, placeholders).map_err(|e| format!("{name}.{operation}: {e}"))?;

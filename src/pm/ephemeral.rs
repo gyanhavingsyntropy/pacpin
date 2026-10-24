@@ -6,6 +6,12 @@ use std::{
     process::Command,
 };
 
+#[derive(Debug)]
+pub(crate) struct BuildError { pub build_failed: bool, message: String }
+impl From<String> for BuildError { fn from(message: String) -> Self { Self { build_failed: false, message } } }
+impl From<&str> for BuildError { fn from(message: &str) -> Self { message.to_owned().into() } }
+impl std::fmt::Display for BuildError { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) } }
+
 fn read_recipe_file(path: &Path) -> Result<String, String> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
@@ -114,7 +120,7 @@ pub(crate) fn build_aur_archive(
     recipe: &Path,
     work: &Path,
     view: &BuildWorkspace,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<Vec<PathBuf>, BuildError> {
     let output = work.join("packages");
     fs::create_dir(&output).map_err(|e| e.to_string())?;
     let mut command = Command::new("makepkg");
@@ -129,17 +135,17 @@ pub(crate) fn build_aur_archive(
         fs::create_dir(work.join(dir)).map_err(|e| e.to_string())?;
     }
     let mut command = view.command(command, work)?;
-    let status = crate::progress::run(
+    let mut evidence = super::continuation::FailureEvidence::default();
+    let status = crate::progress::run_observed(
         &mut command,
         crate::progress::Manager::Runtime,
         "Building temporary AUR package",
         || {},
+        |line| evidence.observe(line),
     )
     .map_err(|e| e.to_string())?;
     if !status.success() {
-        return Err(format!(
-            "Temporary AUR build failed ({status}); no package was installed"
-        ));
+        return Err(BuildError { build_failed: status.code().is_some_and(|code| code != 130 && code != 137) && evidence.verify().is_ok(), message: format!("Temporary AUR build failed ({status}); no package was installed") });
     }
     let mut packages = Vec::new();
     for entry in fs::read_dir(output).map_err(|e| e.to_string())? {

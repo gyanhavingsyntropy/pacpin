@@ -22,6 +22,8 @@ mod install;
 mod lock;
 mod orphans;
 mod pinning;
+mod private_build;
+pub(crate) use private_build::install_archives;
 mod rebuild;
 mod validation;
 mod workspace;
@@ -97,6 +99,12 @@ pub fn check_aur_options(config: &Config, policy: crate::scratch::Policy, flags:
     crate::config::validate_privilege_tool(&config.options.privilege_tool)
         .map_err(|error| OptionError::Invalid(error.to_string()))?;
     workspace::check_options(&config.options.helper, policy, flags)?;
+    if crate::cleanup::temporary() {
+        if !workspace::is_paru(&config.options.helper) || !flags.is_empty() {
+            return Err(OptionError::Unsupported("--cleanup=temporary requires Paru recipe preparation without forwarded helper flags".into()));
+        }
+        crate::preparation::check_capability().map_err(OptionError::Invalid)?;
+    }
     if config.options.privilege_tool != "sudo" && !workspace::is_paru(&config.options.helper) {
         return Err(OptionError::Unsupported(format!("AUR helper '{}' cannot use the selected {} privilege override", config.options.helper, config.options.privilege_tool)));
     }
@@ -111,6 +119,9 @@ pub fn remove(config: &mut Config, targets: &[String], flags: &[String]) -> Resu
 
     if let Some(bad) = targets.iter().find(|t| !crate::utils::is_safe_install_target(t)) {
         return Err(format!("Refusing unsafe package target for removal: '{}'.", bad));
+    }
+    if targets.iter().any(|target| crate::sources::directory::target(config, target).is_some()) {
+        return crate::sources::directory::remove(config, targets, flags);
     }
 
     // `-n` / `--dry-run` only ever previews here: forwarded to `pacman -R`

@@ -144,12 +144,13 @@ pub struct Plan {
 impl Plan {
     pub fn new(
         config: &Config,
-        before: BTreeMap<String, String>,
+        mut before: BTreeMap<String, String>,
         expected: BTreeMap<String, String>,
         scope: crate::runtime::UpgradeScope,
         aur_available: bool,
     ) -> Result<Self, String> {
         validate(config)?;
+        add_directory_versions(config, &expected, &mut before)?;
         if std::env::var_os("PACPIN_HOOK").is_some() {
             if !config.hooks.is_empty() {
                 println!(":: Post-update hooks skipped in a hook subprocess.");
@@ -254,7 +255,7 @@ impl Plan {
             outcome.success = false;
             return outcome;
         }
-        let after = match crate::progress::operation(crate::progress::Manager::Checks, "Verifying hook conditions", || AlpmManager::with_repo_order(&config.repo_order)) {
+        let mut after = match crate::progress::operation(crate::progress::Manager::Checks, "Verifying hook conditions", || AlpmManager::with_repo_order(&config.repo_order)) {
             Ok(manager) => versions(&manager),
             Err(error) => {
                 eprintln!(":: Cannot verify updates for hooks: {error}");
@@ -262,6 +263,11 @@ impl Plan {
                 return outcome;
             }
         };
+        if let Err(error) = add_directory_versions(config, &self.expected, &mut after) {
+            eprintln!(":: Cannot verify directory updates for hooks: {error}");
+            outcome.success = false;
+            return outcome;
+        }
         let verified: BTreeSet<_> = verified_changes(
             &self.before,
             &self.expected,
@@ -349,6 +355,17 @@ impl Plan {
 pub struct Outcome {
     pub success: bool,
     pub aur: Option<bool>,
+}
+
+fn add_directory_versions(config: &Config, expected: &BTreeMap<String, String>, versions: &mut BTreeMap<String, String>) -> Result<(), String> {
+    for name in expected.keys() {
+        if let Some((alias, package)) = crate::sources::directory::target(config, name) {
+            if let Some(receipt) = crate::sources::directory::installed(config, alias, package)? {
+                if versions.insert(name.clone(), receipt.version).is_some() { return Err("Directory hook target conflicts with native ownership".into()); }
+            }
+        }
+    }
+    Ok(())
 }
 impl Default for Outcome {
     fn default() -> Self {
