@@ -205,7 +205,7 @@ pub(crate) fn run() {
             eprintln!("{}", format!("Error: {}", error).red());
             exit(1);
         }
-    } else if cmd == "check" || cmd == "-Qu" || (cmd.starts_with("-Q") && cmd.contains('u')) {
+    } else if crate::commands::cli::is_check_invocation(&args) {
         let mut check_args = Vec::new();
         if cmd.starts_with("-Q") && cmd.contains('q') {
             check_args.push("-q".to_string());

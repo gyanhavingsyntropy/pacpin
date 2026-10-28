@@ -14,7 +14,7 @@ pub use git::Revision as GitRevision;
 use crate::config::Config;
 pub use provider::SourceProvider;
 pub use install::clear_prefetched;
-pub(crate) use install::prepare_temporary;
+pub(crate) use install::{prepare_temporary, source_cache_dir, valid_sha256_key};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
@@ -162,6 +162,19 @@ pub fn safe_relative(value: &str) -> bool {
             .components()
             .all(|c| matches!(c, Component::Normal(_)))
 }
+
+pub fn safe_root_pattern(value: &str) -> bool {
+    if value.is_empty() || value.contains("**") {
+        return false;
+    }
+    let sanitized = value
+        .replace("{version}", "v")
+        .replace("{tag}", "t")
+        .replace("{arch}", "a")
+        .replace('*', "x")
+        .replace('?', "y");
+    safe_relative(&sanitized)
+}
 fn safe_text(value: &str) -> bool {
     !value.is_empty() && !value.chars().any(char::is_control)
 }
@@ -219,7 +232,7 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
             {
                 return Err(format!("'{alias}/{name}' needs a safe project path"));
             }
-            if !recipe.root.is_empty() && !safe_relative(&recipe.root) {
+            if !recipe.root.is_empty() && !safe_root_pattern(&recipe.root) {
                 return Err(format!("Invalid payload root for '{name}'"));
             }
             if recipe.format != Format::Native && recipe.binaries.is_empty() {

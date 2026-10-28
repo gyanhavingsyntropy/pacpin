@@ -10,7 +10,15 @@ pub(super) fn print_help() {
     println!("  manager NAME --FLAG        Preview and run a configured manager action");
     println!();
     println!("{}", "Core Package Operations:".bold());
-    println!("  check, -Qu                   Check pending updates & verify pin protections");
+    println!("  check, -Qu [flags]           Check pending updates & verify pin protections");
+    println!("    Flags:");
+    println!("      -q, --quiet              Output package names only");
+    println!("      -r, --repo               Check official repositories only");
+    println!("      -a, --aur, --aur-only    Check AUR packages only");
+    println!("      --sources-only           Check configured Sources only");
+    println!("      --external-only          Check enabled external managers only");
+    println!("      --no-flatpak             Exclude Flatpak from update checks");
+    println!("      --keep-going             Report partial results if a provider check fails");
     println!("  upgrade, -Syu [flags] [pkg...] Execute safe upgrade with True Resolver");
     println!("    Requested packages get their own box, and the approval");
     println!("    also covers auto-pulled dependencies (separate box).");

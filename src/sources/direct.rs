@@ -113,7 +113,7 @@ pub struct RecipeInput {
 
 pub fn build_recipe(input: RecipeInput, project: String, channel: Channel) -> Result<Recipe, String> {
     let format = match input.format.as_str() { "archive" => Format::Archive, "binary" => Format::Binary, "native" => Format::Native, _ => return Err("format must be archive, binary, or native".into()) };
-    if !crate::utils::is_safe_pkg_name(&input.name) || !safe_text(&input.asset) || (!project.is_empty() && !safe_relative(&project)) || (!input.root.is_empty() && !safe_relative(&input.root)) { return Err("Invalid package name, asset, project, or payload root".into()); }
+    if !crate::utils::is_safe_pkg_name(&input.name) || !safe_text(&input.asset) || (!project.is_empty() && !safe_relative(&project)) || (!input.root.is_empty() && !super::safe_root_pattern(&input.root)) { return Err("Invalid package name, asset, project, or payload root".into()); }
     if format != Format::Native && input.binaries.is_empty() { return Err("archive and binary recipes need at least one executable mapping".into()); }
     if input.binaries.iter().any(|(name, path)| !crate::utils::is_safe_pkg_name(name) || !safe_relative(path)) || input.depends.iter().any(|dep| !crate::utils::is_safe_pkg_name(dep)) { return Err("Invalid executable mapping or dependency".into()); }
     if input.sha256.as_ref().is_some_and(|digest| !valid_digest(digest) || input.tag.is_none()) { return Err("A fixed sha256 needs a fixed tag and 64 hex digits".into()); }

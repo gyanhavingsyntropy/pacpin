@@ -4,7 +4,8 @@ use std::io::Read;
 use std::time::Duration;
 use url::Url;
 
-pub const MAX_METADATA: u64 = 10 * 1024 * 1024;
+pub const MAX_METADATA: u64 = 20 * 1024 * 1024;
+pub const MAX_RELEASE_WINDOW_METADATA: u64 = 40 * 1024 * 1024;
 pub const MAX_ARTIFACT: u64 = 2 * 1024 * 1024 * 1024;
 
 pub fn https_url(value: &str) -> Result<Url, String> {
@@ -333,9 +334,13 @@ pub fn releases(source: &Source, name: &str, recipe: &Recipe) -> Result<Vec<Rele
             || response
                 .header("X-Next-Page")
                 .is_some_and(|h| !h.is_empty());
-        let bytes = bounded_bytes(response.into_reader(), MAX_METADATA)?;
+        let remaining_budget = MAX_RELEASE_WINDOW_METADATA.saturating_sub(total_bytes as u64);
+        if remaining_budget == 0 {
+            return Err("Release window exceeds 40 MiB total metadata budget".into());
+        }
+        let bytes = bounded_bytes(response.into_reader(), remaining_budget)?;
         total_bytes += bytes.len();
-        if total_bytes as u64 > MAX_METADATA * 4 {
+        if total_bytes as u64 > MAX_RELEASE_WINDOW_METADATA {
             return Err("Release window exceeds 40 MiB total metadata budget".into());
         }
         all.extend(parse_releases(&source.kind, &bytes, name)?);
@@ -736,5 +741,15 @@ mod tests {
             "app.tar.gz"
         )
         .is_err());
+    }
+
+    #[test]
+    fn release_window_budget_allows_large_single_pages_under_total_cap() {
+        const { assert!(MAX_METADATA >= 20 * 1024 * 1024) };
+        const { assert!(MAX_RELEASE_WINDOW_METADATA == 40 * 1024 * 1024) };
+        let big_size = 12 * 1024 * 1024;
+        let reader = std::io::repeat(b'a').take(big_size);
+        let bytes = bounded_bytes(reader, MAX_RELEASE_WINDOW_METADATA).unwrap();
+        assert_eq!(bytes.len() as u64, big_size);
     }
 }

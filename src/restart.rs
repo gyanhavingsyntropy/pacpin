@@ -469,6 +469,7 @@ mod tests {
 
     #[test]
     fn advisory_commands_preserve_units_and_runtime_privilege_tool() {
+        colored::control::set_override(false);
         let services = [
             ProcessRestartInfo {
                 service: ServiceType::SystemdSystem("a-long-system-service-name.service".into()),
@@ -485,6 +486,7 @@ mod tests {
         assert!(text.contains("'org.gnome.SettingsDaemon.Power.service'"));
         assert!(text.contains("systemctl --user restart"));
         assert!(text.contains(" \\\n"));
+        colored::control::unset_override();
     }
 
     #[test]

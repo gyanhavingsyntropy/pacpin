@@ -115,13 +115,10 @@ pub(super) fn execute_with_view(plan: &Plan, work: &Path, input: &Path, view: Op
         fs::remove_file(input).map_err(|e| e.to_string())?;
         payload
     };
-    let root = if plan.recipe.root.is_empty() {
-        payload.clone()
-    } else {
-        payload.join(&plan.recipe.root)
-    };
+    let canonical_payload = fs::canonicalize(&payload).map_err(|e| e.to_string())?;
+    let root = super::install::resolve_payload_root(plan, &canonical_payload)?;
     let root = fs::canonicalize(root).map_err(|_| "Source-code root is missing")?;
-    if !root.starts_with(&payload) || !root.is_dir() {
+    if !root.starts_with(&canonical_payload) || !root.is_dir() {
         return Err("Source-code root escapes its workspace".into());
     }
     let output = root.join(&build.output);

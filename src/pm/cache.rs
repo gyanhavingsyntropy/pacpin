@@ -39,6 +39,7 @@ pub fn clean_scoped(
     let is_aur_only = cache_scope(extra_args)? == CacheScope::Aur;
     if !is_aur_only {
         prune_download_directories(config, full)?;
+        prune_source_cache(config, full)?;
     }
     let helper = &config.options.helper;
     let use_helper = !force_native_only && crate::is_command_available(helper);
@@ -225,6 +226,115 @@ fn prune_download_directories(config: &Config, full: bool) -> Result<(), String>
                 Ok(_) => return Err(format!("Download directory remains after cleanup: {}", path.display())),
             }
             println!(":: Removed inactive ALPM download directory {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn prune_source_cache(config: &Config, full: bool) -> Result<(), String> {
+    let Some(cache_dir) = crate::sources::source_cache_dir() else { return Ok(()); };
+    if !cache_dir.is_dir() { return Ok(()); }
+    let entries = match std::fs::read_dir(&cache_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+    let active_hashes: std::collections::HashSet<String> = if full {
+        std::collections::HashSet::new()
+    } else {
+        let mut hashes = std::collections::HashSet::new();
+        if let Ok(receipts) = crate::sources::directory::inventory(config) {
+            for r in receipts {
+                if let Some(sha) = r.sha256 {
+                    if let Some(valid) = crate::sources::valid_sha256_key(&sha) {
+                        hashes.insert(valid);
+                    }
+                }
+            }
+        }
+        if let Ok(opt_entries) = std::fs::read_dir("/opt") {
+            for entry in opt_entries.flatten() {
+                let receipt_path = entry.path().join(".pacpin-source.json");
+                if let Ok(data) = std::fs::read_to_string(&receipt_path) {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+                        if let Some(sha) = parsed.get("sha256").and_then(|v| v.as_str()) {
+                            if let Some(valid) = crate::sources::valid_sha256_key(sha) {
+                                hashes.insert(valid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(manager) = crate::db::AlpmManager::new() {
+            if let Ok(sidecar_entries) = std::fs::read_dir(&cache_dir) {
+                for entry in sidecar_entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "json") {
+                        if let Ok(data) = std::fs::read_to_string(&path) {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+                                if let (Some(pkg), Some(sha)) = (
+                                    parsed.get("package").and_then(|v| v.as_str()),
+                                    parsed.get("sha256").and_then(|v| v.as_str()),
+                                ) {
+                                    let sidecar_ver =
+                                        parsed.get("version").and_then(|v| v.as_str());
+                                    if manager
+                                        .installed_version(pkg)
+                                        .is_some_and(|v| sidecar_ver.is_none_or(|sv| v == sv))
+                                    {
+                                        if let Some(valid) = crate::sources::valid_sha256_key(sha) {
+                                            hashes.insert(valid);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for source in config.sources.values() {
+            for recipe in source.packages.values() {
+                if let Some(sha) = &recipe.sha256 {
+                    if let Some(valid) = crate::sources::valid_sha256_key(sha) {
+                        hashes.insert(valid);
+                    }
+                }
+            }
+        }
+        let inventory_ok = crate::sources::directory::inventory(config).is_ok();
+        let alpm_ok = crate::db::AlpmManager::new().is_ok();
+        if hashes.is_empty() && !inventory_ok && !alpm_ok {
+            return Ok(());
+        }
+        hashes
+    };
+
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_symlink() { continue; }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(".tmp.") {
+            let is_stale = full || entry.metadata().ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|mod_time| now.duration_since(mod_time).ok())
+                .is_some_and(|age| age.as_secs() >= 3600);
+            if is_stale {
+                let _ = std::fs::remove_file(&path);
+            }
+        } else if let Some(key) = crate::sources::valid_sha256_key(&name_str) {
+            if full || !active_hashes.contains(&key) {
+                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(cache_dir.join(format!("{key}.json")));
+            }
+        } else if let Some(stem) = name_str.strip_suffix(".json") {
+            if let Some(key) = crate::sources::valid_sha256_key(stem) {
+                if full || !active_hashes.contains(&key) || !cache_dir.join(&key).is_file() {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
         }
     }
     Ok(())

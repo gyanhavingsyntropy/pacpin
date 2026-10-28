@@ -107,6 +107,7 @@ pub(crate) fn upgrade_manager_flags(flags: &[String]) -> Vec<String> {
 pub fn parse(args: &mut Vec<String>) -> Result<Policy, String> {
     let upgrade = crate::commands::cli::is_upgrade_invocation(args)
         && !crate::commands::cli::is_refresh_only_invocation(args);
+    let check = crate::commands::cli::is_check_invocation(args);
     let install = crate::commands::cli::supports_preparation(args) && args.first().is_some_and(|s| {
         matches!(s.as_str(), "install" | "rebuild") || s.starts_with("-S") && s[2..].chars().all(|c| matches!(c, 'y' | 'n'))
     });
@@ -138,12 +139,19 @@ pub fn parse(args: &mut Vec<String>) -> Result<Policy, String> {
             return Err(format!("{arg}: this flag does not take a value"));
         }
         if is_owned_flag(arg) {
-            if !(upgrade || (install || ephemeral) && matches!(arg.as_str(), "--use-ram" | "--use-storage")
-                || manager_action && is_custom_flag(arg)) {
+            let allowed_for_check = check
+                && crate::commands::cli::CHECK_SCOPE_FLAGS.contains(&arg.as_str());
+            if !(upgrade
+                || allowed_for_check
+                || (install || ephemeral) && matches!(arg.as_str(), "--use-ram" | "--use-storage")
+                || manager_action && is_custom_flag(arg))
+            {
                 return Err(format!(
                     "{arg} is only supported for {}",
                     if arg.starts_with("--use-") {
                         "installation, upgrades, run and try"
+                    } else if crate::commands::cli::CHECK_SCOPE_FLAGS.contains(&arg.as_str()) {
+                        "upgrades and check"
                     } else {
                         "upgrades"
                     }
@@ -289,5 +297,27 @@ mod tests {
         assert!(upgrade_manager_flags(&input).is_empty());
         let input = args(&["--ignore", "--no-cache", "--overwrite", "--noconfirm", "--needed"]);
         assert_eq!(upgrade_manager_flags(&input), args(&["--ignore", "--no-cache", "--overwrite", "--noconfirm"]));
+    }
+    #[test]
+    fn check_scope_and_keep_going_flags_are_supported() {
+        for cmd in ["check", "-Qu", "-Quq"] {
+            for flag in ["--sources-only", "--aur-only", "--external-only", "--keep-going"] {
+                let mut input = args(&[cmd, flag]);
+                assert!(parse(&mut input).is_ok(), "{cmd} {flag}");
+                assert_eq!(input, args(&[cmd, flag]));
+
+                let mut input_first = args(&[flag, cmd]);
+                assert!(parse(&mut input_first).is_ok(), "{flag} {cmd}");
+            }
+            assert!(parse(&mut args(&[cmd, "--sources-only", "--aur-only"])).is_err());
+            assert!(parse(&mut args(&[cmd, "--sources-only", "--external-only"])).is_err());
+            assert!(parse(&mut args(&[cmd, "--aur-only", "--external-only"])).is_err());
+
+            let err = parse(&mut args(&[cmd, "--use-ram"])).unwrap_err();
+            assert!(err.contains("only supported for installation, upgrades, run and try"), "{err}");
+        }
+
+        let err = parse(&mut args(&["install", "foo", "--sources-only"])).unwrap_err();
+        assert!(err.contains("only supported for upgrades and check"), "{err}");
     }
 }

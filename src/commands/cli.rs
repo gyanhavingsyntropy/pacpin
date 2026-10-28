@@ -162,6 +162,23 @@ pub fn is_refresh_only_invocation(args: &[String]) -> bool {
     })
 }
 
+pub const CHECK_SCOPE_FLAGS: &[&str] = &[
+    "--sources-only",
+    "--aur-only",
+    "--external-only",
+    "--keep-going",
+];
+
+pub fn is_check_invocation(args: &[String]) -> bool {
+    args.iter()
+        .find(|a| !CHECK_SCOPE_FLAGS.contains(&a.as_str()))
+        .is_some_and(|s| {
+            s == "check"
+                || s == "-Qu"
+                || (s.starts_with("-Q") && !s.starts_with("--") && s.contains('u'))
+        })
+}
+
 pub fn pacman_files_needs_sudo(args: &[String]) -> bool {
     let (_, flags) = parse_pacman_cli_args(args);
     flags.iter().any(|a| {

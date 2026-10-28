@@ -18,9 +18,25 @@ impl SourceProvider {
 
 impl IntegrationProvider for SourceProvider {
     fn cache_usage(&self) -> Option<crate::pm::CacheUsage> {
-        // Downloaded artifacts and build outputs live in owned temporary trees,
-        // not a persistent package cache awaiting --no-cache cleanup.
-        None
+        let cache_dir = super::install::source_cache_dir()?;
+        let entries = std::fs::read_dir(&cache_dir).ok()?;
+        let mut bytes = 0u64;
+        let mut complete = true;
+        for entry in entries.flatten() {
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_file() && !ft.is_symlink() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if super::install::valid_sha256_key(&name_str).is_some() || name_str.starts_with(".tmp.") {
+                        match entry.metadata().map(|m| m.len()) {
+                            Ok(len) => bytes = bytes.saturating_add(len),
+                            Err(_) => complete = false,
+                        }
+                    }
+                }
+            }
+        }
+        Some(crate::pm::CacheUsage { bytes, complete })
     }
     fn check_options(&self, _policy: crate::scratch::Policy, _no_cache: bool) -> Result<(), crate::runtime::OptionError> {
         // Sources own temporary workspaces under either policy. Their actual

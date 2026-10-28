@@ -237,8 +237,125 @@ pub fn confirm(noconfirm: bool) -> Result<(), String> {
     }
 }
 
+pub fn source_cache_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(xdg).join("pacpin/sources"));
+    }
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(|h| PathBuf::from(h).join(".cache/pacpin/sources"))
+}
+
+pub fn valid_sha256_key(expected: &str) -> Option<String> {
+    let lower = expected.trim().to_ascii_lowercase();
+    if lower.len() == 64 && lower.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        Some(lower)
+    } else {
+        None
+    }
+}
+
+pub(super) fn try_restore_from_cache(plan: &Plan, dest: &Path) -> Option<PathBuf> {
+    let key = valid_sha256_key(plan.asset.sha256.as_deref()?)?;
+    let cache_dir = source_cache_dir()?;
+    let cached = cache_dir.join(&key);
+    match fs::symlink_metadata(&cached) {
+        Ok(m) if m.is_file() => {},
+        _ => return None,
+    }
+
+    let restored = fs::hard_link(&cached, dest)
+        .or_else(|_| fs::copy(&cached, dest).map(|_| ()))
+        .is_ok();
+    if !restored {
+        let _ = fs::remove_file(dest);
+        return None;
+    }
+
+    match crate::download::compute_sha256(dest) {
+        Ok(digest) if digest.eq_ignore_ascii_case(&key) => {
+            crate::progress::source_message(format!(
+                ":: Restored verified {} from source cache (SHA-256: {})",
+                plan.asset.name,
+                &digest[..12]
+            ));
+            Some(dest.to_path_buf())
+        }
+        _ => {
+            let _ = fs::remove_file(dest);
+            let _ = fs::remove_file(&cached);
+            let _ = fs::remove_file(cache_dir.join(format!("{key}.json")));
+            None
+        }
+    }
+}
+
+pub(super) fn persist_verified_to_cache(plan: &Plan, artifact: &Path, sha256_hex: &str) {
+    let Some(key) = valid_sha256_key(sha256_hex) else { return; };
+    let Some(cache_dir) = source_cache_dir() else { return; };
+
+    if fs::create_dir_all(&cache_dir).is_err() {
+        return;
+    }
+    let _ = fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700));
+
+    let final_path = cache_dir.join(&key);
+    if final_path.is_file() {
+        return;
+    }
+
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp_path = cache_dir.join(format!(".tmp.{pid}.{nanos}.{key}"));
+
+    let staged = if fs::hard_link(artifact, &tmp_path).is_ok() {
+        true
+    } else {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .and_then(|mut out| {
+                let mut src = fs::File::open(artifact)?;
+                std::io::copy(&mut src, &mut out)?;
+                out.sync_all()
+            })
+            .is_ok()
+    };
+
+    if staged {
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o400));
+        if fs::rename(&tmp_path, &final_path).is_ok() {
+            let sidecar = serde_json::json!({
+                "source": plan.alias,
+                "package": plan.name,
+                "tag": plan.tag,
+                "version": plan.version,
+                "asset": plan.asset.name,
+                "url": plan.asset.url,
+                "sha256": key,
+            });
+            let _ = fs::write(cache_dir.join(format!("{key}.json")), sidecar.to_string());
+        } else {
+            let _ = fs::remove_file(&tmp_path);
+        }
+    } else {
+        let _ = fs::remove_file(&tmp_path);
+    }
+}
+
 fn download(plan: &Plan, work: &mut Workdir) -> Result<PathBuf, String> {
     if let Some(revision) = &plan.git { return super::git::fetch(plan, revision, &work.0); }
+    if !crate::cleanup::cache() {
+        let dest = work.0.join("artifact");
+        if let Some(cached) = try_restore_from_cache(plan, &dest) {
+            return Ok(cached);
+        }
+    }
     crate::progress::source_operation(|| download_inner(plan, work))
 }
 
@@ -371,6 +488,9 @@ fn download_inner(plan: &Plan, work: &mut Workdir) -> Result<PathBuf, String> {
         plan.asset.name,
         &digest[..digest.len().min(12)]
     ));
+    if !crate::cleanup::cache() {
+        persist_verified_to_cache(plan, &path, &digest);
+    }
     Ok(path)
 }
 
@@ -457,6 +577,167 @@ fn build(plan: &Plan, work: &Path, artifact: &Path) -> Result<PathBuf, String> {
     build_with_view(plan, work, artifact, None)
 }
 
+fn is_archive_noise(name: &str) -> bool {
+    name == ".DS_Store"
+        || name == "__MACOSX"
+        || name == "pax_global_header"
+        || name.starts_with("._")
+}
+
+fn binaries_resolve(root: &Path, binaries: &BTreeMap<String, String>) -> bool {
+    if binaries.is_empty() {
+        return false;
+    }
+    binaries.values().all(|rel| {
+        let candidate = root.join(rel);
+        if let Ok(canon) = fs::canonicalize(&candidate) {
+            canon.starts_with(root) && canon.is_file()
+        } else {
+            false
+        }
+    })
+}
+
+fn resolve_glob_root(base: &Path, pattern_str: &str) -> Result<PathBuf, String> {
+    let mut current_candidates = vec![base.to_path_buf()];
+    for segment in Path::new(pattern_str).components() {
+        let std::path::Component::Normal(seg_os) = segment else {
+            return Err("Root path pattern contains invalid components".into());
+        };
+        let seg_str = seg_os.to_string_lossy();
+        let seg_pat = glob::Pattern::new(&seg_str)
+            .map_err(|e| format!("Invalid pattern segment: {e}"))?;
+        let mut next_candidates = Vec::new();
+        for cand in current_candidates {
+            if let Ok(entries) = fs::read_dir(&cand) {
+                for entry in entries.flatten() {
+                    if let Ok(ft) = entry.file_type() {
+                        if ft.is_dir() && !ft.is_symlink() {
+                            let n = entry.file_name();
+                            let ns = n.to_string_lossy();
+                            if !is_archive_noise(&ns) && seg_pat.matches(&ns) {
+                                next_candidates.push(entry.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        current_candidates = next_candidates;
+    }
+
+    match current_candidates.len() {
+        1 => {
+            let found = current_candidates.into_iter().next().unwrap();
+            let canon = fs::canonicalize(&found).map_err(|_| "Declared payload root is missing")?;
+            if !canon.starts_with(base) || !canon.is_dir() {
+                return Err("Payload root escapes extraction directory".into());
+            }
+            Ok(canon)
+        }
+        0 => Err(format!(
+            "No directory matches root pattern '{pattern_str}' in {}",
+            base.display()
+        )),
+        n => Err(format!(
+            "Ambiguous root pattern '{pattern_str}': matches {n} directories"
+        )),
+    }
+}
+
+pub(super) fn resolve_payload_root(plan: &Plan, payload: &Path) -> Result<PathBuf, String> {
+    let canonical_payload = fs::canonicalize(payload).map_err(|e| e.to_string())?;
+
+    if !plan.recipe.root.is_empty() {
+        let clean_ver = plan.version.strip_suffix("-1").unwrap_or(&plan.version);
+        let escaped_ver = glob::Pattern::escape(clean_ver);
+        let escaped_tag = glob::Pattern::escape(&plan.tag);
+        let pattern_str = plan
+            .recipe
+            .root
+            .replace("{arch}", std::env::consts::ARCH)
+            .replace("{version}", &escaped_ver)
+            .replace("{tag}", &escaped_tag);
+
+        if !super::safe_root_pattern(&pattern_str) {
+            return Err("Expanded root pattern contains unsafe components".into());
+        }
+
+        if pattern_str.contains('*') || pattern_str.contains('?') {
+            return resolve_glob_root(&canonical_payload, &pattern_str);
+        }
+
+        let candidate = canonical_payload.join(&pattern_str);
+        let canonical_root =
+            fs::canonicalize(&candidate).map_err(|_| "Declared payload root is missing")?;
+        if !canonical_root.starts_with(&canonical_payload) || !canonical_root.is_dir() {
+            return Err("Payload root escapes extraction directory".into());
+        }
+        return Ok(canonical_root);
+    }
+
+    if !matches!(plan.recipe.format, Format::Archive | Format::Source) {
+        return Ok(canonical_payload);
+    }
+
+    // 1. Probe-first for Archive with declared binaries:
+    // If all declared binaries already resolve under canonical_payload, keep canonical_payload
+    if plan.recipe.format == Format::Archive
+        && !plan.recipe.binaries.is_empty()
+        && binaries_resolve(&canonical_payload, &plan.recipe.binaries)
+    {
+        return Ok(canonical_payload);
+    }
+
+    // 2. Discover top-level directories (ignoring archive/OS noise and skipping symlinks)
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(&canonical_payload).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if is_archive_noise(&name_str) {
+            continue;
+        }
+        let ft = entry.file_type().map_err(|e| e.to_string())?;
+        if ft.is_dir() && !ft.is_symlink() {
+            dirs.push(entry.path());
+        }
+    }
+
+    // 3. For Format::Source (pre-build source trees do not have compiled binaries yet)
+    // or recipes with no binaries declared:
+    // If there is exactly 1 top-level directory (even if accompanied by README/LICENSE files),
+    // auto-unwrap into that source directory!
+    if plan.recipe.format == Format::Source || plan.recipe.binaries.is_empty() {
+        if dirs.len() == 1 {
+            let canon = fs::canonicalize(&dirs[0]).map_err(|_| "Declared payload root is missing")?;
+            if !canon.starts_with(&canonical_payload) || !canon.is_dir() {
+                return Err("Payload root escapes extraction directory".into());
+            }
+            return Ok(canon);
+        }
+        return Ok(canonical_payload);
+    }
+
+    // 4. For Format::Archive with declared binaries:
+    // Try candidate directories and find those that contain all declared binaries.
+    let matching: Vec<_> = dirs
+        .into_iter()
+        .filter(|d| binaries_resolve(d, &plan.recipe.binaries))
+        .collect();
+    match matching.as_slice() {
+        [one] => {
+            let canon = fs::canonicalize(one).map_err(|_| "Declared payload root is missing")?;
+            if !canon.starts_with(&canonical_payload) || !canon.is_dir() {
+                return Err("Payload root escapes extraction directory".into());
+            }
+            Ok(canon)
+        }
+        [] => Ok(canonical_payload),
+        _ => Err("Ambiguous payload root; set `root` explicitly".into()),
+    }
+}
+
 pub(super) fn unpack_payload(plan: &Plan, work: &Path, artifact: &Path) -> Result<PathBuf, String> {
     let payload = work.join("payload");
     fs::create_dir(&payload).map_err(|e| e.to_string())?;
@@ -467,18 +748,11 @@ pub(super) fn unpack_payload(plan: &Plan, work: &Path, artifact: &Path) -> Resul
         verify_elf(artifact, true)?;
         fs::copy(artifact, payload.join("artifact")).map_err(|e| e.to_string())?;
     }
-    let root = if plan.recipe.root.is_empty() {
-        payload.clone()
-    } else {
-        payload.join(&plan.recipe.root)
-    };
-    let canonical_root = fs::canonicalize(&root).map_err(|_| "Declared payload root is missing")?;
-    if !canonical_root.starts_with(&payload) || !canonical_root.is_dir() {
-        return Err("Payload root escapes extraction directory".into());
-    }
+    let canonical_payload = fs::canonicalize(&payload).map_err(|e| e.to_string())?;
+    let canonical_root = resolve_payload_root(plan, &canonical_payload)?;
     for relative in plan.recipe.binaries.values() {
         let binary =
-            fs::canonicalize(root.join(relative)).map_err(|_| "Declared binary is missing")?;
+            fs::canonicalize(canonical_root.join(relative)).map_err(|_| "Declared binary is missing")?;
         if !binary.starts_with(&canonical_root) || !binary.is_file() {
             return Err("Declared binary escapes payload root or is not a file".into());
         }
@@ -491,7 +765,7 @@ pub(super) fn unpack_payload(plan: &Plan, work: &Path, artifact: &Path) -> Resul
         .create_new(true)
         .write(true)
         .mode(0o644)
-        .open(root.join(".pacpin-source.json"))
+        .open(canonical_root.join(".pacpin-source.json"))
         .map_err(|_| "Cannot create trusted package provenance")?;
     receipt
         .write_all(provenance.to_string().as_bytes())
@@ -500,7 +774,7 @@ pub(super) fn unpack_payload(plan: &Plan, work: &Path, artifact: &Path) -> Resul
     // Integrity and executable validation are complete. Release the download
     // before makepkg writes the output package, keeping the peak smaller.
     fs::remove_file(artifact).map_err(|e| format!("Cannot release verified source artifact: {e}"))?;
-    Ok(root)
+    Ok(canonical_root)
 }
 
 fn build_with_view(plan: &Plan, work: &Path, artifact: &Path, view: Option<&crate::execution::BuildWorkspace>) -> Result<PathBuf, String> {
@@ -1111,5 +1385,140 @@ mod tests {
         };
         assert!(catalog::local_path(&source, "escape").is_err());
         assert!(catalog::local_path(&source, "../passwd").is_err());
+    }
+
+    #[test]
+    fn safe_root_pattern_rules() {
+        assert!(super::super::safe_root_pattern("app-{version}-x86_64"));
+        assert!(super::super::safe_root_pattern("proton-cachyos-*-v3"));
+        assert!(super::super::safe_root_pattern("myapp-{tag}"));
+        assert!(!super::super::safe_root_pattern(""));
+        assert!(!super::super::safe_root_pattern("../escape"));
+        assert!(!super::super::safe_root_pattern("/absolute"));
+        assert!(!super::super::safe_root_pattern("nested/**/deep"));
+        assert!(!super::super::safe_root_pattern("unknown-{placeholder}"));
+    }
+
+    #[test]
+    fn resolve_payload_root_probe_first_and_auto_descent() {
+        let work = Workdir::new().unwrap();
+        let payload = work.0.join("payload");
+        fs::create_dir(&payload).unwrap();
+
+        // 1. Single-FHS trap: archive has only payload/bin/app
+        let bin_dir = payload.join("bin");
+        fs::create_dir(&bin_dir).unwrap();
+        fs::write(bin_dir.join("app"), "#!/bin/sh").unwrap();
+
+        let mut plan = fixture(&work.0);
+        plan.recipe.root = String::new();
+        plan.recipe.binaries = BTreeMap::from([("pacpin-source-test".into(), "bin/app".into())]);
+
+        // Probe-first must preserve payload root
+        let root = resolve_payload_root(&plan, &payload).unwrap();
+        assert_eq!(root, fs::canonicalize(&payload).unwrap());
+
+        // 2. Wrapped archive: payload/app-1.0/bin/app + metadata noise + README
+        let nested_work = Workdir::new().unwrap();
+        let nested_payload = nested_work.0.join("payload");
+        fs::create_dir(&nested_payload).unwrap();
+        let app_dir = nested_payload.join("app-1.0");
+        let app_bin = app_dir.join("bin");
+        fs::create_dir_all(&app_bin).unwrap();
+        fs::write(app_bin.join("app"), "#!/bin/sh").unwrap();
+        fs::write(nested_payload.join(".DS_Store"), "noise").unwrap();
+        fs::write(nested_payload.join("pax_global_header"), "noise").unwrap();
+        fs::write(nested_payload.join("README.md"), "# Readme").unwrap();
+
+        let root_wrapped = resolve_payload_root(&plan, &nested_payload).unwrap();
+        assert_eq!(root_wrapped, fs::canonicalize(&app_dir).unwrap());
+
+        // 3. Explicit root with wildcard and placeholder
+        let glob_work = Workdir::new().unwrap();
+        let glob_payload = glob_work.0.join("payload");
+        fs::create_dir(&glob_payload).unwrap();
+        let custom_dir = glob_payload.join("proton-cachyos-11.0-20261015-slr-x86_64_v3");
+        fs::create_dir_all(&custom_dir).unwrap();
+        fs::write(custom_dir.join("proton"), "#!/bin/sh").unwrap();
+
+        plan.version = "11.0-20261015-slr-1".into();
+        plan.recipe.root = "proton-cachyos-*-x86_64_v3".into();
+        plan.recipe.binaries = BTreeMap::from([("proton".into(), "proton".into())]);
+
+        let root_glob = resolve_payload_root(&plan, &glob_payload).unwrap();
+        assert_eq!(root_glob, fs::canonicalize(&custom_dir).unwrap());
+
+        // 4. Ambiguous glob error
+        let other_dir = glob_payload.join("proton-cachyos-other-x86_64_v3");
+        fs::create_dir_all(&other_dir).unwrap();
+        assert!(resolve_payload_root(&plan, &glob_payload).unwrap_err().contains("Ambiguous"));
+
+        // 5. Format::Source with single top-level directory and sibling README
+        let src_work = Workdir::new().unwrap();
+        let src_payload = src_work.0.join("payload");
+        fs::create_dir(&src_payload).unwrap();
+        let src_code = src_payload.join("cmark-0.31.0");
+        fs::create_dir(&src_code).unwrap();
+        fs::write(src_code.join("CMakeLists.txt"), "# cmake").unwrap();
+        fs::write(src_payload.join("README.md"), "# Readme").unwrap();
+        fs::write(src_payload.join("LICENSE"), "MIT").unwrap();
+
+        let mut src_plan = plan.clone();
+        src_plan.recipe.format = Format::Source;
+        src_plan.recipe.root = "".into();
+        src_plan.recipe.binaries = BTreeMap::new();
+
+        let root_src = resolve_payload_root(&src_plan, &src_payload).unwrap();
+        assert_eq!(root_src, fs::canonicalize(&src_code).unwrap());
+
+        // 6. Security: Top-level symlink must NOT be treated as a directory or auto-unwrapped
+        let sym_work = Workdir::new().unwrap();
+        let sym_payload = sym_work.0.join("payload");
+        fs::create_dir(&sym_payload).unwrap();
+        std::os::unix::fs::symlink("/usr", sym_payload.join("escaped_dir")).unwrap();
+        let root_sym = resolve_payload_root(&src_plan, &sym_payload).unwrap();
+        assert_eq!(root_sym, fs::canonicalize(&sym_payload).unwrap());
+    }
+
+    #[test]
+    fn source_cache_persistence_and_restore() {
+        let cache_env = Workdir::new().unwrap();
+        let old_cache = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", &cache_env.0);
+
+        let fixture_dir = Workdir::new().unwrap();
+        let plan = fixture(&fixture_dir.0);
+        let expected_sha = plan.asset.sha256.clone().unwrap();
+
+        // 1. First download populates cache
+        let mut work1 = Workdir::new().unwrap();
+        let artifact1 = download(&plan, &mut work1).unwrap();
+        assert!(artifact1.is_file());
+
+        let cache_dir = source_cache_dir().unwrap();
+        let cached_file = cache_dir.join(&expected_sha);
+        assert!(cached_file.is_file(), "artifact must be saved in cache");
+        assert!(cache_dir.join(format!("{expected_sha}.json")).is_file(), "sidecar must exist");
+
+        // 2. Second download hits cache without calling original fixture download
+        let mut work2 = Workdir::new().unwrap();
+        let artifact2 = download(&plan, &mut work2).unwrap();
+        assert!(artifact2.is_file());
+        assert_eq!(crate::download::compute_sha256(&artifact2).unwrap(), expected_sha);
+
+        // 3. Corrupted cache entry is evicted and self-heals
+        let _ = fs::set_permissions(&cached_file, fs::Permissions::from_mode(0o600));
+        fs::write(&cached_file, b"corrupted data").unwrap();
+        let mut work3 = Workdir::new().unwrap();
+        let artifact3 = download(&plan, &mut work3).unwrap();
+        assert!(artifact3.is_file());
+        assert_eq!(crate::download::compute_sha256(&artifact3).unwrap(), expected_sha);
+        assert_eq!(fs::read(&cached_file).unwrap(), fs::read(&artifact3).unwrap());
+
+        if let Some(val) = old_cache {
+            std::env::set_var("XDG_CACHE_HOME", val);
+        } else {
+            std::env::remove_var("XDG_CACHE_HOME");
+        }
     }
 }
