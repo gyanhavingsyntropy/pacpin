@@ -150,6 +150,12 @@ impl BuildWorkspace {
         ] {
             command.arg("--setenv").arg(name).arg(path);
         }
+        // Unprivileged bwrap maps only the caller's UID; UID 0 is unmapped, so
+        // chown(..., 0, 0) returns EINVAL, which libfakeroot does not swallow.
+        // FAKEROOTDONTTRYCHOWN instructs fakeroot to skip the kernel syscall entirely
+        // and record ownership only in faked. This prevents failures during package()
+        // (e.g. cp -a, install -o 0) in unprivileged user namespaces.
+        command.args(["--setenv", "FAKEROOTDONTTRYCHOWN", "1"]);
         command
             .arg("--")
             .arg(original.get_program())
@@ -180,6 +186,39 @@ mod tests {
         fn drop(&mut self) {
             let _ = super::super::remove_owned_tree(&self.0);
         }
+    }
+
+    #[test]
+    fn fakeroot_ownership_preservation_is_forced_in_build_view() {
+        let work = Work::new();
+        let view = BuildWorkspace {
+            root: work.0.join("missing"),
+            overlay: false,
+            readonly_paths: Vec::new(),
+        };
+        let mut original = Command::new("makepkg");
+        original.current_dir(&work.0);
+        original.env("FAKEROOTDONTTRYCHOWN", "0");
+        let result = view.command(original, &work.0);
+        if unsafe { libc::geteuid() } == 0 {
+            assert!(result.is_err());
+            return;
+        }
+        let command = result.unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let last_pos = args
+            .iter()
+            .rposition(|arg| arg == "FAKEROOTDONTTRYCHOWN")
+            .expect("FAKEROOTDONTTRYCHOWN must be set in bwrap arguments");
+        assert_eq!(args[last_pos + 1], "1");
+        let sep_pos = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("-- separator present");
+        assert!(last_pos < sep_pos);
     }
 
     #[test]

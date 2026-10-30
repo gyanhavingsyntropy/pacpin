@@ -310,29 +310,39 @@ impl IntegrationsManager {
             let Some(provider) = provider else {
                 println!(":: {}: skipped {} after AUR failure (continuation unsupported).", update.runner, update.name); continue;
             };
-            if stopped { println!(":: Sources: skipped {} because safe continuation could not be re-established.", update.name); continue; }
+            if stopped { println!(":: {}: skipped {} because safe continuation could not be re-established.", provider.name(), update.name); continue; }
             if let Err(reason) = permit.validate() {
-                eprintln!(":: Sources: skipped {}: {reason}", update.name); stopped = true; continue;
+                eprintln!(":: {}: skipped {}: {reason}", provider.name(), update.name); stopped = true; continue;
             }
-            println!(":: Checking independent Sources update: {}", update.name);
+            println!(":: Checking independent {} update: {}", provider.name(), update.name);
             let description = match provider.upgrade_description(std::slice::from_ref(update)) {
                 Ok(description) => description,
-                Err(error) => { eprintln!(":: Sources plan is invalid: {error}"); outcomes.push((String::new(), false)); stopped = true; continue; }
+                Err(error) => { eprintln!(":: {} plan is invalid: {error}", provider.name()); outcomes.push((String::new(), false)); stopped = true; continue; }
             };
             if let Some(preparation) = preparation { preparation.before(provider.name()); }
             let success = match provider.execute_after_aur_failure(update, permit) {
-                Ok(true) => { println!("✔ Sources: {} updated successfully.", update.name); true },
-                Ok(false) => { eprintln!(":: Sources: {} failed.", update.name); false },
-                Err(error) => { eprintln!(":: Sources: {} was not completed: {error}", update.name); false },
+                Ok(true) => { println!("✔ {}: {} updated successfully.", provider.name(), update.name); true },
+                Ok(false) => { eprintln!(":: {}: {} failed.", provider.name(), update.name); false },
+                Err(error) => { eprintln!(":: {}: {} was not completed: {error}", provider.name(), update.name); false },
             };
             outcomes.push((description, success));
             if !success && permit.validate().is_err() { stopped = true; }
         }
-        let source_count = updates.iter().filter(|u| u.runner == "Sources").count();
+        let supported_count = updates.iter().filter(|u| providers.iter().any(|p| p.name() == u.runner && p.supports_aur_failure_continuation())).count();
         let completed = outcomes.iter().filter(|(_, success)| *success).count();
-        if source_count != 0 && completed == source_count { crate::progress::completed(crate::progress::Manager::Sources); }
-        else if source_count != 0 { crate::progress::failed(crate::progress::Manager::Sources); }
-        if source_count != 0 { println!(":: Sources after AUR failure: {completed} completed, {} not completed.", source_count.saturating_sub(completed)); }
+        if updates.iter().any(|u| u.runner == "Sources") {
+            let source_count = updates.iter().filter(|u| u.runner == "Sources").count();
+            if completed >= source_count { crate::progress::completed(crate::progress::Manager::Sources); }
+            else { crate::progress::failed(crate::progress::Manager::Sources); }
+        }
+        if supported_count != 0 {
+            let name = if providers.iter().filter(|p| p.supports_aur_failure_continuation() && updates.iter().any(|u| u.runner == p.name())).count() == 1 {
+                updates.iter().find(|u| providers.iter().any(|p| p.name() == u.runner && p.supports_aur_failure_continuation())).map(|u| u.runner.as_str()).unwrap_or("External")
+            } else {
+                "External"
+            };
+            println!(":: {name} after AUR failure: {completed} completed, {} not completed.", supported_count.saturating_sub(completed));
+        }
         outcomes
     }
 
@@ -760,5 +770,45 @@ mod tests {
         ], None);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(outcomes.iter().all(|(_, _, success)| !success));
+    }
+
+    #[test]
+    fn continuation_filtering_and_manager_resolution() {
+        let p_flatpak = test_provider("flatpak");
+        let p_sources = crate::sources::SourceProvider::new(&Config::default());
+        assert!(!p_flatpak.supports_aur_failure_continuation());
+        assert!(p_sources.supports_aur_failure_continuation());
+
+        let providers: Vec<Arc<dyn IntegrationProvider>> = vec![
+            Arc::new(p_flatpak),
+            Arc::new(p_sources),
+        ];
+
+        // 1. When external_updates is empty:
+        let empty_updates: [ExternalUpdate; 0] = [];
+        let continuation_providers: Vec<_> = providers
+            .iter()
+            .filter(|p| p.supports_aur_failure_continuation() && empty_updates.iter().any(|u| u.runner == p.name()))
+            .map(|p| p.name())
+            .collect();
+        assert!(continuation_providers.is_empty());
+
+        // 2. When external_updates only contains Flatpak (unsupported):
+        let flatpak_only = [ExternalUpdate { runner: "Flatpak".into(), id: "app".into(), ..Default::default() }];
+        let continuation_providers: Vec<_> = providers
+            .iter()
+            .filter(|p| p.supports_aur_failure_continuation() && flatpak_only.iter().any(|u| u.runner == p.name()))
+            .map(|p| p.name())
+            .collect();
+        assert!(continuation_providers.is_empty());
+
+        // 3. When external_updates contains Sources (supported):
+        let with_sources = [ExternalUpdate { runner: "Sources".into(), id: "repo/app".into(), ..Default::default() }];
+        let continuation_providers: Vec<_> = providers
+            .iter()
+            .filter(|p| p.supports_aur_failure_continuation() && with_sources.iter().any(|u| u.runner == p.name()))
+            .map(|p| p.name())
+            .collect();
+        assert_eq!(continuation_providers, vec!["Sources"]);
     }
 }

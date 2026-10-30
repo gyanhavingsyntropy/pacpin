@@ -735,9 +735,29 @@ pub fn cmd_upgrade(
         let report = pm::execute_aur(config, &aur_targets, &options, pm::AurOperation::Install, keep_going);
         let status = report.map(|report| {
             if !report.status.success() && keep_going {
+                let continuation_providers: Vec<_> = ext_providers
+                    .iter()
+                    .filter(|p| {
+                        p.supports_aur_failure_continuation()
+                            && external_updates.iter().any(|u| u.runner == p.name())
+                    })
+                    .map(|p| p.name())
+                    .collect();
                 match report.continuation {
-                    Ok(permit) => { println!(":: AUR build failed without observed native changes; checking independent Sources (--keep-going)."); continuation_permit = Some(permit); }
-                    Err(reason) => eprintln!(":: Continuation disabled: {reason}"),
+                    Ok(permit) => {
+                        if !continuation_providers.is_empty() {
+                            println!(
+                                ":: AUR build failed without observed native changes; checking independent {} (--keep-going).",
+                                continuation_providers.join(", ")
+                            );
+                            continuation_permit = Some(permit);
+                        }
+                    }
+                    Err(reason) => {
+                        if !continuation_providers.is_empty() {
+                            eprintln!(":: Continuation disabled: {reason}");
+                        }
+                    }
                 }
             }
             report.status
