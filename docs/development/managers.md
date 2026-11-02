@@ -44,7 +44,10 @@ cannot enter prefetch, installation or cleanup through another result vector.
 
 - `--cleanup=temporary` is an invocation policy shared by install, upgrade, rebuild
   and try/run; `cache` reuses no-cache. Build-only private archives must never
-  enter the native runtime installation closure. Preserve installed dependencies,
+  enter the native runtime installation closure. Private archive validation must
+  mirror native pacman architecture configuration, accepting compatible microarchitecture
+  levels and any-arch packages rather than restricting to a single compile-time target architecture.
+  Preserve installed dependencies,
   explicit reasons, guarded AUR build-failure continuation and actual cleanup
   errors. External managers require an explicit temporary_cleanup capability;
   unsupported options use the same eligibility/keep-going policy as scratch.

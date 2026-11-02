@@ -157,7 +157,7 @@ adapter; no company-specific updater is necessary.
   PKGBUILD or install script executes during packaging.
 - `format = "binary"`: ELF executable/ELF AppImage; use
   `binaries = { myapp = "artifact" }`.
-- `format = "native"`: Arch package; name, version, and architecture are checked
+- `format = "native"`: Arch package; name, version, and architecture compatibility (following pacman's configured Architecture list) are checked
   before pacman installs it. A manifest may specify `package_version` for an
   Arch version differing from the semantic upstream version.
 - `format = "source"`: compile upstream code with a local `build` table;

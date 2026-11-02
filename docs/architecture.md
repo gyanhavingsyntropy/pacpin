@@ -383,8 +383,9 @@ required footer skip causes are covered in
 
 `preparation/` owns private dependency roots, bounded native archive fetching and
 workspace lifetime. Native try/run, AUR/Sources/export preparation and
-`pm/private_build` share it; it never imports application launching or command
-handlers. Sandbox entry-point selection remains in `sandbox/prepared`.
+`pm/private_build` share it; archive validation mirrors native pacman Architecture
+configuration via `pacman_config` and `AlpmManager`. It never imports application
+launching or command handlers. Sandbox entry-point selection remains in `sandbox/prepared`.
 `cleanup` parses invocation-only policy before ordinary option routing, preserves
 argv delimiters/values and normalizes cache intent into the existing no-cache
 lifecycle. The AUR boundary installs only the actual runtime closure of privately

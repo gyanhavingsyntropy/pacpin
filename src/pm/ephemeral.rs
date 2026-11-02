@@ -47,6 +47,7 @@ fn recipe_dependencies(info: &str, target: &str) -> Result<Vec<String>, String> 
     let mut section = None;
     let mut found = false;
     let mut dependencies = Vec::new();
+    let configured = crate::pacman_config::architectures();
     for line in info.lines() {
         let Some((key, value)) = line.trim().split_once(" = ") else {
             continue;
@@ -59,7 +60,11 @@ fn recipe_dependencies(info: &str, target: &str) -> Result<Vec<String>, String> 
         if applicable
             && ["depends", "makedepends"]
                 .iter()
-                .any(|base| key == *base || key == format!("{base}_{}", std::env::consts::ARCH))
+                .any(|base| {
+                    key == *base
+                        || key == format!("{base}_{}", std::env::consts::ARCH)
+                        || configured.iter().any(|arch| key == format!("{base}_{arch}"))
+                })
         {
             if !crate::utils::is_safe_pkg_name(crate::aur::clean_dep_name(value))
                 || value.chars().any(char::is_control)
@@ -178,5 +183,9 @@ mod tests {
         assert!(deps.contains(&"one".into()));
         assert!(!deps.contains(&"two".into()));
         assert!(recipe_dependencies(&info, "missing").is_err());
+
+        let info_arch = format!("pkgbase = base\nmakedepends_{} = tool\npkgname = first\n", std::env::consts::ARCH);
+        let deps_arch = recipe_dependencies(&info_arch, "first").unwrap();
+        assert!(deps_arch.contains(&"tool".into()));
     }
 }

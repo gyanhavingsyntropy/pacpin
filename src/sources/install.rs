@@ -524,7 +524,11 @@ pub(super) fn pkgbuild(plan: &Plan, payload: &Path) -> String {
         .map(|d| quote(d))
         .collect::<Vec<_>>()
         .join(" ");
-    let mut text = format!("pkgname={}\npkgver={}\npkgrel=1\narch=({})\nlicense=('custom')\noptions=('!strip' '!debug')\ndepends=({depends})\npackage() {{\n  install -dm755 \"$pkgdir/opt\" \"$pkgdir/usr/bin\"\n  mv -T -- {} \"$pkgdir/opt/{}\"\n  chmod 755 \"$pkgdir/opt/{}\"\n", quote(&plan.name), quote(pkgver), quote(std::env::consts::ARCH), quote(&payload.to_string_lossy()), plan.name, plan.name);
+    let primary_arch = crate::pacman_config::architectures()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| std::env::consts::ARCH.to_string());
+    let mut text = format!("pkgname={}\npkgver={}\npkgrel=1\narch=({})\nlicense=('custom')\noptions=('!strip' '!debug')\ndepends=({depends})\npackage() {{\n  install -dm755 \"$pkgdir/opt\" \"$pkgdir/usr/bin\"\n  mv -T -- {} \"$pkgdir/opt/{}\"\n  chmod 755 \"$pkgdir/opt/{}\"\n", quote(&plan.name), quote(pkgver), quote(&primary_arch), quote(&payload.to_string_lossy()), plan.name, plan.name);
     for (binary, relative) in &plan.recipe.binaries {
         text.push_str(&format!(
             "  chmod 755 -- \"$pkgdir/opt/{}/{}\"\n  ln -s -- {} \"$pkgdir/usr/bin/{}\"\n",
@@ -848,13 +852,13 @@ pub(crate) fn prepare_temporary(config: &Config, plan: &Plan, view: &crate::exec
     crate::archive::footprint(&archive)?;
     let manager = crate::db::AlpmManager::with_repo_order(&config.repo_order).map_err(|e| e.to_string())?;
     let loaded = manager.handle().pkg_load(archive.to_string_lossy().as_ref(), true, alpm::SigLevel::NONE).map_err(|e| e.to_string())?;
-    validate_output(plan, &loaded)?;
+    validate_output(plan, &loaded, &manager)?;
     Ok(TemporaryPackage { _work: work, archive })
 }
 
-fn validate_output(plan: &Plan, loaded: &alpm::Pkg) -> Result<(), String> {
+fn validate_output(plan: &Plan, loaded: &alpm::Pkg, manager: &crate::db::AlpmManager) -> Result<(), String> {
     if loaded.name() != plan.name || loaded.version().as_str() != plan.version
-        || !matches!(loaded.arch(), Some(arch) if arch == std::env::consts::ARCH || arch == "any") {
+        || !manager.accepts_arch(loaded.arch()) {
         return Err("Native package identity, version, or architecture differs from the approved plan".into());
     }
     Ok(())
@@ -965,7 +969,7 @@ fn execute_inner(config: &mut Config, plan: &Plan, needed: bool, permit: Option<
             alpm::SigLevel::NONE,
         )
         .map_err(|_| "Artifact is not a valid Arch package")?;
-    validate_output(plan, &loaded)?;
+    validate_output(plan, &loaded, &manager)?;
     let installed = manager.handle().localdb().pkg(plan.name.as_str()).ok();
     if let Some(permit) = permit {
         let dependencies = loaded.depends().into_iter().map(|d| d.to_string()).collect::<Vec<_>>();
@@ -1279,7 +1283,11 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.name(), plan.name);
         assert_eq!(loaded.version().as_str(), plan.version);
-        assert_eq!(loaded.arch(), Some(std::env::consts::ARCH));
+        let primary_arch = crate::pacman_config::architectures()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| std::env::consts::ARCH.to_string());
+        assert_eq!(loaded.arch(), Some(primary_arch.as_str()));
         let unpacked = work.0.join("verify");
         fs::create_dir(&unpacked).unwrap();
         fs::set_permissions(&unpacked, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1520,5 +1528,36 @@ mod tests {
         } else {
             std::env::remove_var("XDG_CACHE_HOME");
         }
+    }
+
+    #[test]
+    fn validate_output_mirrors_configured_architectures() {
+        let work = Workdir::new().unwrap();
+        let mut plan = fixture(&work.0);
+        plan.name = "test-pkg".into();
+        plan.version = "1.0-1".into();
+
+        let pkg_path = work.0.join("test-pkg.pkg.tar");
+        let mut archive = tar::Builder::new(fs::File::create(&pkg_path).unwrap());
+        let info = "pkgname = test-pkg\npkgver = 1.0-1\narch = x86_64_v3\nsize = 1\nlicense = custom\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(info.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append_data(&mut header, ".PKGINFO", info.as_bytes()).unwrap();
+        archive.finish().unwrap();
+
+        let mut fixture = crate::db::test_support::AlpmFixture::new(&[], &[]);
+
+        // When manager does not include x86_64_v3:
+        fixture.manager.set_architectures_for_test(vec!["x86_64".into()]);
+        let loaded = fixture.manager.handle().pkg_load(pkg_path.to_str().unwrap(), true, alpm::SigLevel::NONE).unwrap();
+        assert!(validate_output(&plan, &loaded, &fixture.manager).is_err());
+        drop(loaded);
+
+        // When manager includes x86_64_v3:
+        fixture.manager.set_architectures_for_test(vec!["x86_64".into(), "x86_64_v3".into()]);
+        let loaded = fixture.manager.handle().pkg_load(pkg_path.to_str().unwrap(), true, alpm::SigLevel::NONE).unwrap();
+        assert!(validate_output(&plan, &loaded, &fixture.manager).is_ok());
     }
 }

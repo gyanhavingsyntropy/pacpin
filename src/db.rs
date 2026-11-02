@@ -51,11 +51,34 @@ pub struct DownloadTarget {
 pub struct AlpmManager {
     handle: Alpm,
     repos: Vec<String>,
+    architectures: Vec<String>,
 }
 
 impl AlpmManager {
     pub fn new() -> Result<Self, alpm::Error> {
         Self::with_repo_order(&[])
+    }
+
+    pub fn architectures(&self) -> &[String] {
+        &self.architectures
+    }
+
+    pub fn accepts_arch(&self, arch: Option<&str>) -> bool {
+        crate::pacman_config::accepts_architecture(arch, &self.architectures)
+    }
+
+    #[cfg(test)]
+    pub fn set_architectures_for_test(&mut self, arches: Vec<String>) {
+        self.architectures = arches;
+    }
+
+    #[cfg(test)]
+    pub fn for_test(handle: Alpm, architectures: Vec<String>) -> Self {
+        Self {
+            handle,
+            repos: Vec::new(),
+            architectures,
+        }
     }
 
     pub fn get_dbpath() -> PathBuf {
@@ -67,7 +90,7 @@ impl AlpmManager {
     }
 
     pub fn with_repo_order(repo_order: &[String]) -> Result<Self, alpm::Error> {
-        crate::pacman_config::snapshot().map_err(|error| { eprintln!(":: Native configuration unavailable: {error}"); alpm::Error::System })?;
+        let snapshot = crate::pacman_config::snapshot().map_err(|error| { eprintln!(":: Native configuration unavailable: {error}"); alpm::Error::System })?;
         let root = Self::get_rootdir();
         let dbpath = Self::get_dbpath();
         let root = root.to_string_lossy();
@@ -77,7 +100,8 @@ impl AlpmManager {
         for repo in &repos {
             handle.register_syncdb(repo.as_str(), SigLevel::USE_DEFAULT)?;
         }
-        Ok(Self { handle, repos })
+        let architectures = snapshot.option("Architecture").to_vec();
+        Ok(Self { handle, repos, architectures })
     }
 
     /// Verifies all configured sync databases for missing files or corruption.
@@ -602,7 +626,11 @@ pub(crate) mod test_support {
                 handle.register_syncdb(*repo, SigLevel::empty()).unwrap();
             }
             Self {
-                manager: AlpmManager { handle, repos: repos.iter().map(|(name, _)| name.to_string()).collect() },
+                manager: AlpmManager {
+                    handle,
+                    repos: repos.iter().map(|(name, _)| name.to_string()).collect(),
+                    architectures: vec![std::env::consts::ARCH.into()],
+                },
                 path,
             }
         }

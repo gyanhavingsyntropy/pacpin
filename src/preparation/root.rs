@@ -280,11 +280,7 @@ impl<'a> PackageRoot<'a> {
                 alpm::SigLevel::NONE,
             )
             .map_err(|e| format!("Cannot inspect temporary package: {e}"))?;
-        if package.name() != expected
-            || package
-                .arch()
-                .is_none_or(|arch| arch != "any" && arch != std::env::consts::ARCH)
-        {
+        if package.name() != expected || !self.manager.accepts_arch(package.arch()) {
             return Err(
                 "Temporary archive identity or architecture does not match requested package"
                     .into(),
@@ -435,9 +431,12 @@ mod tests {
     use super::*;
     use crate::db::test_support::{AlpmFixture, FixturePackage};
     fn package(directory: &Path, name: &str, depends: &[&str], provides: &[&str]) -> PathBuf {
-        let path = directory.join(format!("{name}.pkg.tar"));
+        package_with_arch(directory, name, "any", depends, provides)
+    }
+    fn package_with_arch(directory: &Path, name: &str, arch: &str, depends: &[&str], provides: &[&str]) -> PathBuf {
+        let path = directory.join(format!("{name}-{arch}.pkg.tar"));
         let mut archive = tar::Builder::new(fs::File::create(&path).unwrap());
-        let mut info = format!("pkgname = {name}\npkgbase = {name}\npkgver = 2-1\npkgdesc = fixture\nsize = 1\narch = any\nlicense = custom\n");
+        let mut info = format!("pkgname = {name}\npkgbase = {name}\npkgver = 2-1\npkgdesc = fixture\nsize = 1\narch = {arch}\nlicense = custom\n");
         for value in depends {
             info += &format!("depend = {value}\n");
         }
@@ -509,5 +508,52 @@ mod tests {
             select_installation_archives(&fixture.manager, &[app.clone(), too_old], &[app])
                 .is_err()
         );
+    }
+    #[test]
+    fn add_archive_respects_configured_architectures() {
+        let fixture = AlpmFixture::new(&[], &[]);
+        let directory = PathBuf::from(fixture.manager.handle().dbpath());
+        let pkg_v3 = package_with_arch(&directory, "v3pkg", "x86_64_v3", &[], &[]);
+
+        let work = directory.join("test-work");
+        let root_dir = work.join("root");
+        fs::create_dir_all(&root_dir).unwrap();
+
+        let handle = alpm::Alpm::new(directory.to_str().unwrap(), directory.to_str().unwrap()).unwrap();
+        let manager = AlpmManager::for_test(handle, vec!["x86_64".into()]);
+
+        let config = Config::default();
+        let options = Options {
+            no_cache: false,
+            allow_unverified: false,
+            noconfirm: true,
+            prefix: "test",
+        };
+
+        let mut root = PackageRoot {
+            view: BuildWorkspace {
+                root: root_dir.clone(),
+                overlay: false,
+                readonly_paths: Vec::new(),
+            },
+            root: root_dir,
+            work: work.clone(),
+            manager,
+            config: &config,
+            options: &options,
+            guard: SandboxGuard::new(work),
+            archives: Vec::new(),
+            names: HashSet::new(),
+            building: HashSet::new(),
+            resolving: HashSet::new(),
+            build_failed: false,
+        };
+
+        // When manager does not have x86_64_v3 configured, add_archive fails:
+        assert!(root.add_archive(&pkg_v3, "v3pkg").is_err());
+
+        // When manager has x86_64_v3 configured, add_archive succeeds:
+        root.manager.set_architectures_for_test(vec!["x86_64".into(), "x86_64_v3".into()]);
+        assert!(root.add_archive(&pkg_v3, "v3pkg").is_ok());
     }
 }

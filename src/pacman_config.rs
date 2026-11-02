@@ -18,6 +18,24 @@ pub fn snapshot() -> Result<Arc<Snapshot>, String> {
         parse(&body).map(Arc::new)
     }).clone()
 }
+pub fn architectures() -> Vec<String> {
+    snapshot().map(|s| s.option("Architecture").to_vec()).unwrap_or_default()
+}
+
+pub fn accepts_architecture(arch: Option<&str>, configured: &[String]) -> bool {
+    match arch {
+        Some("any") => true,
+        Some(a) => {
+            if configured.is_empty() {
+                a == std::env::consts::ARCH
+            } else {
+                configured.iter().any(|c| c == a)
+            }
+        }
+        None => false,
+    }
+}
+
 fn parse(body: &str) -> Result<Snapshot, String> {
     let mut snapshot = Snapshot::default();
     let mut section = String::new();
@@ -48,5 +66,24 @@ mod tests {
         assert_eq!(snapshot.option("CacheDir").len(), 2);
         assert_eq!(snapshot.servers("first"), ["https://first"]);
         assert!(parse("[options]\nRootDir = /\nDBPath = relative\n").is_err());
+    }
+
+    #[test]
+    fn accepts_architecture_mirrors_pacman_native_rules() {
+        let configured = vec!["x86_64".into(), "x86_64_v2".into(), "x86_64_v3".into()];
+        assert!(accepts_architecture(Some("any"), &configured));
+        assert!(accepts_architecture(Some("x86_64"), &configured));
+        assert!(accepts_architecture(Some("x86_64_v2"), &configured));
+        assert!(accepts_architecture(Some("x86_64_v3"), &configured));
+        assert!(!accepts_architecture(Some("x86_64_v4"), &configured));
+        assert!(!accepts_architecture(Some("aarch64"), &configured));
+        assert!(!accepts_architecture(None, &configured));
+
+        // When configured list is empty, falls back to std::env::consts::ARCH
+        let empty: Vec<String> = Vec::new();
+        assert!(accepts_architecture(Some("any"), &empty));
+        assert!(accepts_architecture(Some(std::env::consts::ARCH), &empty));
+        assert!(!accepts_architecture(Some("foreign_arch"), &empty));
+        assert!(!accepts_architecture(None, &empty));
     }
 }
