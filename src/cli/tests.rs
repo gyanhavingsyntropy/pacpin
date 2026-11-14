@@ -344,4 +344,10 @@ use crate::{find_matching_pin, parse_install_flags};
         assert!(opts.sysupgrade);
         assert!(opts.no_cache);
         assert_eq!(opts.forwarded_flags, vec!["--overwrite", "*", "--cachedir=/tmp"]);
+
+        // Value-taking flags do not leak arguments into operation checks
+        let opts = parse_install_flags(&to_vec(&["-y", "--logfile", "-n", "pkg"]));
+        assert!(opts.refresh);
+        assert!(!opts.dry_run);
+        assert_eq!(opts.forwarded_flags, vec!["--logfile", "-n", "pkg"]);
     }

@@ -253,10 +253,15 @@ pub fn check_package_root_capacity(new_size: i64, old_size: i64) -> Result<(), S
 pub fn check_native_capacity(preview: &TransactionPreview) -> Result<(), String> {
     if preview.adds.is_empty() { return Ok(()); }
     let root = AlpmManager::get_rootdir();
-    let output = std::process::Command::new("pacman-conf").arg("CacheDir").output()
-        .map_err(|e| format!("Cannot inspect pacman cache directories: {e}"))?;
-    if !output.status.success() { return Err("Cannot inspect pacman cache directories".into()); }
-    let caches: Vec<std::path::PathBuf> = String::from_utf8_lossy(&output.stdout).lines().filter(|line| !line.trim().is_empty()).map(std::path::PathBuf::from).collect();
+    let caches: Vec<std::path::PathBuf> = match crate::pacman_config::snapshot() {
+        Ok(config) => config.option("CacheDir").iter().map(std::path::PathBuf::from).collect(),
+        Err(_) => {
+            let output = std::process::Command::new("pacman-conf").arg("CacheDir").output()
+                .map_err(|e| format!("Cannot inspect pacman cache directories: {e}"))?;
+            if !output.status.success() { return Err("Cannot inspect pacman cache directories".into()); }
+            String::from_utf8_lossy(&output.stdout).lines().filter(|line| !line.trim().is_empty()).map(std::path::PathBuf::from).collect()
+        }
+    };
     let cache = caches.first().ok_or("Pacman has no configured cache directory")?;
     let missing = preview.adds.iter().filter(|p| {
         p.filename.is_empty() || !caches.iter().any(|dir| std::fs::metadata(dir.join(&p.filename)).is_ok_and(|m| m.is_file() && m.len() == p.download_size as u64))

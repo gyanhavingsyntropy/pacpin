@@ -351,34 +351,30 @@ pub(super) fn resolve_requested_targets(
         // otherwise fall back to the AUR only when no sync package matches.
         let mut handled_native = false;
         if pinned.as_deref() != Some("aur") {
-            if let Some(sync_pkg) = manager
-            .handle()
-            .syncdbs()
-            .into_iter()
-            .find_map(|db| db.pkg(target.as_str()).ok().map(|pkg| (db.name().to_string(), pkg.version().to_string(), pkg.build_date(), pkg.isize().max(0))))
-        {
-            let (repo, candidate, builddate, _isize) = sync_pkg;
-            if held_by_name(target) {
-                return Err(format!("'{target}' is currently held back and cannot be pulled into this upgrade."));
+            if let Ok(pkg) = crate::db::find_sync_package(manager.handle(), target) {
+                let repo = pkg.db().map(|d| d.name().to_string()).unwrap_or_default();
+                let real_name = pkg.name().to_string();
+                let candidate = pkg.version().to_string();
+                let builddate = pkg.build_date();
+                if held_by_name(&real_name) {
+                    return Err(format!("'{real_name}' is currently held back and cannot be pulled into this upgrade."));
+                }
+                if ResolverEngine::is_excluded(&real_name, &repo, &config.exclude) {
+                    return Err(format!("'{real_name}' is excluded from [{repo}] by configuration; remove the exclusion to include it in this upgrade."));
+                }
+                check_requested_delay(&real_name, builddate, config, now_epoch)?;
+                let installed = installed_version(&real_name);
+                out.native.push(if repo.is_empty() { real_name.clone() } else { format!("{repo}/{real_name}") });
+                out.items.push(RequestedItem {
+                    name: real_name,
+                    manager: "repo".to_string(),
+                    repo: Some(repo),
+                    installed_version: installed.clone(),
+                    candidate_version: candidate.clone(),
+                    status: requested_status(installed.as_deref(), &candidate),
+                });
+                handled_native = true;
             }
-            if ResolverEngine::is_excluded(target, &repo, &config.exclude) {
-                return Err(format!("'{target}' is excluded from [{repo}] by configuration; remove the exclusion to include it in this upgrade."));
-            }
-            check_requested_delay(target, builddate, config, now_epoch)?;
-            let installed = installed_version(target);
-            // Qualify with the resolving repository so the executed command
-            // installs exactly what the preview approved.
-            out.native.push(format!("{repo}/{target}"));
-            out.items.push(RequestedItem {
-                name: target.clone(),
-                manager: "repo".to_string(),
-                repo: Some(repo),
-                installed_version: installed.clone(),
-                candidate_version: candidate.clone(),
-                status: requested_status(installed.as_deref(), &candidate),
-            });
-            handled_native = true;
-        }
         }
         if !handled_native {
             let found = aur::query_aur(std::slice::from_ref(target));

@@ -43,7 +43,7 @@ mod cache_summary;
 mod tests;
 
 use planning::{
-    collect_ignored_names, ignored_names, requested_aur_resolved_package,
+    collect_ignored_names, requested_aur_resolved_package,
     requested_resolved_package, resolve_requested_targets, validate_upgrade_targets,
 };
 
@@ -807,7 +807,8 @@ pub fn cmd_upgrade(
             }
         }
     } else if let Some(mut permit) = continuation_permit.filter(|_| !external_updates.is_empty()) {
-        for (cmd, success) in IntegrationsManager::execute_after_aur_failure(&ext_providers, &external_updates, &mut permit, Some(&preparation)) {
+        for (p_name, cmd, success) in IntegrationsManager::execute_after_aur_failure(&ext_providers, &external_updates, &mut permit, Some(&preparation)) {
+            external_outcomes.push((p_name.to_string(), success));
             if success { executed_commands.push(cmd); }
         }
         println!(":: The AUR stage failed; this run remains unsuccessful. Orphan cleanup is skipped.");
@@ -823,7 +824,6 @@ pub fn cmd_upgrade(
     // Packages the user ignored are skipped by pacman at execution, so they
     // must not be recorded as applied (or rollback would reason over a
     // transaction that never happened).
-    let ignored = ignored_names(extra_flags);
     applied_updates.retain(|u| !ignored.contains(&u.name));
     if !applied_updates.is_empty() {
         let mut tx_packages: Vec<serde_json::Value> = applied_updates
@@ -982,50 +982,85 @@ pub fn parse_install_flags(flags: &[String]) -> pm::InstallOptions {
             _ => None,
         }
     });
-    let dry_run = flags.iter().any(|f| f == "-n" || f == "--dry-run")
-        || flags
-            .iter()
-            .any(|f| f.starts_with('-') && !f.starts_with("--") && f[1..].contains('n'));
-    let refresh = flags.iter().any(|f| f == "-y" || f == "--refresh" || f == "-yy")
-        || flags
-            .iter()
-            .any(|f| f.starts_with('-') && !f.starts_with("--") && f[1..].contains('y'));
-    let sysupgrade = flags.iter().any(|f| f == "-u" || f == "--sysupgrade" || f == "-uu")
-        || flags
-            .iter()
-            .any(|f| f.starts_with('-') && !f.starts_with("--") && f[1..].contains('u'));
-    let noconfirm = flags.iter().any(|f| f == "--noconfirm");
-    let no_cache = flags.iter().any(|f| f == "--no-cache" || f == "--clean-cache");
-    let needed = true;
+    let mut dry_run = false;
+    let mut refresh = false;
+    let mut sysupgrade = false;
+    let mut noconfirm = false;
+    let mut no_cache = false;
+    let mut forwarded_flags = Vec::new();
+    let mut i = 0;
 
-    let forwarded_flags: Vec<String> = flags
-        .iter()
-        .enumerate()
-        .filter(|(index, f)| {
-            let s = f.as_str();
-            if *index > 0 && flags[*index - 1] == "--channel" { return false; }
-            if s == "--refresh"
-                || s == "--sysupgrade"
-                || s == "--dry-run"
-                || s == "--noconfirm"
-                || s == "--needed" || s == "--channel" || s.starts_with("--channel=")
-                || s == "--no-cache" || s == "--clean-cache"
-            {
-                return false;
+    while i < flags.len() {
+        let f = &flags[i];
+        let s = f.as_str();
+
+        if s == "--channel" {
+            i += 2;
+            continue;
+        }
+        if s.starts_with("--channel=") {
+            i += 1;
+            continue;
+        }
+        if s == "--dry-run" {
+            dry_run = true;
+            i += 1;
+            continue;
+        }
+        if s == "--refresh" {
+            refresh = true;
+            i += 1;
+            continue;
+        }
+        if s == "--sysupgrade" {
+            sysupgrade = true;
+            i += 1;
+            continue;
+        }
+        if s == "--noconfirm" {
+            noconfirm = true;
+            i += 1;
+            continue;
+        }
+        if s == "--no-cache" || s == "--clean-cache" {
+            no_cache = true;
+            i += 1;
+            continue;
+        }
+        if s == "--needed" {
+            i += 1;
+            continue;
+        }
+        if crate::commands::cli::takes_value(s) {
+            forwarded_flags.push(f.clone());
+            if i + 1 < flags.len() {
+                forwarded_flags.push(flags[i + 1].clone());
+                i += 1;
             }
-            if s.starts_with('-') && !s.starts_with("--") {
-                let chars = s[1..].chars();
-                if chars.clone().all(|c| c == 'y' || c == 'u' || c == 'n') {
-                    return false;
+            i += 1;
+            continue;
+        }
+        if s.starts_with('-') && !s.starts_with("--") {
+            let mut pure_ops = true;
+            for c in s[1..].chars() {
+                match c {
+                    'y' => refresh = true,
+                    'u' => sysupgrade = true,
+                    'n' => dry_run = true,
+                    _ => { pure_ops = false; }
                 }
             }
-            true
-        })
-        .map(|(_, f)| f.clone())
-        .collect();
+            if pure_ops {
+                i += 1;
+                continue;
+            }
+        }
+        forwarded_flags.push(f.clone());
+        i += 1;
+    }
 
     pm::InstallOptions {
-        needed,
+        needed: true,
         noconfirm,
         refresh,
         sysupgrade,

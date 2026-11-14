@@ -247,8 +247,11 @@ pub fn cmd_check(config: &Config, args: &[String]) {
         }
     };
 
+    let mut incomplete = false;
+
     if !res.check_errors.is_empty() {
         if keep_going {
+            incomplete = true;
             eprintln!(
                 ":: Warning: Update check incomplete: {}",
                 crate::discovery::describe(&res.check_errors)
@@ -295,6 +298,7 @@ pub fn cmd_check(config: &Config, args: &[String]) {
                 if keep_going {
                     let (updates, failures) = rep.into_parts();
                     if !failures.is_empty() {
+                        incomplete = true;
                         eprintln!(
                             ":: Warning: External check incomplete: {}",
                             crate::discovery::describe(&failures)
@@ -340,23 +344,32 @@ pub fn cmd_check(config: &Config, args: &[String]) {
                 })
                 .collect();
             let names = res.updates.iter().map(|p| p.name.clone()).collect();
-            match crate::preview::prepare_native_preview(mgr, &targets) {
-                Ok(preview) => {
-                    ui::render_transaction_plan(
-                        &res,
-                        &config.options.helper,
-                        &external_updates,
-                        Some(ui::PlanDetails {
-                            preview: &preview,
-                            explicit_names: &names,
-                            requested: &[],
-                            cache: None,
-                        }),
-                    );
-                }
-                Err(error) => {
-                    eprintln!(":: Native dependency preview unavailable: {error}. Totals below cover listed updates only.");
-                    render_transaction_view(&res, &config.options.helper, &external_updates);
+            if targets.is_empty() {
+                ui::render_transaction_plan(
+                    &res,
+                    &config.options.helper,
+                    &external_updates,
+                    None,
+                );
+            } else {
+                match crate::preview::prepare_native_preview(mgr, &targets) {
+                    Ok(preview) => {
+                        ui::render_transaction_plan(
+                            &res,
+                            &config.options.helper,
+                            &external_updates,
+                            Some(ui::PlanDetails {
+                                preview: &preview,
+                                explicit_names: &names,
+                                requested: &[],
+                                cache: None,
+                            }),
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(":: Native dependency preview unavailable: {error}. Totals below cover listed updates only.");
+                        render_transaction_view(&res, &config.options.helper, &external_updates);
+                    }
                 }
             }
         } else if ext_empty {
@@ -389,6 +402,10 @@ pub fn cmd_check(config: &Config, args: &[String]) {
                 "— run 'pacpin orphans -c' to remove unneeded dependencies".dimmed()
             );
         }
+    }
+
+    if keep_going && incomplete {
+        exit(2);
     }
 }
 

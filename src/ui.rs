@@ -199,7 +199,7 @@ pub fn prompt_items_selection(prompt_text: &str, items: &[String]) -> Vec<String
     }
 
     print!("\n{} ", prompt_text.bold());
-    io::stdout().flush().unwrap();
+    let _ = io::stdout().flush();
 
     let mut input = String::new();
     if io::stdin().read_line(&mut input).is_err() {
@@ -513,7 +513,7 @@ fn orphan_selection_inner(
     };
 
     print!("\n{} ", prompt_msg.bold());
-    io::stdout().flush().unwrap();
+    let _ = io::stdout().flush();
 
     let mut input = String::new();
     if io::stdin().read_line(&mut input).is_err() {

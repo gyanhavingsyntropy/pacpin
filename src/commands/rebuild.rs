@@ -263,10 +263,9 @@ fn parse_flatpak_list(stdout: &str) -> Result<BTreeMap<String, String>, String> 
 }
 
 fn list_flatpaks(scope: &str) -> Result<BTreeMap<String, String>, String> {
-    let output = Command::new("flatpak")
-        .args(["list", scope, "--app", "--columns=application,origin"])
-        .output()
-        .map_err(|e| format!("Cannot list {} Flatpaks: {}", scope, e))?;
+    let output = crate::execution::capture_output(
+        Command::new("flatpak").args(["list", scope, "--app", "--columns=application,origin"])
+    ).map_err(|e| format!("Cannot list {} Flatpaks: {}", scope, e))?;
     if !output.status.success() {
         return Err(format!(
             "Cannot list {} Flatpaks (exit {}).",
@@ -343,7 +342,8 @@ fn install_flatpaks(targets: &[String], scope: &str) -> Result<(), String> {
         if let Some(remote) = remote {
             command.arg(remote);
         }
-        let status = command.arg(app).status().map_err(|e| {
+        command.arg(app);
+        let status = crate::execution::run_tracked_command(&mut command).map_err(|e| {
             format!(
                 "Failed to start Flatpak installation for '{}': {}",
                 target, e

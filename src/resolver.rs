@@ -252,39 +252,33 @@ impl<'a> ResolverEngine<'a> {
     }
 
     pub fn load_installed_dbs() -> HashMap<String, String> {
-        use std::io::Read;
         let mut map = HashMap::new();
         let dbpath = crate::db::AlpmManager::get_dbpath();
         let local_dir = dbpath.join("local");
-        let mut buf = [0u8; 1024];
 
         if let Ok(entries) = std::fs::read_dir(local_dir) {
             for entry in entries.flatten() {
                 let desc_path = entry.path().join("desc");
-                if let Ok(mut file) = std::fs::File::open(&desc_path) {
-                    if let Ok(n) = file.read(&mut buf) {
-                        if let Ok(content) = std::str::from_utf8(&buf[..n]) {
-                            let mut name = None;
-                            let mut db = None;
-                            let mut lines = content.lines();
-                            while let Some(line) = lines.next() {
-                                if line == "%NAME%" {
-                                    if let Some(val) = lines.next() {
-                                        name = Some(val.trim().to_string());
-                                    }
-                                } else if line == "%INSTALLED_DB%" {
-                                    if let Some(val) = lines.next() {
-                                        db = Some(val.trim().to_string());
-                                    }
-                                }
-                                if name.is_some() && db.is_some() {
-                                    break;
-                                }
+                if let Ok(content) = std::fs::read_to_string(&desc_path) {
+                    let mut name = None;
+                    let mut db = None;
+                    let mut lines = content.lines();
+                    while let Some(line) = lines.next() {
+                        if line == "%NAME%" {
+                            if let Some(val) = lines.next() {
+                                name = Some(val.trim().to_string());
                             }
-                            if let (Some(n), Some(d)) = (name, db) {
-                                map.insert(n, d);
+                        } else if line == "%INSTALLED_DB%" {
+                            if let Some(val) = lines.next() {
+                                db = Some(val.trim().to_string());
                             }
                         }
+                        if name.is_some() && db.is_some() {
+                            break;
+                        }
+                    }
+                    if let (Some(n), Some(d)) = (name, db) {
+                        map.insert(n, d);
                     }
                 }
             }

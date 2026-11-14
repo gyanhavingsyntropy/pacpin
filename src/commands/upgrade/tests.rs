@@ -1,6 +1,6 @@
 //! Upgrade command and requested-plan contract checks.
 use super::*;
-use super::planning::requested_status;
+use super::planning::{ignored_names, requested_status};
 
 #[test]
 fn noconfirm_only_autoremoves_pure_orphans_when_requested() {

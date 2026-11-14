@@ -70,6 +70,7 @@ fn display_manager(manager: Manager) -> Manager {
 static TERMINAL: Mutex<Option<(libc::termios, u16)>> = Mutex::new(None);
 static VIEW: Mutex<Option<(u16, u16, u16)>> = Mutex::new(None);
 static SESSION_VIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ATEXIT_REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Keep one output region across an invocation's successive footer phases.
 pub struct SessionView;
@@ -78,7 +79,9 @@ pub fn session_view() -> SessionView {
     SESSION_VIEW.store(true, std::sync::atomic::Ordering::Relaxed);
     extern "C" fn restore_at_exit() { restore_terminal(); }
     // process::exit bypasses Rust destructors in several command handlers.
-    unsafe { libc::atexit(restore_at_exit); }
+    if !ATEXIT_REGISTERED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        unsafe { libc::atexit(restore_at_exit); }
+    }
     SessionView
 }
 impl Drop for SessionView {
@@ -896,11 +899,27 @@ pub struct BackgroundCommand {
     reader: Option<std::thread::JoinHandle<()>>,
 }
 impl BackgroundCommand {
+    fn kill_group(&mut self) {
+        let pid = self.child.0.id();
+        // Signal the entire process group so root pacman child under sudo exits and releases db.lck
+        unsafe { let _ = libc::kill(-(pid as i32), libc::SIGTERM); }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(_)) = self.child.0.try_wait() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        unsafe { let _ = libc::kill(-(pid as i32), libc::SIGKILL); }
+        let _ = self.child.0.kill();
+    }
+
     pub fn wait(mut self) -> io::Result<ExitStatus> {
         let result = self.wait_with_progress();
-        if result.is_err() { let _ = self.child.0.kill(); let _ = self.child.0.wait(); }
+        if result.is_err() { self.kill_group(); let _ = self.child.0.wait(); }
         if let Some(reader) = self.reader.take() { let _ = reader.join(); }
         *NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        crate::execution::unregister_child(self.child.0.id());
         result
     }
 
@@ -941,9 +960,13 @@ impl BackgroundCommand {
 }
 impl Drop for BackgroundCommand {
     fn drop(&mut self) {
-        if self.child.0.try_wait().ok().flatten().is_none() { let _ = self.child.0.kill(); let _ = self.child.0.wait(); }
+        if self.child.0.try_wait().ok().flatten().is_none() {
+            self.kill_group();
+            let _ = self.child.0.wait();
+        }
         if let Some(reader) = self.reader.take() { let _ = reader.join(); }
         *NATIVE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        crate::execution::unregister_child(self.child.0.id());
     }
 }
 pub fn start_background(command: &mut Command) -> io::Result<BackgroundCommand> {

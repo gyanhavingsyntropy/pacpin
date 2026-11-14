@@ -73,18 +73,10 @@ pub fn cmd_clean(config: &Config, full: bool, extra_args: &[String]) {
 }
 
 pub fn cmd_remove(mut config: Config, args: &[String], is_friendly: bool) {
-    let mut flags = Vec::new();
-    let mut targets = Vec::new();
+    let (targets, mut flags) = crate::commands::cli::parse_pacman_cli_args(args);
 
     if is_friendly {
         flags.push("-Rns".to_string());
-    }
-    for a in args {
-        if a.starts_with('-') {
-            flags.push(a.clone());
-        } else {
-            targets.push(a.clone());
-        }
     }
 
     match pm::remove(&mut config, &targets, &flags) {
@@ -168,7 +160,7 @@ pub fn cmd_reset(force: bool, noconfirm: bool) {
             "{}",
             "Are you sure you want to reset all configurations and pins to default? [y/N] ".bold()
         );
-        io::stdout().flush().unwrap();
+        let _ = io::stdout().flush();
         let mut input = String::new();
         if io::stdin().read_line(&mut input).is_err() {
             println!("\nAborted.");

@@ -518,7 +518,7 @@ pub(crate) fn check_and_prompt_smart_unpin(mut config: Config, removed_pkgs: &[S
                         repo.green()
                     );
                 }
-                io::stdout().flush().unwrap();
+                let _ = io::stdout().flush();
                 let mut input = String::new();
                 if io::stdin().read_line(&mut input).is_ok() {
                     let trimmed = input.trim().to_lowercase();
@@ -549,7 +549,7 @@ pub(crate) fn check_and_prompt_smart_unpin(mut config: Config, removed_pkgs: &[S
                     pkg.cyan().bold(),
                     days
                 );
-                io::stdout().flush().unwrap();
+                let _ = io::stdout().flush();
                 let mut input = String::new();
                 if io::stdin().read_line(&mut input).is_ok() {
                     let trimmed = input.trim().to_lowercase();

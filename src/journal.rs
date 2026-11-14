@@ -92,7 +92,14 @@ impl TransactionJournal {
 
     pub fn get_cache_dirs() -> Vec<PathBuf> {
         let mut dirs = Vec::new();
-        if let Ok(output) = Command::new("pacman-conf").arg("CacheDir").output() {
+        if let Ok(config) = crate::pacman_config::snapshot() {
+            for dir in config.option("CacheDir") {
+                let trimmed = dir.trim();
+                if !trimmed.is_empty() {
+                    dirs.push(PathBuf::from(trimmed));
+                }
+            }
+        } else if let Ok(output) = Command::new("pacman-conf").arg("CacheDir").output() {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {

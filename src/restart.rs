@@ -52,17 +52,22 @@ impl RestartInspector {
         let running_module_path = modules_dir.join(&running);
         let running_modules_missing = !running_module_path.exists();
 
-        // 2. Check if any kernel package was updated
-        let mut kernel_pkg_updated = None;
-        for p in updated_pkgs {
-            let name = &p.name;
-            if crate::utils::is_kernel_package(name) {
-                if let Some(cand) = &p.candidate {
-                    kernel_pkg_updated = Some(cand.version.clone());
-                    break;
-                }
-            }
-        }
+        // 2. Check if the package corresponding to the running kernel was updated
+        let running_pkg_prefix = if running.contains("-lts") {
+            "linux-lts"
+        } else if running.contains("-zen") {
+            "linux-zen"
+        } else if running.contains("-hardened") {
+            "linux-hardened"
+        } else if running.contains("-cachyos") {
+            "linux-cachyos"
+        } else {
+            "linux"
+        };
+        let running_pkg_updated = updated_pkgs.iter().any(|p| {
+            (p.name == running_pkg_prefix || p.name.starts_with(&format!("{running_pkg_prefix}-")))
+                && crate::utils::is_kernel_package(&p.name)
+        });
 
         // 3. Find installed versions in /usr/lib/modules
         if let Ok(entries) = fs::read_dir(modules_dir) {
@@ -73,17 +78,33 @@ impl RestartInspector {
                 .collect();
             installed_versions.sort_by(|a, b| alpm::vercmp(a.as_str(), b.as_str()));
 
-            // If running modules are missing, or a kernel was upgraded
-            if running_modules_missing || kernel_pkg_updated.is_some() {
-                // Find best matching or latest installed module
-                let latest = installed_versions
+            // Only notify if running modules disappeared or the booted kernel flavor was upgraded
+            if running_modules_missing || running_pkg_updated {
+                let flavor = if running.contains("-lts") {
+                    "-lts"
+                } else if running.contains("-zen") {
+                    "-zen"
+                } else if running.contains("-hardened") {
+                    "-hardened"
+                } else if running.contains("-cachyos") {
+                    "-cachyos"
+                } else if running.contains("-arch") {
+                    "-arch"
+                } else {
+                    ""
+                };
+                let matching = installed_versions
+                    .iter()
+                    .filter(|v| flavor.is_empty() || v.contains(flavor))
                     .last()
+                    .or_else(|| installed_versions.last())
                     .cloned()
                     .unwrap_or_else(|| "newer".to_string());
-                if latest != running {
+
+                if matching != running {
                     return Some(KernelUpdateInfo {
                         running,
-                        installed: latest,
+                        installed: matching,
                     });
                 }
             }

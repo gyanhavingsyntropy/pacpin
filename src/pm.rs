@@ -204,7 +204,7 @@ pub fn remove(config: &mut Config, targets: &[String], flags: &[String]) -> Resu
             Ok(())
         }
         Ok(s) => Err(format!("Removal exited with code {}.", s.code().unwrap_or(1))),
-        Err(e) => Err(format!("Failed to run sudo pacman: {}", e)),
+        Err(e) => Err(format!("Failed to run {} pacman: {}", config.options.privilege_tool, e)),
     }
 }
 

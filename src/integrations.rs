@@ -299,10 +299,10 @@ impl IntegrationsManager {
         report
     }
 
-    pub fn execute_after_aur_failure(
-        providers: &[Arc<dyn IntegrationProvider>], updates: &[ExternalUpdate], permit: &mut crate::pm::AurBuildFailurePermit,
+    pub fn execute_after_aur_failure<'a>(
+        providers: &'a [Arc<dyn IntegrationProvider>], updates: &[ExternalUpdate], permit: &mut crate::pm::AurBuildFailurePermit,
         preparation: Option<&preparation::Session>,
-    ) -> Vec<(String, bool)> {
+    ) -> Vec<(&'a str, String, bool)> {
         let mut outcomes = Vec::new();
         let mut stopped = false;
         for update in updates {
@@ -317,7 +317,7 @@ impl IntegrationsManager {
             println!(":: Checking independent {} update: {}", provider.name(), update.name);
             let description = match provider.upgrade_description(std::slice::from_ref(update)) {
                 Ok(description) => description,
-                Err(error) => { eprintln!(":: {} plan is invalid: {error}", provider.name()); outcomes.push((String::new(), false)); stopped = true; continue; }
+                Err(error) => { eprintln!(":: {} plan is invalid: {error}", provider.name()); outcomes.push((provider.name(), String::new(), false)); stopped = true; continue; }
             };
             if let Some(preparation) = preparation { preparation.before(provider.name()); }
             let success = match provider.execute_after_aur_failure(update, permit) {
@@ -325,11 +325,11 @@ impl IntegrationsManager {
                 Ok(false) => { eprintln!(":: {}: {} failed.", provider.name(), update.name); false },
                 Err(error) => { eprintln!(":: {}: {} was not completed: {error}", provider.name(), update.name); false },
             };
-            outcomes.push((description, success));
+            outcomes.push((provider.name(), description, success));
             if !success && permit.validate().is_err() { stopped = true; }
         }
         let supported_count = updates.iter().filter(|u| providers.iter().any(|p| p.name() == u.runner && p.supports_aur_failure_continuation())).count();
-        let completed = outcomes.iter().filter(|(_, success)| *success).count();
+        let completed = outcomes.iter().filter(|(_, _, success)| *success).count();
         if updates.iter().any(|u| u.runner == "Sources") {
             let source_count = updates.iter().filter(|u| u.runner == "Sources").count();
             if completed >= source_count { crate::progress::completed(crate::progress::Manager::Sources); }
