@@ -180,12 +180,6 @@ pub fn cmd_upgrade(
     };
     discovery_failures.extend(check_failures);
     external_updates.retain(|update| update.runner != "Sources" || !crate::sources::ignored(&update.name, extra_flags));
-    for (key, definition) in &provider_config.manager_file.managers {
-        let name = match key.as_str() { "flatpak" => "Flatpak", "nix" => "Nix", "pipx" => "Pipx", _ => key };
-        if !definition.selected_flags.is_empty() && !external_updates.iter().any(|u| u.runner == name) {
-            println!(":: {name}: custom flags skipped because this manager has no approved updates.");
-        }
-    }
 
     // Explicitly requested targets (`pin -Syu <pkg...>`) join the upgrade in
     // their own box. Source-owned and direct upstream targets are rejected
@@ -220,6 +214,18 @@ pub fn cmd_upgrade(
     let actionable = !res.updates.is_empty() || !external_updates.is_empty()
         || requested_targets.items.iter().any(|item| item.status != RequestedStatus::AlreadyCurrent);
     let aur_preflight = if actionable { preflight::aur_targets(&res, &requested_targets) } else { Vec::new() };
+
+    for (key, definition) in &provider_config.manager_file.managers {
+        let name = match key.as_str() { "flatpak" => "Flatpak", "nix" => "Nix", "pipx" => "Pipx", _ => key };
+        let has_updates = match key.as_str() {
+            "pacman" => !res.updates.is_empty() || !requested_targets.native.is_empty(),
+            "aur" => !aur_preflight.is_empty(),
+            _ => external_updates.iter().any(|u| u.runner == name),
+        };
+        if !definition.selected_flags.is_empty() && !has_updates {
+            println!(":: {name}: custom flags skipped because this manager has no approved updates.");
+        }
+    }
     let eligibility = match preflight::prepare(config, &ext_providers, &external_updates, aur_preflight, &manager_flags,
         preflight::Options { policy: crate::scratch::policy(), no_cache, keep_going }, discovery_failures) {
         Ok(plan) => plan,
@@ -638,9 +644,21 @@ pub fn cmd_upgrade(
             Err(e) => {
                 // Never start a second pacman operation while a failed wait
                 // might have left the download-only child holding db.lck.
-                eprintln!("{}", format!(":: Background download wait failed ({e}); the upgrade will download normally.").yellow());
+                eprintln!("{}", format!(":: Background download wait failed ({e}); checking lock...").yellow());
+                if let Err(lock_err) = pm::check_lock() {
+                    eprintln!("{}", format!(":: Lock error after background download failure: {lock_err}").red());
+                    exit(1);
+                }
+                println!("{}", ":: Lock released; the upgrade will download normally.".yellow());
             }
-            _ => eprintln!("{}", ":: Background download did not finish; the upgrade will download normally.".yellow()),
+            _ => {
+                eprintln!("{}", ":: Background download did not finish; checking lock...".yellow());
+                if let Err(lock_err) = pm::check_lock() {
+                    eprintln!("{}", format!(":: Lock error: {lock_err}").red());
+                    exit(1);
+                }
+                println!("{}", ":: The upgrade will download normally.".yellow());
+            }
         }
     }
 
@@ -972,16 +990,7 @@ fn revalidate_orphan_selection(
 pub fn parse_install_flags(flags: &[String]) -> pm::InstallOptions {
     let manager_flags = crate::runtime::manager_flags(flags);
     let flags = manager_flags.as_slice();
-    let channel = flags.iter().enumerate().find_map(|(index, flag)| {
-        let value = flag.strip_prefix("--channel=").or_else(|| (flag == "--channel").then(|| flags.get(index + 1)).flatten().map(String::as_str))?;
-        match value {
-            "stable" => Some(crate::sources::Channel::Stable),
-            "alpha" => Some(crate::sources::Channel::Alpha),
-            "beta" => Some(crate::sources::Channel::Beta),
-            "prerelease" => Some(crate::sources::Channel::Prerelease),
-            _ => None,
-        }
-    });
+    let mut channel = None;
     let mut dry_run = false;
     let mut refresh = false;
     let mut sysupgrade = false;
@@ -990,15 +999,27 @@ pub fn parse_install_flags(flags: &[String]) -> pm::InstallOptions {
     let mut forwarded_flags = Vec::new();
     let mut i = 0;
 
+    let parse_chan = |v: &str| match v {
+        "stable" => Some(crate::sources::Channel::Stable),
+        "alpha" => Some(crate::sources::Channel::Alpha),
+        "beta" => Some(crate::sources::Channel::Beta),
+        "prerelease" => Some(crate::sources::Channel::Prerelease),
+        _ => None,
+    };
+
     while i < flags.len() {
         let f = &flags[i];
         let s = f.as_str();
 
         if s == "--channel" {
+            if let Some(val) = flags.get(i + 1) {
+                channel = parse_chan(val);
+            }
             i += 2;
             continue;
         }
-        if s.starts_with("--channel=") {
+        if let Some(val) = s.strip_prefix("--channel=") {
+            channel = parse_chan(val);
             i += 1;
             continue;
         }
@@ -1050,6 +1071,10 @@ pub fn parse_install_flags(flags: &[String]) -> pm::InstallOptions {
                     _ => { pure_ops = false; }
                 }
             }
+            // Preserve force-refresh (-yy) and downgrade (-uu) in forwarded flags
+            if s.contains("yy") || s.contains("uu") {
+                forwarded_flags.push(f.clone());
+            }
             if pure_ops {
                 i += 1;
                 continue;
@@ -1098,12 +1123,28 @@ pub fn cmd_install(mut config: Config, targets: &[String], flags: &[String]) {
 
 fn validate_channel_flags(flags: &[String]) -> Result<(), String> {
     let mut values = Vec::new();
-    for (index, flag) in flags.iter().enumerate() {
+    let mut i = 0;
+    while i < flags.len() {
+        let flag = &flags[i];
+        if crate::commands::cli::takes_value(flag) {
+            i += 2;
+            continue;
+        }
         if let Some(value) = flag.strip_prefix("--channel=") {
             values.push(value);
-        } else if flag == "--channel" {
-            values.push(flags.get(index + 1).map(String::as_str).ok_or("--channel requires stable, alpha, beta, or prerelease")?);
+            i += 1;
+            continue;
         }
+        if flag == "--channel" {
+            if i + 1 < flags.len() {
+                values.push(flags[i + 1].as_str());
+                i += 2;
+                continue;
+            } else {
+                return Err("--channel requires stable, alpha, beta, or prerelease".into());
+            }
+        }
+        i += 1;
     }
     if values.len() > 1 { return Err("--channel may only be specified once".into()); }
     if values.iter().any(|value| !matches!(*value, "stable" | "alpha" | "beta" | "prerelease")) {

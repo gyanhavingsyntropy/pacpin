@@ -41,7 +41,10 @@ impl UpgradeScope {
         matches!(self, Self::All | Self::Aur)
     }
     pub fn includes_runner(self, name: &str) -> bool {
-        self == Self::All || self == Self::Sources && name == "Sources" || self == Self::External && name != "Sources"
+        self == Self::All
+            || (self == Self::Aur && name.eq_ignore_ascii_case("aur"))
+            || (self == Self::Sources && name == "Sources")
+            || (self == Self::External && name != "Sources" && !name.eq_ignore_ascii_case("aur") && name != "pacman")
     }
 }
 pub fn is_owned_flag(flag: &str) -> bool {

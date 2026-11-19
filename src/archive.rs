@@ -247,8 +247,7 @@ pub(crate) fn extract(
 /// Native packages can use absolute links into their installation root. Rebase
 /// those links into the private root; never create a link to the host filesystem.
 pub(crate) fn extract_package(archive_path: &Path, target_dir: &Path) -> Result<(), String> {
-    extract_inner(archive_path, target_dir, crate::download::MAX_ARCHIVE_ENTRIES, crate::download::MAX_UNPACKED_BYTES, true)?;
-    crate::download::validate_symlink_traversal(target_dir, 32)
+    extract_inner(archive_path, target_dir, crate::download::MAX_ARCHIVE_ENTRIES, crate::download::MAX_UNPACKED_BYTES, true)
 }
 
 fn package_link(path: &Path, link: &str) -> Result<String, String> {
@@ -463,6 +462,7 @@ fn extract_inner(archive_path: &Path, target_dir: &Path, max_entries: usize, max
             "Close package archive",
         )?;
     }
+    crate::download::validate_symlink_traversal(target_dir, 32)?;
     Ok(())
 }
 

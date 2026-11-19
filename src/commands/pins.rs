@@ -40,7 +40,25 @@ pub fn parse_pin_args(
                 return Err("'-f/--file' requires a file path.".to_string());
             }
             let file_path = &pin_args[i + 1];
-            match std::fs::read_to_string(file_path) {
+            let content_res = (|| -> Result<String, String> {
+                use std::io::Read;
+                use std::os::unix::fs::OpenOptionsExt;
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                    .open(file_path)
+                    .map_err(|e: std::io::Error| e.to_string())?;
+                if !file.metadata().map_err(|e: std::io::Error| e.to_string())?.is_file() {
+                    return Err("Target must be a regular file".into());
+                }
+                let mut body = String::new();
+                file.take(1_048_577).read_to_string(&mut body).map_err(|e: std::io::Error| e.to_string())?;
+                if body.len() > 1_048_576 {
+                    return Err("Package list file exceeds 1 MiB limit".into());
+                }
+                Ok(body)
+            })();
+            match content_res {
                 Ok(content) => {
                     for line in content.lines() {
                         let trimmed = line.trim();
@@ -209,39 +227,41 @@ pub fn cmd_list(config: &Config) {
         }
     }
 
-    let alpm = manager.handle();
-    let local_pkgs = alpm.localdb().pkgs();
-    let glob_pins = ResolverEngine::compile_glob_pins(&config.pins);
-    let glob_delays = ResolverEngine::compile_glob_delays(&config.delay);
-    let syncdb_map: HashMap<&str, &alpm::Db> =
-        alpm.syncdbs().into_iter().map(|d| (d.name(), d)).collect();
-    let installed_dbs = ResolverEngine::load_installed_dbs();
-
     let mut custom_matches = Vec::new();
-    for p in local_pkgs {
-        if let Some((_, target_repo, _)) =
-            ResolverEngine::find_matching_pin_rule(p.name(), &config.pins, &glob_pins)
-        {
-            let inst_db = installed_dbs.get(p.name()).cloned().unwrap_or_default();
-            let mut cand_info = None;
-            if let Some(&db) = syncdb_map.get(target_repo.as_str()) {
-                if let Ok(cand) = db.pkg(p.name()) {
-                    cand_info = Some((target_repo.clone(), cand.version().to_string()));
+    if !config.pins.is_empty() {
+        let alpm = manager.handle();
+        let local_pkgs = alpm.localdb().pkgs();
+        let glob_pins = ResolverEngine::compile_glob_pins(&config.pins);
+        let glob_delays = ResolverEngine::compile_glob_delays(&config.delay);
+        let syncdb_map: HashMap<&str, &alpm::Db> =
+            alpm.syncdbs().into_iter().map(|d| (d.name(), d)).collect();
+        let installed_dbs = ResolverEngine::load_installed_dbs();
+
+        for p in local_pkgs {
+            if let Some((_, target_repo, _)) =
+                ResolverEngine::find_matching_pin_rule(p.name(), &config.pins, &glob_pins)
+            {
+                let inst_db = installed_dbs.get(p.name()).cloned().unwrap_or_default();
+                let mut cand_info = None;
+                if let Some(&db) = syncdb_map.get(target_repo.as_str()) {
+                    if let Ok(cand) = db.pkg(p.name()) {
+                        cand_info = Some((target_repo.clone(), cand.version().to_string()));
+                    }
                 }
+                let delay_info = if config.features.stability_delays {
+                    ResolverEngine::match_delay_days(p.name(), &config.delay, &glob_delays)
+                } else {
+                    None
+                };
+                custom_matches.push((
+                    p.name().to_string(),
+                    p.version().to_string(),
+                    inst_db,
+                    target_repo,
+                    cand_info,
+                    delay_info,
+                ));
             }
-            let delay_info = if config.features.stability_delays {
-                ResolverEngine::match_delay_days(p.name(), &config.delay, &glob_delays)
-            } else {
-                None
-            };
-            custom_matches.push((
-                p.name().to_string(),
-                p.version().to_string(),
-                inst_db,
-                target_repo,
-                cand_info,
-                delay_info,
-            ));
         }
     }
     custom_matches.sort_by(|a, b| a.0.cmp(&b.0));
@@ -496,9 +516,10 @@ pub(crate) fn check_and_prompt_smart_unpin(mut config: Config, removed_pkgs: &[S
     let mut removed_pins = BTreeMap::new();
     let mut removed_delays = BTreeMap::new();
     let interactive = io::stdin().is_terminal();
+    let glob_pins = ResolverEngine::compile_glob_pins(&config.pins);
 
     for pkg in removed_pkgs {
-        if let Some((pattern, repo, is_exact)) = find_matching_pin(pkg, &config.pins) {
+        if let Some((pattern, repo, is_exact)) = ResolverEngine::find_matching_pin_rule(pkg, &config.pins, &glob_pins) {
             let should_remove = if noconfirm {
                 // A non-interactive removal may clean up a direct pin, but a
                 // wildcard rule can apply to many packages and must survive.

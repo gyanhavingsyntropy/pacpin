@@ -48,7 +48,16 @@ pub use upgrade::{cmd_install, cmd_upgrade, parse_install_flags};
 pub fn check_pacman_lock() {
     let args: Vec<String> = env::args().collect();
     let mut wait_secs = None;
-    for (i, a) in args.iter().enumerate() {
+    let mut i = 1;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            break;
+        }
+        if cli::takes_value(a) {
+            i += 2;
+            continue;
+        }
         if a == "--wait" {
             if let Some(next) = args.get(i + 1) {
                 if let Ok(s) = next.parse::<u64>() {
@@ -64,6 +73,7 @@ pub fn check_pacman_lock() {
                 break;
             }
         }
+        i += 1;
     }
 
     let res = if let Some(s) = wait_secs {

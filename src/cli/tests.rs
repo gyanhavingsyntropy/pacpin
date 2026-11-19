@@ -350,4 +350,27 @@ use crate::{find_matching_pin, parse_install_flags};
         assert!(opts.refresh);
         assert!(!opts.dry_run);
         assert_eq!(opts.forwarded_flags, vec!["--logfile", "-n", "pkg"]);
+
+        // Double-y and double-u are preserved for pacman force-refresh and downgrade
+        let opts = parse_install_flags(&to_vec(&["-yy"]));
+        assert!(opts.refresh);
+        assert!(opts.forwarded_flags.contains(&"-yy".to_string()));
+
+        let opts = parse_install_flags(&to_vec(&["-uu"]));
+        assert!(opts.sysupgrade);
+        assert!(opts.forwarded_flags.contains(&"-uu".to_string()));
+
+        // Channel flag parsing
+        let opts = parse_install_flags(&to_vec(&["--channel", "beta"]));
+        assert_eq!(opts.channel, Some(crate::sources::Channel::Beta));
+        assert!(opts.forwarded_flags.is_empty());
+    }
+
+    #[test]
+    fn test_is_check_invocation_with_scope_flags() {
+        let to_vec = |slice: &[&str]| slice.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(crate::commands::cli::is_check_invocation(&to_vec(&["--aur-only", "check"])));
+        assert!(crate::commands::cli::is_check_invocation(&to_vec(&["--keep-going", "-Quq"])));
+        assert!(crate::commands::cli::is_check_invocation(&to_vec(&["check", "--sources-only"])));
+        assert!(!crate::commands::cli::is_check_invocation(&to_vec(&["--aur-only", "install", "foo"])));
     }

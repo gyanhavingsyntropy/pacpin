@@ -245,6 +245,7 @@ pub(super) fn resolve_requested_targets(
                 if ignored.contains(tail) {
                     return Err(format!("'{tail}' is explicitly ignored; remove the matching --ignore/--ignoregroup entry to include it in this upgrade."));
                 }
+                let status = requested_status(installed_version(tail).as_deref(), &item.version);
                 out.aur.push(tail.to_string());
                 out.items.push(RequestedItem {
                     name: tail.to_string(),
@@ -252,7 +253,7 @@ pub(super) fn resolve_requested_targets(
                     repo: Some("aur".to_string()),
                     installed_version: installed_version(tail),
                     candidate_version: item.version.clone(),
-                    status: requested_status(installed_version(tail).as_deref(), &item.version),
+                    status,
                 });
             } else if manager.repos().iter().any(|repo| repo == head) {
                 let db = manager
@@ -278,6 +279,7 @@ pub(super) fn resolve_requested_targets(
                 check_requested_delay(tail, pkg.build_date(), config, now_epoch)?;
                 let installed = installed_version(tail);
                 let candidate = pkg.version().to_string();
+                let status = requested_status(installed.as_deref(), &candidate);
                 out.native.push(target.clone());
                 out.items.push(RequestedItem {
                     name: tail.to_string(),
@@ -285,7 +287,7 @@ pub(super) fn resolve_requested_targets(
                     repo: Some(head.to_string()),
                     installed_version: installed.clone(),
                     candidate_version: candidate.clone(),
-                    status: requested_status(installed.as_deref(), &candidate),
+                    status,
                 });
             } else {
                 return Err(format!(
@@ -333,6 +335,7 @@ pub(super) fn resolve_requested_targets(
                 check_requested_delay(target, pkg.build_date(), config, now_epoch)?;
                 let installed = installed_version(target);
                 let candidate = pkg.version().to_string();
+                let status = requested_status(installed.as_deref(), &candidate);
                 out.native.push(format!("{pinned_repo}/{target}"));
                 out.items.push(RequestedItem {
                     name: target.clone(),
@@ -340,7 +343,7 @@ pub(super) fn resolve_requested_targets(
                     repo: Some(pinned_repo.to_string()),
                     installed_version: installed.clone(),
                     candidate_version: candidate.clone(),
-                    status: requested_status(installed.as_deref(), &candidate),
+                    status,
                 });
                 continue;
             }
@@ -354,6 +357,12 @@ pub(super) fn resolve_requested_targets(
             if let Ok(pkg) = crate::db::find_sync_package(manager.handle(), target) {
                 let repo = pkg.db().map(|d| d.name().to_string()).unwrap_or_default();
                 let real_name = pkg.name().to_string();
+                if out.items.iter().any(|item| item.name == real_name) {
+                    continue;
+                }
+                if ignored.contains(&real_name) {
+                    return Err(format!("'{real_name}' is explicitly ignored; remove the matching --ignore/--ignoregroup entry to include it in this upgrade."));
+                }
                 let candidate = pkg.version().to_string();
                 let builddate = pkg.build_date();
                 if held_by_name(&real_name) {
@@ -364,6 +373,7 @@ pub(super) fn resolve_requested_targets(
                 }
                 check_requested_delay(&real_name, builddate, config, now_epoch)?;
                 let installed = installed_version(&real_name);
+                let status = requested_status(installed.as_deref(), &candidate);
                 out.native.push(if repo.is_empty() { real_name.clone() } else { format!("{repo}/{real_name}") });
                 out.items.push(RequestedItem {
                     name: real_name,
@@ -371,7 +381,7 @@ pub(super) fn resolve_requested_targets(
                     repo: Some(repo),
                     installed_version: installed.clone(),
                     candidate_version: candidate.clone(),
-                    status: requested_status(installed.as_deref(), &candidate),
+                    status,
                 });
                 handled_native = true;
             }
@@ -384,6 +394,7 @@ pub(super) fn resolve_requested_targets(
             if held_by_name(target) {
                 return Err(format!("'{target}' is currently held back and cannot be pulled into this upgrade."));
             }
+            let status = requested_status(installed_version(target).as_deref(), &item.version);
             out.aur.push(target.clone());
             out.items.push(RequestedItem {
                 name: target.clone(),
@@ -391,7 +402,7 @@ pub(super) fn resolve_requested_targets(
                 repo: Some("aur".to_string()),
                 installed_version: installed_version(target),
                 candidate_version: item.version.clone(),
-                status: requested_status(installed_version(target).as_deref(), &item.version),
+                status,
             });
         }
     }

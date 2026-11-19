@@ -54,6 +54,7 @@ pub fn validate_helper(helper: &str) -> Result<String, String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Options {
     #[serde(default = "default_helper")]
     pub helper: String,
@@ -91,6 +92,7 @@ impl Default for Options {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Features {
     #[serde(default = "default_true")]
     pub pinning: bool,
@@ -128,6 +130,7 @@ impl Default for Features {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct IntegrationsConfig {
     #[serde(default = "default_false")]
     pub flatpak: bool,
@@ -249,10 +252,36 @@ pub fn config_exists() -> bool {
     get_config_path().exists()
 }
 
+fn read_config_file(path: &Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("Cannot read {}: {e}", path.display())),
+    };
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err(format!("{} must be a regular file", path.display()));
+    }
+    let mut body = String::new();
+    file.take(1_048_577)
+        .read_to_string(&mut body)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    if body.len() > 1_048_576 {
+        return Err(format!("{} exceeds the 1 MiB configuration limit", path.display()));
+    }
+    Ok(Some(body))
+}
+
 pub fn load_config() -> Config {
     let path = get_config_path();
-    let mut config: Config = if !path.exists() { Config::default() } else { match fs::read_to_string(&path) {
-        Ok(contents) => match toml::from_str(&contents) {
+    let mut config: Config = match read_config_file(&path) {
+        Ok(None) => Config::default(),
+        Ok(Some(contents)) => match toml::from_str(&contents) {
             Ok(cfg) => cfg,
             Err(e) => {
                 eprintln!(
@@ -282,7 +311,7 @@ pub fn load_config() -> Config {
             );
             std::process::exit(1);
         }
-    }};
+    };
 
     if let Err(error) = load_supplements(&mut config, &path) {
         eprintln!("Error: {error}");
@@ -365,10 +394,10 @@ where
     F: FnOnce(&mut Config) -> Result<R, String>,
 {
     let _lock = lock_config(path).map_err(|e| format!("Failed to lock configuration: {}", e))?;
-    let mut cfg = match fs::read_to_string(path) {
-        Ok(contents) => toml::from_str(&contents)
+    let mut cfg = match read_config_file(path) {
+        Ok(Some(contents)) => toml::from_str(&contents)
             .map_err(|e| format!("Failed to parse configuration: {}", e))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        Ok(None) => Config::default(),
         Err(e) => return Err(format!("Failed to read configuration: {}", e)),
     };
     load_supplements(&mut cfg, path)?;

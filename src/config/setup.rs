@@ -93,13 +93,9 @@ impl Snapshot {
         validate(updated)?;
         let backup = if let Some(body) = &self.files[0] {
             let directory = self.path.parent().unwrap_or_else(|| Path::new("."));
-            let path =
-                crate::download::create_secure_temp_file(directory, "config.toml.backup", "toml")?;
+            let (path, mut file) =
+                crate::download::create_secure_temp_file_with_handle(directory, "config.toml.backup", "toml")?;
             let result = (|| {
-                let mut file = fs::OpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                    .open(&path)?;
                 file.write_all(body)?;
                 file.sync_all()
             })();

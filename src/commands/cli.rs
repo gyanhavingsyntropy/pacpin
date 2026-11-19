@@ -89,6 +89,30 @@ pub fn parse_pacman_cli_args(args: &[String]) -> (Vec<String>, Vec<String>) {
     (targets, flags)
 }
 
+pub fn iter_flags(flags_list: &[String]) -> impl Iterator<Item = &String> {
+    struct FlagIter<'a> {
+        slice: &'a [String],
+        idx: usize,
+    }
+    impl<'a> Iterator for FlagIter<'a> {
+        type Item = &'a String;
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.idx < self.slice.len() {
+                let item = &self.slice[self.idx];
+                if takes_value(item) {
+                    self.idx += 2;
+                } else {
+                    self.idx += 1;
+                }
+                Some(item)
+            } else {
+                None
+            }
+        }
+    }
+    FlagIter { slice: flags_list, idx: 0 }
+}
+
 pub fn is_upgrade_invocation(args: &[String]) -> bool {
     if args.is_empty() {
         return false;
@@ -104,7 +128,7 @@ pub fn is_upgrade_invocation(args: &[String]) -> bool {
     let (targets, flags_list) = parse_pacman_cli_args(&args[1..]);
 
     let mut flags = std::collections::HashSet::new();
-    for a in std::iter::once(first).chain(flags_list.iter()) {
+    for a in std::iter::once(first).chain(iter_flags(&flags_list)) {
         if a.starts_with('-') && !a.starts_with("--") {
             for c in a[1..].chars() {
                 flags.insert(c);
@@ -117,7 +141,7 @@ pub fn is_upgrade_invocation(args: &[String]) -> bool {
     // stays on the install path.
     if !(targets.is_empty()
         || flags.contains(&'u')
-        || flags_list.iter().any(|a| a == "--sysupgrade"))
+        || iter_flags(&flags_list).any(|a| a == "--sysupgrade"))
     {
         return false;
     }
@@ -129,7 +153,7 @@ pub fn is_upgrade_invocation(args: &[String]) -> bool {
         || flags.contains(&'l')
         || flags.contains(&'g')
         || (flags.contains(&'c') && !flags.contains(&'u'))
-        || flags_list.iter().any(|a| {
+        || iter_flags(&flags_list).any(|a| {
             a == "--search"
                 || a == "--info"
                 || a == "--downloadonly"
@@ -144,8 +168,7 @@ pub fn is_upgrade_invocation(args: &[String]) -> bool {
 
     flags.contains(&'u')
         || flags.contains(&'y')
-        || flags_list
-            .iter()
+        || iter_flags(&flags_list)
             .any(|a| a == "--sysupgrade" || a == "--refresh")
 }
 
@@ -156,10 +179,11 @@ pub fn is_refresh_only_invocation(args: &[String]) -> bool {
     }
     let first = &args[0];
     let (_, flags) = parse_pacman_cli_args(&args[1..]);
-    !std::iter::once(first).chain(flags.iter()).any(|arg| {
+    let has_u = std::iter::once(first).chain(iter_flags(&flags)).any(|arg| {
         arg == "--sysupgrade"
             || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('u'))
-    })
+    });
+    !has_u
 }
 
 pub const CHECK_SCOPE_FLAGS: &[&str] = &[
@@ -181,7 +205,7 @@ pub fn is_check_invocation(args: &[String]) -> bool {
 
 pub fn pacman_files_needs_sudo(args: &[String]) -> bool {
     let (_, flags) = parse_pacman_cli_args(args);
-    flags.iter().any(|a| {
+    let needs_sudo = iter_flags(&flags).any(|a| {
         if a == "--refresh" {
             true
         } else if a.starts_with('-') && !a.starts_with("--") {
@@ -189,7 +213,8 @@ pub fn pacman_files_needs_sudo(args: &[String]) -> bool {
         } else {
             false
         }
-    })
+    });
+    needs_sudo
 }
 
 #[cfg(test)]

@@ -155,8 +155,8 @@ pub(super) fn eligible_requests(config: &Config, manager: &crate::db::AlpmManage
         if crate::sources::owner(config, target).is_some() { return true; }
         let pin = config.features.pinning.then(|| crate::resolver::ResolverEngine::match_pinned_package(target, &config.pins, &glob_pins)).flatten();
         if let Some(repo) = pin { return repo != "aur"; }
-        // Requested upgrade classification requires an exact native name.
-        manager.handle().syncdbs().into_iter().any(|db| db.pkg(target.as_str()).is_ok())
+        // Requested upgrade classification checks native sync databases (exact name, versioned, or virtual provider)
+        crate::db::find_sync_package(manager.handle(), target).is_ok()
     }).cloned().collect()
 }
 

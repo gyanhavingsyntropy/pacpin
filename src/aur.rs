@@ -99,12 +99,8 @@ fn read_rpc_body(reader: impl Read, limit: u64) -> Result<String, String> {
     Ok(text)
 }
 
-fn query_aur_chunk(chunk: &[String]) -> Result<HashMap<String, AurItem>, String> {
+fn query_aur_chunk(agent: &ureq::Agent, chunk: &[String]) -> Result<HashMap<String, AurItem>, String> {
     let mut results = HashMap::new();
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(6))
-        .user_agent("pacpin/3.1 (GPLv3)")
-        .build();
 
     let params: Vec<String> = chunk
         .iter()
@@ -119,9 +115,6 @@ fn query_aur_chunk(chunk: &[String]) -> Result<HashMap<String, AurItem>, String>
 
     while attempts < max_attempts && !success {
         attempts += 1;
-        if attempts > 1 {
-            std::thread::sleep(std::time::Duration::from_millis(400 * attempts as u64));
-        }
 
         match agent.get(&url).call() {
             Ok(resp) => {
@@ -131,6 +124,8 @@ fn query_aur_chunk(chunk: &[String]) -> Result<HashMap<String, AurItem>, String>
                     Err(e) => {
                         if attempts == max_attempts {
                             eprintln!("{}", format!(":: Warning: Failed to read AUR RPC response: {}", e).yellow());
+                        } else {
+                            std::thread::sleep(std::time::Duration::from_millis(400 * attempts as u64));
                         }
                         continue;
                     }
@@ -153,6 +148,8 @@ fn query_aur_chunk(chunk: &[String]) -> Result<HashMap<String, AurItem>, String>
                                 )
                                 .yellow()
                             );
+                        } else {
+                            std::thread::sleep(std::time::Duration::from_millis(400 * attempts as u64));
                         }
                     }
                 }
@@ -166,7 +163,7 @@ fn query_aur_chunk(chunk: &[String]) -> Result<HashMap<String, AurItem>, String>
                     504 => "Gateway timeout (HTTP 504)",
                     _ => "HTTP error response",
                 };
-                if attempts == max_attempts {
+                if attempts == max_attempts || matches!(code, 400 | 403 | 404 | 414) {
                     eprintln!(
                         "{}",
                         format!(
@@ -176,8 +173,16 @@ fn query_aur_chunk(chunk: &[String]) -> Result<HashMap<String, AurItem>, String>
                         .yellow()
                     );
                 }
+                // Permanent client errors (400, 403, 404, 414): no point retrying
+                if matches!(code, 400 | 403 | 404 | 414) {
+                    break;
+                }
                 if code == 429 {
-                    std::thread::sleep(std::time::Duration::from_millis(1500 * attempts as u64));
+                    if attempts < max_attempts {
+                        std::thread::sleep(std::time::Duration::from_millis(1500 * attempts as u64));
+                    }
+                } else if attempts < max_attempts {
+                    std::thread::sleep(std::time::Duration::from_millis(400 * attempts as u64));
                 }
             }
             Err(ureq::Error::Transport(transport_err)) => {
@@ -190,12 +195,14 @@ fn query_aur_chunk(chunk: &[String]) -> Result<HashMap<String, AurItem>, String>
                         )
                         .yellow()
                     );
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(400 * attempts as u64));
                 }
             }
         }
     }
 
-    if success { Ok(results) } else { Err(format!("AUR check failed for {} package(s) after {max_attempts} attempts", chunk.len())) }
+    if success { Ok(results) } else { Err(format!("AUR check failed for {} package(s) after {attempts} attempts", chunk.len())) }
 }
 
 fn parse_requested_aur_response(body: &str, requested: &[String]) -> Result<Vec<AurItem>, String> {
@@ -215,8 +222,15 @@ pub fn query_aur_checked(pkg_names: &[String]) -> Result<HashMap<String, AurItem
         return Ok(HashMap::new());
     }
 
+    let agent = std::sync::Arc::new(
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(6))
+            .user_agent(concat!("pacpin/", env!("CARGO_PKG_VERSION"), " (GPLv3)"))
+            .build(),
+    );
+
     if pkg_names.len() <= 50 {
-        return query_aur_chunk(pkg_names);
+        return query_aur_chunk(&agent, pkg_names);
     }
 
     // Query 50-package chunks concurrently with bounded worker concurrency (max 4 parallel connections)
@@ -228,10 +242,27 @@ pub fn query_aur_checked(pkg_names: &[String]) -> Result<HashMap<String, AurItem
         let mut handles = Vec::new();
         for chunk in chunk_batch {
             let chunk = chunk.clone();
-            handles.push(std::thread::spawn(move || query_aur_chunk(&chunk)));
+            let ag = std::sync::Arc::clone(&agent);
+            handles.push(std::thread::spawn(move || query_aur_chunk(&ag, &chunk)));
         }
+        let mut first_error = None;
         for h in handles {
-            results.extend(h.join().map_err(|_| "AUR check worker failed")??);
+            match h.join() {
+                Ok(Ok(map)) => results.extend(map),
+                Ok(Err(e)) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error = Some("AUR check worker panicked".to_string());
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
         }
     }
 

@@ -79,10 +79,6 @@ pub(crate) fn run() {
         exit(0);
     }
 
-    match crate::cleanup::parse(&mut args) {
-        Ok(policy) => crate::cleanup::initialize(policy),
-        Err(error) => { eprintln!("Error: {error}"); exit(2); }
-    }
     let cli_privilege_override = match runtime::extract_privilege_override(&mut args) {
         Ok(tool) => tool.map(str::to_string),
         Err(error) => { eprintln!("Error: {error}"); exit(2); }
@@ -93,9 +89,9 @@ pub(crate) fn run() {
         Err(error) => { eprintln!("Error: {error}"); exit(2); }
     }
 
-    if is_clean_invocation(&args) && unsafe { libc::geteuid() } == 0 {
-        eprintln!("Error: Do not run pacpin as root. Run pacpin as your user (e.g. `pin clean` or `pin clean --pkexec`); it will elevate privileges automatically.");
-        exit(1);
+    match crate::cleanup::parse(&mut args) {
+        Ok(policy) => crate::cleanup::initialize(policy),
+        Err(error) => { eprintln!("Error: {error}"); exit(2); }
     }
 
     if args
@@ -114,6 +110,11 @@ pub(crate) fn run() {
     {
         print_help();
         exit(0);
+    }
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("Error: Do not run pacpin as root. Run pacpin as your normal user; it will elevate privileges automatically when required.");
+        exit(1);
     }
 
     if args
@@ -207,13 +208,25 @@ pub(crate) fn run() {
         }
     } else if crate::commands::cli::is_check_invocation(&args) {
         let mut check_args = Vec::new();
-        if cmd.starts_with("-Q") && cmd.contains('q') {
-            check_args.push("-q".to_string());
+        let mut matched_token = false;
+        for arg in &args {
+            if !matched_token
+                && (arg == "check"
+                    || arg == "-Qu"
+                    || (arg.starts_with("-Q") && !arg.starts_with("--") && arg.contains('u')))
+            {
+                matched_token = true;
+                if arg.starts_with("-Q") && arg.contains('q') {
+                    check_args.push("-q".to_string());
+                }
+            } else {
+                check_args.push(arg.clone());
+            }
         }
-        check_args.extend_from_slice(&args[1..]);
         cmd_check(&config, &check_args);
     } else if is_refresh_only_invocation(&args) {
-        if args.iter().any(|arg| arg == "-n" || arg == "--dry-run") {
+        let (_, extra_flags) = parse_pacman_cli_args(&args[1..]);
+        if crate::commands::cli::iter_flags(&extra_flags).any(|arg| arg == "-n" || arg == "--dry-run") {
             println!(":: Would refresh package databases only: {} pacman {}", config.options.privilege_tool, args.join(" "));
             exit(0);
         }
@@ -226,20 +239,19 @@ pub(crate) fn run() {
         }
     } else if is_upgrade_invocation(&args) {
         let (targets, extra_flags) = parse_pacman_cli_args(&args[1..]);
-        let dry_run = args.iter().any(|a| a == "-n" || a == "--dry-run")
-            || args
-                .iter()
+        let dry_run = crate::commands::cli::iter_flags(&extra_flags).any(|a| a == "-n" || a == "--dry-run")
+            || (cmd.starts_with('-') && !cmd.starts_with("--") && cmd[1..].contains('n'))
+            || crate::commands::cli::iter_flags(&extra_flags)
                 .any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains('n'));
-        let refresh = args.iter().any(|a| a == "-y" || a == "--refresh")
-            || args
-                .iter()
+        let refresh = crate::commands::cli::iter_flags(&extra_flags).any(|a| a == "-y" || a == "--refresh")
+            || (cmd.starts_with('-') && !cmd.starts_with("--") && cmd[1..].contains('y'))
+            || crate::commands::cli::iter_flags(&extra_flags)
                 .any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains('y'));
-        let noconfirm = args.iter().any(|a| a == "--noconfirm");
-        let autoremove = args
-            .iter()
+        let noconfirm = crate::commands::cli::iter_flags(&extra_flags).any(|a| a == "--noconfirm");
+        let autoremove = crate::commands::cli::iter_flags(&extra_flags)
             .any(|a| a == "-c" || a == "--clean" || a == "--autoremove")
-            || args
-                .iter()
+            || (cmd.starts_with('-') && !cmd.starts_with("--") && cmd[1..].contains('c'))
+            || crate::commands::cli::iter_flags(&extra_flags)
                 .any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains('c'));
         cmd_upgrade(
             &config,
@@ -253,7 +265,9 @@ pub(crate) fn run() {
     } else if cmd == "search"
         || cmd == "-Ss"
         || (cmd.starts_with("-S")
-            && (cmd.contains('s') || args.iter().any(|a| a == "-s" || a == "--search")))
+            && (cmd.contains('s')
+                || crate::commands::cli::iter_flags(&parse_pacman_cli_args(&args[1..]).1)
+                    .any(|a| a == "-s" || a == "--search")))
     {
         let query_args: Vec<String> = if cmd.starts_with("-S") {
             let mut q = Vec::new();
@@ -274,7 +288,9 @@ pub(crate) fn run() {
     } else if cmd == "info"
         || cmd == "-Si"
         || (cmd.starts_with("-S")
-            && (cmd.contains('i') || args.iter().any(|a| a == "-i" || a == "--info")))
+            && (cmd.contains('i')
+                || crate::commands::cli::iter_flags(&parse_pacman_cli_args(&args[1..]).1)
+                    .any(|a| a == "-i" || a == "--info")))
     {
         let pkg_args: Vec<String> = if cmd.starts_with("-S") {
             let mut p = Vec::new();
@@ -296,7 +312,9 @@ pub(crate) fn run() {
         let (full, extra_args) = parse_clean_args(&args);
         cmd_clean(&config, full, &extra_args);
     } else if cmd.starts_with("-Sw")
-        || (cmd.starts_with("-S") && args.iter().any(|a| a == "-w" || a == "--downloadonly"))
+        || (cmd.starts_with("-S")
+            && crate::commands::cli::iter_flags(&parse_pacman_cli_args(&args[1..]).1)
+                .any(|a| a == "-w" || a == "--downloadonly"))
     {
         match pm::forward_pacman(&config, &args, true) {
             Ok(code) => exit(code),
@@ -308,8 +326,7 @@ pub(crate) fn run() {
     } else if cmd == "-Sp"
         || (cmd.starts_with("-S") && cmd.contains('p'))
         || (cmd.starts_with("-S")
-            && args
-                .iter()
+            && crate::commands::cli::iter_flags(&parse_pacman_cli_args(&args[1..]).1)
                 .any(|a| a == "-p" || a == "--print-uris" || a == "--print"))
     {
         let (targets, _) = parse_pacman_cli_args(&args[1..]);
@@ -317,14 +334,18 @@ pub(crate) fn run() {
         exit(0);
     } else if cmd == "-Sl"
         || (cmd.starts_with("-S") && cmd.contains('l'))
-        || (cmd.starts_with("-S") && args.iter().any(|a| a == "-l" || a == "--list"))
+        || (cmd.starts_with("-S")
+            && crate::commands::cli::iter_flags(&parse_pacman_cli_args(&args[1..]).1)
+                .any(|a| a == "-l" || a == "--list"))
     {
         let (repos, _) = parse_pacman_cli_args(&args[1..]);
         cmd_sync_list(&config, &repos);
         exit(0);
     } else if cmd == "-Sg"
         || (cmd.starts_with("-S") && cmd.contains('g'))
-        || (cmd.starts_with("-S") && args.iter().any(|a| a == "-g" || a == "--groups"))
+        || (cmd.starts_with("-S")
+            && crate::commands::cli::iter_flags(&parse_pacman_cli_args(&args[1..]).1)
+                .any(|a| a == "-g" || a == "--groups"))
     {
         let (groups, _) = parse_pacman_cli_args(&args[1..]);
         cmd_sync_groups(&config, &groups);
@@ -359,6 +380,11 @@ pub(crate) fn run() {
             }
             if subflags.contains('n') {
                 flags.push("-n".to_string());
+            }
+            for c in subflags.chars() {
+                if !matches!(c, 'y' | 'u' | 'n') && c.is_ascii_alphabetic() {
+                    flags.push(format!("-{c}"));
+                }
             }
         }
         cmd_install(config, &targets, &flags);
@@ -467,12 +493,13 @@ pub(crate) fn run() {
         cmd_unpin(&args[1]);
     } else if cmd.starts_with('-') {
         let helper = &config.options.helper;
-        let status = if is_command_available(helper) {
-            Command::new(helper).args(&args).status()
+        let mut fallback = if is_command_available(helper) {
+            Command::new(helper)
         } else {
-            Command::new("pacman").args(&args).status()
+            Command::new("pacman")
         };
-        match status {
+        fallback.args(&args);
+        match crate::execution::run_tracked_command(&mut fallback) {
             Ok(s) => exit(s.code().unwrap_or(1)),
             Err(e) => {
                 eprintln!("{}", format!("Failed to run command: {}", e).red());

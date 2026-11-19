@@ -27,15 +27,23 @@ pub fn compute_sha256(path: &Path) -> Result<String, String> {
         if crate::execution::is_terminating() {
             return Err("Checksum verification interrupted".into());
         }
-        let count = file.read(&mut buffer).map_err(|e| format!("Cannot read checksum input: {e}"))?;
-        if count == 0 { break; }
+        let count = match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("Cannot read checksum input: {e}")),
+        };
         hash.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hash.finalize()))
 }
 
-/// Creates a secure temporary file with 0600 permissions.
-pub fn create_secure_temp_file(dir: &Path, prefix: &str, ext: &str) -> Result<PathBuf, String> {
+/// Creates a secure temporary file with 0600 permissions, returning both path and open File handle.
+pub fn create_secure_temp_file_with_handle(
+    dir: &Path,
+    prefix: &str,
+    ext: &str,
+) -> Result<(PathBuf, fs::File), String> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -56,15 +64,20 @@ pub fn create_secure_temp_file(dir: &Path, prefix: &str, ext: &str) -> Result<Pa
         let target = dir.join(format!("{}-{}.{}", prefix, hex, ext));
 
         let mut opts = fs::OpenOptions::new();
-        opts.write(true).create_new(true);
+        opts.read(true).write(true).create_new(true);
         #[cfg(unix)]
         opts.mode(0o600);
 
-        if opts.open(&target).is_ok() {
-            return Ok(target);
+        if let Ok(file) = opts.open(&target) {
+            return Ok((target, file));
         }
     }
     Err("Failed to create secure temporary file".to_string())
+}
+
+/// Creates a secure temporary file with 0600 permissions.
+pub fn create_secure_temp_file(dir: &Path, prefix: &str, ext: &str) -> Result<PathBuf, String> {
+    create_secure_temp_file_with_handle(dir, prefix, ext).map(|(p, _)| p)
 }
 
 /// Checks if an archive path entry is safe against directory traversal attacks.
@@ -73,12 +86,12 @@ pub fn is_safe_tar_entry(entry: &str) -> bool {
     if trimmed.is_empty() {
         return true;
     }
-    // Absolute paths or drive letters
-    if trimmed.starts_with('/') || trimmed.starts_with('\\') {
+    // Absolute paths, backslashes (literal on Unix, traversal/mismatch hazard), or drive letters
+    if trimmed.starts_with('/') || trimmed.contains('\\') {
         return false;
     }
     // Path traversal components
-    for component in trimmed.split(['/', '\\']) {
+    for component in trimmed.split('/') {
         if component == ".." {
             return false;
         }
@@ -92,8 +105,8 @@ pub fn is_safe_link_destination(src: &str, dst: &str) -> bool {
     if trimmed_dst.is_empty() {
         return false;
     }
-    // No absolute paths or drive letters
-    if trimmed_dst.starts_with('/') || trimmed_dst.starts_with('\\') {
+    // Reject absolute paths, backslashes in src or dst, and drive letters
+    if trimmed_dst.starts_with('/') || trimmed_dst.contains('\\') || src.contains('\\') {
         return false;
     }
     if trimmed_dst.len() >= 2
@@ -104,9 +117,9 @@ pub fn is_safe_link_destination(src: &str, dst: &str) -> bool {
     }
 
     // Calculate directory depth of the link's source relative to sandbox root
-    let src_trimmed = src.trim().trim_start_matches(['/', '\\']);
+    let src_trimmed = src.trim().trim_start_matches('/');
     let parent_components: Vec<&str> = src_trimmed
-        .split(['/', '\\'])
+        .split('/')
         .filter(|c| !c.is_empty() && *c != ".")
         .collect();
     let mut depth: isize = if parent_components.is_empty() {
@@ -115,7 +128,7 @@ pub fn is_safe_link_destination(src: &str, dst: &str) -> bool {
         (parent_components.len() - 1) as isize
     };
 
-    for comp in trimmed_dst.split(['/', '\\']) {
+    for comp in trimmed_dst.split('/') {
         if comp.is_empty() || comp == "." {
             continue;
         }
@@ -163,6 +176,35 @@ pub fn fetch_package_archive(
 ) -> Result<PathBuf, String> {
     // 1. Check local pacman cache first
     let cache_dirs = if use_cache { crate::journal::TransactionJournal::get_cache_dirs() } else { Vec::new() };
+
+    // Fast path: probe candidate filenames directly (O(1) lookup per cache directory)
+    for url in candidate_urls {
+        if let Some(filename) = url.rsplit('/').next() {
+            if !filename.is_empty() {
+                for cache_dir in &cache_dirs {
+                    let direct_path = cache_dir.join(filename);
+                    if direct_path.is_file() {
+                        let cache_valid = if let Some(expected) = expected_sha {
+                            if let Ok(computed) = compute_sha256(&direct_path) {
+                                computed.eq_ignore_ascii_case(expected)
+                            } else {
+                                false
+                            }
+                        } else {
+                            allow_unverified
+                        };
+
+                        if cache_valid {
+                            println!("{} Found verified '{}' in local pacman cache.", "::".cyan(), pkg);
+                            return Ok(direct_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback path: search cache directories for any matching versioned package archives
     for cache_dir in cache_dirs {
         if let Ok(entries) = fs::read_dir(&cache_dir) {
             let mut matching: Vec<PathBuf> = entries
@@ -172,7 +214,8 @@ pub fn fetch_package_archive(
                     let name_str = file_name.to_string_lossy();
                     (name_str.ends_with(".pkg.tar.zst")
                         || name_str.ends_with(".pkg.tar.xz")
-                        || name_str.ends_with(".pkg.tar.gz"))
+                        || name_str.ends_with(".pkg.tar.gz")
+                        || name_str.ends_with(".pkg.tar.bz2"))
                         && parse_pkgname_from_filename(&name_str) == Some(pkg)
                 })
                 .map(|e| e.path())
@@ -521,6 +564,40 @@ mod tests {
         assert!(validate_symlink_traversal(&root, 32).is_ok());
         assert!(validate_symlink_traversal(&root, 0).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn test_is_safe_tar_entry_rejects_backslash_and_traversal() {
+        assert!(is_safe_tar_entry("usr/bin/app"));
+        assert!(!is_safe_tar_entry("/etc/passwd"));
+        assert!(!is_safe_tar_entry("../outside"));
+        assert!(!is_safe_tar_entry("usr/../outside"));
+        // Backslashes are literal filename characters on Unix, but unsafe for archives
+        assert!(!is_safe_tar_entry("a\\b\\c"));
+        assert!(!is_safe_tar_entry("a\\..\\b"));
+    }
+
+    #[test]
+    fn test_is_safe_link_destination_rejects_backslash_depth_inflation() {
+        assert!(is_safe_link_destination("usr/bin/link", "../lib/libfoo.so"));
+        // Backslash in source or destination must be rejected immediately
+        assert!(!is_safe_link_destination("a\\b\\c\\link", "../../../etc/passwd"));
+        assert!(!is_safe_link_destination("link", "a\\b\\c/../../../etc/passwd"));
+        // Normal escape attempts
+        assert!(!is_safe_link_destination("link", "../outside"));
+        assert!(!is_safe_link_destination("usr/link", "../../outside"));
+    }
+
+    #[test]
+    fn test_parse_pkgname_from_filename_supports_bz2() {
+        assert_eq!(
+            parse_pkgname_from_filename("linux-6.11.5-1-x86_64.pkg.tar.bz2"),
+            Some("linux")
+        );
+        assert_eq!(
+            parse_pkgname_from_filename("gcc-libs-14.2.1-1-x86_64.pkg.tar.zst"),
+            Some("gcc-libs")
+        );
     }
 
     fn test_dir(label: &str) -> PathBuf {

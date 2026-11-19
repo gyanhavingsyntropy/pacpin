@@ -300,8 +300,12 @@ fn collect_snapshot(manager: &AlpmManager, manifest: &PackageManifest) -> Result
     let wants_flatpak = !manifest.flatpak_user.is_empty() || !manifest.flatpak_system.is_empty();
     if wants_flatpak {
         if crate::is_command_available("flatpak") {
-            snapshot.flatpak_user = list_flatpaks("--user")?;
-            snapshot.flatpak_system = list_flatpaks("--system")?;
+            if !manifest.flatpak_user.is_empty() {
+                snapshot.flatpak_user = list_flatpaks("--user")?;
+            }
+            if !manifest.flatpak_system.is_empty() {
+                snapshot.flatpak_system = list_flatpaks("--system")?;
+            }
         } else if !manifest
             .pacman
             .iter()

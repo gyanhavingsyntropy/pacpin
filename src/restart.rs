@@ -95,8 +95,7 @@ impl RestartInspector {
                 };
                 let matching = installed_versions
                     .iter()
-                    .filter(|v| flavor.is_empty() || v.contains(flavor))
-                    .last()
+                    .rfind(|v| flavor.is_empty() || v.contains(flavor))
                     .or_else(|| installed_versions.last())
                     .cloned()
                     .unwrap_or_else(|| "newer".to_string());

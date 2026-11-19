@@ -64,7 +64,10 @@ impl AliasManager {
     }
 
     pub fn setup_aliases() -> Vec<String> {
-        let cfg = crate::config::load_config();
+        Self::setup_aliases_with_config(&crate::config::load_config())
+    }
+
+    pub fn setup_aliases_with_config(cfg: &crate::config::Config) -> Vec<String> {
         if !cfg.features.shell_aliases {
             return Vec::new();
         }
@@ -76,11 +79,32 @@ impl AliasManager {
         let home_path = Path::new(&home);
         let mut modified = Vec::new();
 
+        let has_pin_alias = |content: &str, is_fish: bool| -> bool {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('#') {
+                    continue;
+                }
+                if is_fish {
+                    if trimmed.starts_with("alias pin ")
+                        || trimmed.starts_with("alias pin=")
+                        || trimmed.starts_with("abbr pin ")
+                        || trimmed.starts_with("abbr pin=")
+                    {
+                        return true;
+                    }
+                } else if trimmed.starts_with("alias pin=") || trimmed.starts_with("alias pin ") {
+                    return true;
+                }
+            }
+            false
+        };
+
         // 1. ~/.bashrc
         let bashrc = home_path.join(".bashrc");
         if bashrc.exists() {
             if let Ok(content) = fs::read_to_string(&bashrc) {
-                if !content.contains("alias pin=") && !content.contains("alias pin ") {
+                if !has_pin_alias(&content, false) {
                     if let Ok(mut file) = OpenOptions::new().append(true).open(&bashrc) {
                         let prefix = if content.ends_with('\n') { "" } else { "\n" };
                         let snippet = format!(
@@ -99,7 +123,7 @@ impl AliasManager {
         let zshrc = home_path.join(".zshrc");
         if zshrc.exists() {
             if let Ok(content) = fs::read_to_string(&zshrc) {
-                if !content.contains("alias pin=") && !content.contains("alias pin ") {
+                if !has_pin_alias(&content, false) {
                     if let Ok(mut file) = OpenOptions::new().append(true).open(&zshrc) {
                         let prefix = if content.ends_with('\n') { "" } else { "\n" };
                         let snippet = format!(
@@ -118,7 +142,7 @@ impl AliasManager {
         let fish_conf = home_path.join(".config").join("fish").join("config.fish");
         if fish_conf.exists() {
             if let Ok(content) = fs::read_to_string(&fish_conf) {
-                if !content.contains("alias pin") && !content.contains("abbr pin") {
+                if !has_pin_alias(&content, true) {
                     if let Ok(mut file) = OpenOptions::new().append(true).open(&fish_conf) {
                         let prefix = if content.ends_with('\n') { "" } else { "\n" };
                         let snippet = format!(
@@ -167,7 +191,7 @@ impl AliasManager {
             return;
         }
 
-        let modified_files = Self::setup_aliases();
+        let modified_files = Self::setup_aliases_with_config(&cfg);
 
         let invoked_as = env::args()
             .next()
