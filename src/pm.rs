@@ -128,11 +128,28 @@ pub fn remove(config: &mut Config, targets: &[String], flags: &[String]) -> Resu
     // it would mean `--nosave`, so it is consumed and never forwarded.
     // (Bundled short flags such as `-Rns` keep their pacman meaning.)
     let dry_run = flags.iter().any(|f| f == "-n" || f == "--dry-run");
-    let forwarded: Vec<&str> = flags
-        .iter()
-        .filter(|f| f.as_str() != "-n" && f.as_str() != "--dry-run")
-        .map(|s| s.as_str())
-        .collect();
+    let mut forwarded: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < flags.len() {
+        let f = flags[i].as_str();
+        if f == "-n" || f == "--dry-run" {
+            i += 1;
+            continue;
+        }
+        if f == "--wait" {
+            i += 1;
+            if i < flags.len() && flags[i].parse::<u64>().is_ok() {
+                i += 1;
+            }
+            continue;
+        }
+        if f.starts_with("--wait=") {
+            i += 1;
+            continue;
+        }
+        forwarded.push(f);
+        i += 1;
+    }
 
     let wait_secs = flags
         .iter()
@@ -183,7 +200,9 @@ pub fn remove(config: &mut Config, targets: &[String], flags: &[String]) -> Resu
         cmd_args.join(" ")
     );
 
-    let status = crate::privilege::command(&config.options.privilege_tool).arg("pacman").args(&cmd_args).status();
+    let status = crate::execution::run_tracked_command(
+        crate::privilege::command(&config.options.privilege_tool).arg("pacman").args(&cmd_args),
+    );
 
     match status {
         Ok(s) if s.success() => {
@@ -250,13 +269,15 @@ pub fn info(config: &Config, pkg_args: &[String]) -> Result<i32, String> {
 pub fn forward_pacman(config: &Config, args: &[String], needs_sudo: bool) -> Result<i32, String> {
     if needs_sudo {
         check_lock()?;
-        let status = crate::privilege::command(&config.options.privilege_tool).arg("pacman").args(args).status();
+        let status = crate::execution::run_tracked_command(
+            crate::privilege::command(&config.options.privilege_tool).arg("pacman").args(args),
+        );
         match status {
             Ok(s) => Ok(s.code().unwrap_or(1)),
             Err(e) => Err(format!("Failed to run {} pacman: {}", config.options.privilege_tool, e)),
         }
     } else {
-        let status = Command::new("pacman").args(args).status();
+        let status = crate::execution::run_tracked_command(Command::new("pacman").args(args));
         match status {
             Ok(s) => Ok(s.code().unwrap_or(1)),
             Err(e) => Err(format!("Failed to run pacman: {}", e)),

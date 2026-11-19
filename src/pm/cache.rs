@@ -201,8 +201,11 @@ fn prune_download_directories(config: &Config, full: bool) -> Result<(), String>
         for entry in entries {
             let entry = entry.map_err(|error| format!("Cannot scan native cache: {error}"))?;
             if !entry.file_name().to_string_lossy().starts_with("download-") || !entry.file_type().is_ok_and(|kind| kind.is_dir()) { continue; }
-            if full && is_stale_download_directory(&entry, now) { stale.push(entry.path()); }
-            else { empty.push(entry.path()); }
+            if full && is_stale_download_directory(&entry, now) {
+                stale.push(entry.path());
+            } else if std::fs::read_dir(entry.path()).is_ok_and(|mut d| d.next().is_none()) {
+                empty.push(entry.path());
+            }
         }
     }
     for (paths, recursive) in [(&empty, false), (&stale, true)] {
@@ -241,13 +244,15 @@ fn prune_source_cache(config: &Config, full: bool) -> Result<(), String> {
     let active_hashes: std::collections::HashSet<String> = if full {
         std::collections::HashSet::new()
     } else {
+        let receipts = crate::sources::directory::inventory(config)
+            .map_err(|e| format!("Cannot inspect sources inventory: {e}"))?;
+        let manager = crate::db::AlpmManager::new()
+            .map_err(|e| format!("Cannot inspect ALPM database: {e}"))?;
         let mut hashes = std::collections::HashSet::new();
-        if let Ok(receipts) = crate::sources::directory::inventory(config) {
-            for r in receipts {
-                if let Some(sha) = r.sha256 {
-                    if let Some(valid) = crate::sources::valid_sha256_key(&sha) {
-                        hashes.insert(valid);
-                    }
+        for r in receipts {
+            if let Some(sha) = r.sha256 {
+                if let Some(valid) = crate::sources::valid_sha256_key(&sha) {
+                    hashes.insert(valid);
                 }
             }
         }
@@ -265,26 +270,24 @@ fn prune_source_cache(config: &Config, full: bool) -> Result<(), String> {
                 }
             }
         }
-        if let Ok(manager) = crate::db::AlpmManager::new() {
-            if let Ok(sidecar_entries) = std::fs::read_dir(&cache_dir) {
-                for entry in sidecar_entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().is_some_and(|ext| ext == "json") {
-                        if let Ok(data) = std::fs::read_to_string(&path) {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
-                                if let (Some(pkg), Some(sha)) = (
-                                    parsed.get("package").and_then(|v| v.as_str()),
-                                    parsed.get("sha256").and_then(|v| v.as_str()),
-                                ) {
-                                    let sidecar_ver =
-                                        parsed.get("version").and_then(|v| v.as_str());
-                                    if manager
-                                        .installed_version(pkg)
-                                        .is_some_and(|v| sidecar_ver.is_none_or(|sv| v == sv))
-                                    {
-                                        if let Some(valid) = crate::sources::valid_sha256_key(sha) {
-                                            hashes.insert(valid);
-                                        }
+        if let Ok(sidecar_entries) = std::fs::read_dir(&cache_dir) {
+            for entry in sidecar_entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    if let Ok(data) = std::fs::read_to_string(&path) {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+                            if let (Some(pkg), Some(sha)) = (
+                                parsed.get("package").and_then(|v| v.as_str()),
+                                parsed.get("sha256").and_then(|v| v.as_str()),
+                            ) {
+                                let sidecar_ver =
+                                    parsed.get("version").and_then(|v| v.as_str());
+                                if manager
+                                    .installed_version(pkg)
+                                    .is_some_and(|v| sidecar_ver.is_none_or(|sv| v == sv))
+                                {
+                                    if let Some(valid) = crate::sources::valid_sha256_key(sha) {
+                                        hashes.insert(valid);
                                     }
                                 }
                             }
@@ -301,11 +304,6 @@ fn prune_source_cache(config: &Config, full: bool) -> Result<(), String> {
                     }
                 }
             }
-        }
-        let inventory_ok = crate::sources::directory::inventory(config).is_ok();
-        let alpm_ok = crate::db::AlpmManager::new().is_ok();
-        if hashes.is_empty() && !inventory_ok && !alpm_ok {
-            return Ok(());
         }
         hashes
     };

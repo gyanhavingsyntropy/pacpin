@@ -123,10 +123,11 @@ pub(crate) fn run() {
         .unwrap_or(false)
         || (args.len() >= 2 && args[0] == "config" && args[1] == "reset")
     {
-        let force = args
-            .iter()
+        let offset = if args[0] == "config" { 2 } else { 1 };
+        let (_, extra_flags) = crate::commands::cli::parse_pacman_cli_args(&args[offset..]);
+        let force = crate::commands::cli::iter_flags(&extra_flags)
             .any(|a| a == "-f" || a == "--force" || a == "-y");
-        let noconfirm = args.iter().any(|a| a == "--noconfirm");
+        let noconfirm = crate::commands::cli::iter_flags(&extra_flags).any(|a| a == "--noconfirm");
         cmd_reset(force, noconfirm);
         exit(0);
     }
@@ -177,13 +178,16 @@ pub(crate) fn run() {
         if let Err(error) = crate::commands::source::run(&config, &args[1..]) { eprintln!("Error: {error}"); exit(1); }
     } else if cmd == "manager" {
         let Some(name) = args.get(1) else { eprintln!("Usage: pin manager NAME --FLAG [--dry-run] [--noconfirm]"); exit(2); };
-        let flags: Vec<String> = args[2..].iter().filter(|arg| !matches!(arg.as_str(), "--dry-run" | "-n" | "--noconfirm")).cloned().collect();
+        let (_, extra_flags) = crate::commands::cli::parse_pacman_cli_args(&args[2..]);
+        let dry_run = crate::commands::cli::iter_flags(&extra_flags).any(|arg| matches!(arg.as_str(), "--dry-run" | "-n"));
+        let noconfirm = crate::commands::cli::iter_flags(&extra_flags).any(|arg| arg == "--noconfirm");
+        let flags: Vec<String> = extra_flags.iter().filter(|arg| !matches!(arg.as_str(), "--dry-run" | "-n" | "--noconfirm")).cloned().collect();
         let commands = match integrations::IntegrationsManager::configured_actions(&config, name, &flags, false) {
             Ok(commands) => commands, Err(error) => { eprintln!("Error: {error}"); exit(2); }
         };
         for command in commands { println!(":: {name} action: {command}"); }
-        if args.iter().any(|arg| matches!(arg.as_str(), "--dry-run" | "-n")) { return; }
-        if !args.iter().any(|arg| arg == "--noconfirm") {
+        if dry_run { return; }
+        if !noconfirm {
             use std::io::Write;
             if !io::stdin().is_terminal() { eprintln!("A terminal confirmation or --noconfirm is required"); exit(2); }
             print!(":: Run these configured actions? [y/N] "); let _ = io::stdout().flush();
@@ -425,22 +429,17 @@ pub(crate) fn run() {
         let tx_id = args.get(1).and_then(|s| s.parse::<usize>().ok());
         cmd_history(tx_id);
     } else if cmd == "rollback" {
-        let mut tx_id = None;
-        let dry_run = args.iter().any(|a| a == "-n" || a == "--dry-run");
-        let allow_partial = args
-            .iter()
+        let (targets, extra_flags) = crate::commands::cli::parse_pacman_cli_args(&args[1..]);
+        let dry_run = crate::commands::cli::iter_flags(&extra_flags).any(|a| a == "-n" || a == "--dry-run");
+        let allow_partial = crate::commands::cli::iter_flags(&extra_flags)
             .any(|a| a == "--allow-partial" || a == "--partial" || a == "-f" || a == "--force");
-        let noconfirm = args.iter().any(|a| a == "--noconfirm");
-        for a in &args[1..] {
-            if let Ok(id) = a.parse::<usize>() {
-                tx_id = Some(id);
-            }
-        }
+        let noconfirm = crate::commands::cli::iter_flags(&extra_flags).any(|a| a == "--noconfirm");
+        let tx_id = targets.iter().find_map(|a| a.parse::<usize>().ok());
         TransactionJournal::rollback(tx_id, dry_run, allow_partial, noconfirm, &config.options.privilege_tool);
     } else if cmd == "run" {
-        cmd_run(&args[1..]);
+        cmd_run(&config, &args[1..]);
     } else if cmd == "try" {
-        cmd_try(&args[1..]);
+        cmd_try(&config, &args[1..]);
     } else if cmd == "needrestart" || cmd == "restart-check" {
         restart::RestartInspector::print_restart_advisory(&[], &config.options.privilege_tool);
         exit(0);
@@ -464,8 +463,9 @@ pub(crate) fn run() {
     } else if cmd == "list" {
         cmd_list(&config);
     } else if cmd == "orphans" || cmd == "autoremove" {
-        let clean = args.iter().any(|a| a == "-c" || a == "--clean") || cmd == "autoremove";
-        let noconfirm = args.iter().any(|a| a == "--noconfirm");
+        let (_, extra_flags) = crate::commands::cli::parse_pacman_cli_args(&args[1..]);
+        let clean = crate::commands::cli::iter_flags(&extra_flags).any(|a| a == "-c" || a == "--clean") || cmd == "autoremove";
+        let noconfirm = crate::commands::cli::iter_flags(&extra_flags).any(|a| a == "--noconfirm");
         cmd_orphans(&config, clean, noconfirm);
     } else if cmd == "keep" || cmd == "adopt" {
         cmd_keep(&config, &args[1..]);

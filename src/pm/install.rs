@@ -27,6 +27,7 @@ pub struct InstallOptions {
     pub forwarded_flags: Vec<String>,
     pub channel: Option<crate::sources::Channel>,
     pub no_cache: bool,
+    pub wait: Option<u64>,
 }
 
 impl Default for InstallOptions {
@@ -40,6 +41,7 @@ impl Default for InstallOptions {
             forwarded_flags: Vec::new(),
             channel: None,
             no_cache: false,
+            wait: None,
         }
     }
 }
@@ -180,24 +182,26 @@ pub fn install(
         return result;
     }
 
-    let wait_secs = options
-        .forwarded_flags
-        .iter()
-        .enumerate()
-        .find_map(|(idx, f)| {
-            if f.starts_with("--wait=") {
-                f.strip_prefix("--wait=").and_then(|s| s.parse::<u64>().ok())
-            } else if f == "--wait" {
-                if let Some(next) = options.forwarded_flags.get(idx + 1) {
-                    if let Ok(secs) = next.parse::<u64>() {
-                        return Some(secs);
+    let wait_secs = options.wait.or_else(|| {
+        options
+            .forwarded_flags
+            .iter()
+            .enumerate()
+            .find_map(|(idx, f)| {
+                if f.starts_with("--wait=") {
+                    f.strip_prefix("--wait=").and_then(|s| s.parse::<u64>().ok())
+                } else if f == "--wait" {
+                    if let Some(next) = options.forwarded_flags.get(idx + 1) {
+                        if let Ok(secs) = next.parse::<u64>() {
+                            return Some(secs);
+                        }
                     }
+                    Some(600)
+                } else {
+                    None
                 }
-                Some(600)
-            } else {
-                None
-            }
-        });
+            })
+    });
 
     if let Some(secs) = wait_secs {
         wait_for_lock(secs)?;
@@ -278,7 +282,9 @@ pub fn install(
             "{}",
             format!(":: Refreshing package databases ({} pacman -Sy)...", config.options.privilege_tool).cyan()
         );
-        let status = crate::privilege::command(&config.options.privilege_tool).args(["pacman", "-Sy"]).status();
+        let status = crate::execution::run_tracked_command(
+            crate::privilege::command(&config.options.privilege_tool).args(["pacman", "-Sy"]),
+        );
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => {

@@ -148,6 +148,7 @@ impl Plan {
         expected: BTreeMap<String, String>,
         scope: crate::runtime::UpgradeScope,
         aur_available: bool,
+        keep_going: bool,
     ) -> Result<Self, String> {
         validate(config)?;
         add_directory_versions(config, &expected, &mut before)?;
@@ -194,7 +195,13 @@ impl Plan {
                     }
                 }
                 Action::RebuildAur { packages } => {
-                    crate::pm::validate_rebuild(config, packages)?;
+                    if let Err(err) = crate::pm::validate_rebuild(config, packages) {
+                        if keep_going {
+                            println!(":: Hook {name} skipped under --keep-going: {err}");
+                            continue;
+                        }
+                        return Err(err);
+                    }
                 }
             }
             entries.push((name.clone(), hook.clone(), matched));
@@ -446,6 +453,7 @@ mod tests {
             expected,
             crate::runtime::UpgradeScope::All,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(plan.entries.len(), 1);
@@ -459,6 +467,7 @@ mod tests {
                 before,
                 crate::runtime::UpgradeScope::All,
                 true,
+                false,
             )
             .unwrap()
             .entries
@@ -469,7 +478,7 @@ mod tests {
     fn ineligible_aur_blocks_rebuilds_but_preserves_verified_script_actions() {
         let config: Config = toml::from_str("[hooks.script]\nwatch=['app']\naction='script'\ncommand=['/bin/true']\n[hooks.rebuild]\nwatch=['app']\naction='rebuild-aur'\npackages=['uninstalled-aur-package']").unwrap();
         let plan = Plan::new(&config, BTreeMap::from([("app".into(), "1-1".into())]),
-            BTreeMap::from([("app".into(), "2-1".into())]), crate::runtime::UpgradeScope::All, false).unwrap();
+            BTreeMap::from([("app".into(), "2-1".into())]), crate::runtime::UpgradeScope::All, false, false).unwrap();
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].0, "script");
         assert!(!plan.has_aur());

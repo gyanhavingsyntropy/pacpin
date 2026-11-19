@@ -88,7 +88,7 @@ impl TryOptions {
     }
 }
 
-pub fn cmd_try(target: &str, args: &[String], options: &TryOptions) {
+pub fn cmd_try(config: &crate::config::Config, target: &str, args: &[String], options: &TryOptions) {
     let (prefix, pkg) = parse_target(target);
     if !crate::utils::is_safe_pkg_name(pkg) {
         eprintln!("Error: invalid package identity"); exit(2);
@@ -97,9 +97,8 @@ pub fn cmd_try(target: &str, args: &[String], options: &TryOptions) {
         eprintln!("Error: --installed requires an unqualified native package name; omit the repository/provider prefix.");
         exit(2);
     }
-    let config = crate::config::load_config();
     let repositories = if prefix.is_some() { crate::db::AlpmManager::discover_repos() } else { Vec::new() };
-    let backend = match routing::resolve(prefix, &config, &repositories) {
+    let backend = match routing::resolve(prefix, config, &repositories) {
         Ok(backend) => backend,
         Err(error) => { eprintln!("Error: {error}"); exit(2); }
     };
@@ -113,13 +112,13 @@ pub fn cmd_try(target: &str, args: &[String], options: &TryOptions) {
     }
 
     let res = match backend {
-        Backend::Aur => prepared::try_aur(&config, pkg, args, options),
+        Backend::Aur => prepared::try_aur(config, pkg, args, options),
         Backend::Flatpak => try_flatpak(pkg, args),
         Backend::Nix => try_nix(pkg, args),
         Backend::Pipx => try_pipx(pkg, args, options.no_cache),
-        Backend::Source(alias) => prepared::try_source(&config, alias, pkg, args, options),
-        Backend::Export(manager) => export::try_export(&config, manager, pkg, args, options),
-        Backend::Native(repo) => try_pacman(&config, repo, pkg, args, options),
+        Backend::Source(alias) => prepared::try_source(config, alias, pkg, args, options),
+        Backend::Export(manager) => export::try_export(config, manager, pkg, args, options),
+        Backend::Native(repo) => try_pacman(config, repo, pkg, args, options),
     };
 
     match res {

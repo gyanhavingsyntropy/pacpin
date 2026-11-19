@@ -281,10 +281,14 @@ pub(super) fn try_restore_from_cache(plan: &Plan, dest: &Path) -> Option<PathBuf
             ));
             Some(dest.to_path_buf())
         }
-        _ => {
+        Ok(_) => {
             let _ = fs::remove_file(dest);
             let _ = fs::remove_file(&cached);
             let _ = fs::remove_file(cache_dir.join(format!("{key}.json")));
+            None
+        }
+        Err(_) => {
+            let _ = fs::remove_file(dest);
             None
         }
     }
@@ -339,7 +343,10 @@ pub(super) fn persist_verified_to_cache(plan: &Plan, artifact: &Path, sha256_hex
                 "url": plan.asset.url,
                 "sha256": key,
             });
-            let _ = fs::write(cache_dir.join(format!("{key}.json")), sidecar.to_string());
+            let sidecar_tmp = cache_dir.join(format!(".tmp.{pid}.{nanos}.{key}.json"));
+            if fs::write(&sidecar_tmp, sidecar.to_string()).is_ok() {
+                let _ = fs::rename(&sidecar_tmp, cache_dir.join(format!("{key}.json")));
+            }
         } else {
             let _ = fs::remove_file(&tmp_path);
         }
@@ -350,10 +357,20 @@ pub(super) fn persist_verified_to_cache(plan: &Plan, artifact: &Path, sha256_hex
 
 fn download(plan: &Plan, work: &mut Workdir) -> Result<PathBuf, String> {
     if let Some(revision) = &plan.git { return super::git::fetch(plan, revision, &work.0); }
-    if !crate::cleanup::cache() {
-        let dest = work.0.join("artifact");
-        if let Some(cached) = try_restore_from_cache(plan, &dest) {
-            return Ok(cached);
+    if !crate::cleanup::cache() && !crate::config::load_config().options.no_cache {
+        if let Some(key) = plan.asset.sha256.as_deref().and_then(valid_sha256_key) {
+            if let Some(cache_dir) = source_cache_dir() {
+                let cached = cache_dir.join(&key);
+                if let Ok(m) = fs::symlink_metadata(&cached) {
+                    if m.is_file() {
+                        let _ = work.ensure_capacity(m.len(), 1);
+                        let dest = work.0.join("artifact");
+                        if let Some(cached_path) = try_restore_from_cache(plan, &dest) {
+                            return Ok(cached_path);
+                        }
+                    }
+                }
+            }
         }
     }
     crate::progress::source_operation(|| download_inner(plan, work))
@@ -488,7 +505,7 @@ fn download_inner(plan: &Plan, work: &mut Workdir) -> Result<PathBuf, String> {
         plan.asset.name,
         &digest[..digest.len().min(12)]
     ));
-    if !crate::cleanup::cache() {
+    if !crate::cleanup::cache() && !crate::config::load_config().options.no_cache {
         persist_verified_to_cache(plan, &path, &digest);
     }
     Ok(path)

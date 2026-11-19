@@ -405,7 +405,7 @@ pub fn cmd_upgrade(
     for update in external_updates.iter().filter(|u| u.runner == "Sources") {
         hook_expected.insert(update.name.clone(), update.version.clone());
     }
-    let hook_plan = match crate::hooks::Plan::new(config, crate::hooks::versions(&manager), hook_expected, scope, eligibility.aur_available()) {
+    let hook_plan = match crate::hooks::Plan::new(config, crate::hooks::versions(&manager), hook_expected, scope, eligibility.aur_available(), keep_going) {
         Ok(plan) => plan, Err(error) => { eprintln!("Error: {error}"); exit(1); }
     };
     hook_plan.preview();
@@ -988,6 +988,20 @@ fn revalidate_orphan_selection(
 }
 
 pub fn parse_install_flags(flags: &[String]) -> pm::InstallOptions {
+    let wait = flags.iter().enumerate().find_map(|(idx, f)| {
+        if f.starts_with("--wait=") {
+            f.strip_prefix("--wait=").and_then(|s| s.parse::<u64>().ok())
+        } else if f == "--wait" {
+            if let Some(next) = flags.get(idx + 1) {
+                if let Ok(secs) = next.parse::<u64>() {
+                    return Some(secs);
+                }
+            }
+            Some(600)
+        } else {
+            None
+        }
+    });
     let manager_flags = crate::runtime::manager_flags(flags);
     let flags = manager_flags.as_slice();
     let mut channel = None;
@@ -1093,6 +1107,7 @@ pub fn parse_install_flags(flags: &[String]) -> pm::InstallOptions {
         forwarded_flags,
         channel,
         no_cache,
+        wait,
     }
 }
 

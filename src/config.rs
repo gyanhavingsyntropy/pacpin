@@ -44,7 +44,7 @@ pub fn validate_helper(helper: &str) -> Result<String, String> {
         return Ok(trimmed.to_string());
     }
     let p = Path::new(trimmed);
-    if p.is_absolute() && p.is_file() {
+    if p.is_absolute() && crate::utils::is_executable_file(p) {
         return Ok(trimmed.to_string());
     }
     Err(format!(

@@ -36,7 +36,10 @@ pub(super) fn get_lock_info_at(lock_path: std::path::PathBuf) -> Option<LockInfo
 
     let (is_alive, process_name) = if let Some(pid) = pid_opt {
         #[cfg(unix)]
-        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        let alive = unsafe {
+            libc::kill(pid, 0) == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        };
         #[cfg(not(unix))]
         let alive = true;
 

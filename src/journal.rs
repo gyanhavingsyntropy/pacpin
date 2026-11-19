@@ -455,6 +455,7 @@ impl TransactionJournal {
         if noconfirm {
             child_args.push("--noconfirm");
         }
+        child_args.push("--");
         let path_strs: Vec<String> = pkgs_to_restore
             .iter()
             .map(|(_, _, p)| p.display().to_string())
@@ -463,7 +464,9 @@ impl TransactionJournal {
             child_args.push(p);
         }
 
-        let status = crate::privilege::command(privilege_tool).args(&child_args).status();
+        let status = crate::execution::run_tracked_command(
+            crate::privilege::command(privilege_tool).args(&child_args),
+        );
 
         match status {
             Ok(s) if s.success() => {

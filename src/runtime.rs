@@ -79,19 +79,37 @@ pub fn has_control(flags: &[String], control: &str) -> bool {
     false
 }
 pub fn manager_flags(flags: &[String]) -> Vec<String> {
-    let mut value = false;
-    flags
-        .iter()
-        .filter(|flag| {
-            if value {
-                value = false;
-                return true;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < flags.len() {
+        let flag = &flags[i];
+        if flag == "--wait" {
+            i += 1;
+            if i < flags.len() && flags[i].parse::<u64>().is_ok() {
+                i += 1;
             }
-            value = crate::commands::cli::takes_value(flag);
-            !is_owned_flag(flag)
-        })
-        .cloned()
-        .collect()
+            continue;
+        }
+        if flag.starts_with("--wait=") {
+            i += 1;
+            continue;
+        }
+        if crate::commands::cli::takes_value(flag) {
+            if !is_owned_flag(flag) {
+                out.push(flag.clone());
+                if i + 1 < flags.len() {
+                    out.push(flags[i + 1].clone());
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if !is_owned_flag(flag) {
+            out.push(flag.clone());
+        }
+        i += 1;
+    }
+    out
 }
 
 /// The exact upgrade arguments admitted to preflight also reach execution.
@@ -296,9 +314,9 @@ mod tests {
     }
     #[test]
     fn upgrade_preflight_and_execution_share_only_forwarded_manager_arguments() {
-        let input = args(&["--noconfirm", "--no-cache", "--autoremove", "--keep-going", "--aur-only"]);
+        let input = args(&["--noconfirm", "--no-cache", "--autoremove", "--keep-going", "--aur-only", "--wait", "30", "--wait=15"]);
         assert!(upgrade_manager_flags(&input).is_empty());
-        let input = args(&["--ignore", "--no-cache", "--overwrite", "--noconfirm", "--needed"]);
+        let input = args(&["--ignore", "--no-cache", "--overwrite", "--noconfirm", "--needed", "--wait", "45"]);
         assert_eq!(upgrade_manager_flags(&input), args(&["--ignore", "--no-cache", "--overwrite", "--noconfirm"]));
     }
     #[test]

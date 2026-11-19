@@ -4,6 +4,7 @@ use std::process::exit;
 
 use colored::Colorize;
 
+use crate::config::Config;
 use crate::sandbox::{self, TryOptions};
 
 #[derive(Clone, Copy)]
@@ -137,21 +138,21 @@ fn print_missing_target(mode: Mode) {
     }
 }
 
-fn execute(args: &[String], mode: Mode) {
+fn execute(config: &Config, args: &[String], mode: Mode) {
     let (target, pass_through, options) = parse_args(args, mode);
     let Some(target) = target else {
         print_missing_target(mode);
         exit(1);
     };
-    sandbox::cmd_try(&target, &pass_through, &options);
+    sandbox::cmd_try(config, &target, &pass_through, &options);
 }
 
-pub fn cmd_run(args: &[String]) {
-    execute(args, Mode::Run);
+pub fn cmd_run(config: &Config, args: &[String]) {
+    execute(config, args, Mode::Run);
 }
 
-pub fn cmd_try(args: &[String]) {
-    execute(args, Mode::Try);
+pub fn cmd_try(config: &Config, args: &[String]) {
+    execute(config, args, Mode::Try);
 }
 
 #[cfg(test)]

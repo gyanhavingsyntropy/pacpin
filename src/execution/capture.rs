@@ -60,9 +60,15 @@ pub(crate) fn capture_output_observed(command: &mut Command, limit: usize, timeo
             Err(error) => break Err(error),
         }
     };
-    if status.is_err() { let _ = child.0.kill(); let _ = child.0.wait(); }
-    // Metadata scripts must not leave descendants holding capture pipes open.
-    unsafe { libc::kill(-(child.0.id() as i32), libc::SIGKILL); }
+    let pgid = child.0.id() as i32;
+    if status.is_err() {
+        unsafe { libc::kill(-pgid, libc::SIGKILL); }
+        let _ = child.0.kill();
+        let _ = child.0.wait();
+    } else {
+        // Metadata scripts must not leave descendants holding capture pipes open.
+        unsafe { libc::kill(-pgid, libc::SIGKILL); }
+    }
     let stdout = output.join().map_err(|_| io::Error::other("Output reader failed"))??;
     let stderr = errors.join().map_err(|_| io::Error::other("Error reader failed"))??;
     if overflow.load(std::sync::atomic::Ordering::SeqCst) { return Err(io::Error::other("Command output exceeds metadata limit")); }

@@ -233,13 +233,13 @@ pub(super) fn launch(
         }
         bwrap_cmd.args(["--setenv", "TERM", &term]);
 
-        bwrap_cmd.arg(binary_path).args(args);
+        bwrap_cmd.arg("--").arg(binary_path).args(args);
         run_tracked_command(&mut bwrap_cmd)
     } else if package_view {
         // Run keeps the user's normal files and network. A mount view makes
         // /opt and compiled absolute paths work without copying into the host.
         let mut command = Command::new("bwrap");
-        command.args(["--bind", "/", "/", "--die-with-parent"]);
+        command.args(["--dev-bind", "/", "/", "--die-with-parent"]);
         crate::execution::package_mounts(&mut command, sandbox_dir, supports_ro_overlay())?;
         command
             .arg("--")

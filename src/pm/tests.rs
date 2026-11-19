@@ -140,6 +140,7 @@ fn test_build_install_commands() {
         forwarded_flags: Vec::new(),
         channel: None,
         no_cache: false,
+        wait: None,
     };
     let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", "sudo", &opts_dry_sy, false);
     assert_eq!(op, "-S");
@@ -162,6 +163,7 @@ fn test_build_install_commands() {
         forwarded_flags: Vec::new(),
         channel: None,
         no_cache: false,
+        wait: None,
     };
     let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", "sudo", &opts_sy, false);
     assert_eq!(op, "-S");
@@ -177,6 +179,7 @@ fn test_build_install_commands() {
         forwarded_flags: Vec::new(),
         channel: None,
         no_cache: false,
+        wait: None,
     };
     let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", "sudo", &opts_syu, true);
     assert_eq!(op, "-Syu");
@@ -192,6 +195,7 @@ fn test_build_install_commands() {
         forwarded_flags: Vec::new(),
         channel: None,
         no_cache: false,
+        wait: None,
     };
     let (cmds, op, _) = build_install_commands(&targets, &no_aur, "paru", "sudo", &opts_su, true);
     assert_eq!(op, "-Su");

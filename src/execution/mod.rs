@@ -76,7 +76,7 @@ fn kill_active_children() {
     terminate_children(children, groups);
 }
 
-fn terminate_children(mut children: Vec<u32>, groups: Vec<u32>) {
+fn terminate_children(mut children: Vec<u32>, mut groups: Vec<u32>) {
     // Let sudo relay interruption and let pacman release its database lock.
     // An immediate SIGKILL can leave an interrupted download's lock behind.
     for &pid in &children {
@@ -84,14 +84,18 @@ fn terminate_children(mut children: Vec<u32>, groups: Vec<u32>) {
         unsafe { libc::kill(target, libc::SIGINT); }
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !children.is_empty() && std::time::Instant::now() < deadline {
+    while (!children.is_empty() || !groups.is_empty()) && std::time::Instant::now() < deadline {
         children.retain(|&pid| {
             if unsafe { libc::kill(pid as i32, 0) } != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) { return false; }
             !fs::read_to_string(format!("/proc/{pid}/stat")).ok()
                 .and_then(|stat| stat.rsplit_once(") ").map(|(_, rest)| rest.starts_with('Z')))
                 .unwrap_or(false)
         });
-        if !children.is_empty() { std::thread::sleep(std::time::Duration::from_millis(20)); }
+        groups.retain(|&pid| {
+            if unsafe { libc::kill(-(pid as i32), 0) } != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) { return false; }
+            children.contains(&pid)
+        });
+        if !children.is_empty() || !groups.is_empty() { std::thread::sleep(std::time::Duration::from_millis(20)); }
     }
     for pid in children {
         unsafe { libc::kill(pid as i32, libc::SIGKILL); }

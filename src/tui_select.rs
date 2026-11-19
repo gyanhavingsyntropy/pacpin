@@ -70,21 +70,30 @@ pub fn run_checkbox_menu(title: &str, subtitle: &str, initial: &[CheckboxItem]) 
     let mut searching = false;
     let (visible, _) = menu_layout(crate::progress::selection_height(), items.len());
     for _ in 0..FIXED_ROWS + visible { queue!(out, Print("\r\n")).ok()?; }
+    let mut needs_redraw = true;
+    let mut matches: Vec<usize> = Vec::new();
     loop {
-        let matches: Vec<_> = (0..items.len()).filter(|&i| query.is_empty() || items[i].label.to_lowercase().contains(&query.to_lowercase()) || items[i].description.to_lowercase().contains(&query.to_lowercase())).collect();
-        selected = selected.min(matches.len().saturating_sub(1));
-        let height = crate::progress::selection_height();
-        let (visible, row) = menu_layout(height, items.len());
-        offset = offset.min(selected);
-        if selected >= offset + visible { offset = selected + 1 - visible; }
-        for row in row as usize..height.saturating_sub(1) { queue!(out, MoveTo(0, row as u16), Clear(ClearType::CurrentLine)).ok()?; }
-        queue!(out, MoveTo(0, row)).ok()?;
-        render_checkbox_ui(&mut out, title, subtitle, &items, &matches, selected, offset, visible, crate::ui::get_terminal_width().saturating_sub(1), searching, &query);
-        out.flush().ok()?;
-        crate::progress::draw_selection();
+        if needs_redraw {
+            matches = (0..items.len()).filter(|&i| query.is_empty() || items[i].label.to_lowercase().contains(&query.to_lowercase()) || items[i].description.to_lowercase().contains(&query.to_lowercase())).collect();
+            selected = selected.min(matches.len().saturating_sub(1));
+            let height = crate::progress::selection_height();
+            let (visible, row) = menu_layout(height, items.len());
+            offset = offset.min(selected);
+            if selected >= offset + visible { offset = selected + 1 - visible; }
+            for row in row as usize..height.saturating_sub(1) { queue!(out, MoveTo(0, row as u16), Clear(ClearType::CurrentLine)).ok()?; }
+            queue!(out, MoveTo(0, row)).ok()?;
+            render_checkbox_ui(&mut out, title, subtitle, &items, &matches, selected, offset, visible, crate::ui::get_terminal_width().saturating_sub(1), searching, &query);
+            out.flush().ok()?;
+            crate::progress::draw_selection();
+            needs_redraw = false;
+        }
         if !event::poll(Duration::from_millis(100)).ok()? { continue; }
         match event::read().ok()? {
+            Event::Resize(_, _) => {
+                needs_redraw = true;
+            }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
+                needs_redraw = true;
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                     unsafe { libc::raise(libc::SIGINT); }
                     // The registered signal handler restores input and stops

@@ -30,7 +30,7 @@ pub(super) fn try_pacman(cfg: &crate::config::Config, repo: Option<&str>, pkg: &
                         let trimmed = answer.trim().to_lowercase();
                         if trimmed.is_empty() || trimmed == "y" || trimmed == "yes" {
                             println!("{}", ":: Installing bubblewrap via pacpin...".cyan());
-                            let mut config = crate::config::load_config();
+                            let mut config = cfg.clone();
                             let install_opts = crate::pm::InstallOptions {
                                 needed: true,
                                 noconfirm: false,
@@ -40,6 +40,7 @@ pub(super) fn try_pacman(cfg: &crate::config::Config, repo: Option<&str>, pkg: &
                                 forwarded_flags: Vec::new(),
                                 channel: None,
                                 no_cache: false,
+                                wait: None,
                             };
                             match crate::pm::install(
                                 &mut config,
