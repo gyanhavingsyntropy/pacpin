@@ -99,7 +99,7 @@ impl AurWorkspace {
 impl Drop for AurWorkspace {
     fn drop(&mut self) {
         if !self.preserve {
-            if let Err(error) = fs::remove_dir_all(&self.path) {
+            if let Err(error) = crate::execution::remove_owned_tree(&self.path) {
                 if error.kind() != io::ErrorKind::NotFound {
                     eprintln!(
                         "Warning: Cannot remove AUR temporary workspace {}: {error}",

@@ -1,6 +1,6 @@
 //! Explicit target planning, ignores, delay policy and result-record conversion.
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alpm::vercmp;
@@ -114,15 +114,36 @@ pub(super) fn requested_status(installed: Option<&str>, candidate: &str) -> Requ
 /// afterwards.
 pub(super) fn ignored_names(extra_flags: &[String]) -> HashSet<String> {
     let mut ignored = HashSet::new();
-    let mut iter = extra_flags.iter();
-    while let Some(flag) = iter.next() {
+    let mut i = 0;
+    while i < extra_flags.len() {
+        let flag = &extra_flags[i];
+        if flag == "--" {
+            break;
+        }
         if let Some(list) = flag.strip_prefix("--ignore=") {
             ignored.extend(list.split(',').map(str::to_string));
-        } else if flag == "--ignore" {
-            if let Some(next) = iter.next() {
-                ignored.extend(next.split(',').map(str::to_string));
+            i += 1;
+            continue;
+        }
+        if flag == "--ignore" {
+            if i + 1 < extra_flags.len() {
+                ignored.extend(extra_flags[i + 1].split(',').map(str::to_string));
+                i += 2;
+                continue;
+            } else {
+                i += 1;
+                continue;
             }
         }
+        if crate::commands::cli::takes_value(flag)
+            || (flag == "--wait"
+                && i + 1 < extra_flags.len()
+                && extra_flags[i + 1].parse::<u64>().is_ok())
+        {
+            i += 2;
+            continue;
+        }
+        i += 1;
     }
     ignored.retain(|name| !name.is_empty());
     ignored
@@ -135,15 +156,36 @@ pub(super) fn ignored_names(extra_flags: &[String]) -> HashSet<String> {
 pub(super) fn collect_ignored_names(manager: &AlpmManager, extra_flags: &[String]) -> HashSet<String> {
     let mut ignored = ignored_names(extra_flags);
     let mut groups = Vec::new();
-    let mut iter = extra_flags.iter();
-    while let Some(flag) = iter.next() {
+    let mut i = 0;
+    while i < extra_flags.len() {
+        let flag = &extra_flags[i];
+        if flag == "--" {
+            break;
+        }
         if let Some(list) = flag.strip_prefix("--ignoregroup=") {
             groups.extend(list.split(',').map(str::to_string));
-        } else if flag == "--ignoregroup" {
-            if let Some(next) = iter.next() {
-                groups.extend(next.split(',').map(str::to_string));
+            i += 1;
+            continue;
+        }
+        if flag == "--ignoregroup" {
+            if i + 1 < extra_flags.len() {
+                groups.extend(extra_flags[i + 1].split(',').map(str::to_string));
+                i += 2;
+                continue;
+            } else {
+                i += 1;
+                continue;
             }
         }
+        if crate::commands::cli::takes_value(flag)
+            || (flag == "--wait"
+                && i + 1 < extra_flags.len()
+                && extra_flags[i + 1].parse::<u64>().is_ok())
+        {
+            i += 2;
+            continue;
+        }
+        i += 1;
     }
     for group in groups.iter().filter(|g| !g.is_empty()) {
         for db in manager.handle().syncdbs() {
@@ -212,6 +254,27 @@ pub(super) fn resolve_requested_targets(
     };
     let glob_pins = ResolverEngine::compile_glob_pins(&pins);
 
+    let mut aur_candidates = Vec::new();
+    for target in requested {
+        if let Some((head, tail)) = target.split_once('/') {
+            if head.eq_ignore_ascii_case("aur") && crate::utils::is_safe_pkg_name(tail) {
+                aur_candidates.push(tail.to_string());
+            }
+        } else if crate::utils::is_safe_pkg_name(target) {
+            let pinned_repo = ResolverEngine::match_pinned_package(target, &pins, &glob_pins);
+            if pinned_repo.as_deref() == Some("aur")
+                || crate::db::find_sync_package(manager.handle(), target).is_err()
+            {
+                aur_candidates.push(target.to_string());
+            }
+        }
+    }
+    let aur_batch = if !aur_candidates.is_empty() {
+        aur::query_aur(&aur_candidates)
+    } else {
+        HashMap::new()
+    };
+
     for target in requested {
         // Silently repeated targets are shown and executed once; the first
         // spelling wins so the Requested box never lists duplicates.
@@ -235,8 +298,7 @@ pub(super) fn resolve_requested_targets(
                 if !crate::utils::is_safe_pkg_name(tail) {
                     return Err(format!("Refusing unsafe AUR upgrade target '{tail}'."));
                 }
-                let found = aur::query_aur(std::slice::from_ref(&tail.to_string()));
-                let item = found.get(tail).ok_or_else(|| {
+                let item = aur_batch.get(tail).ok_or_else(|| {
                     format!("'{target}' was not found in the AUR.")
                 })?;
                 if held_by_name(tail) {
@@ -387,8 +449,7 @@ pub(super) fn resolve_requested_targets(
             }
         }
         if !handled_native {
-            let found = aur::query_aur(std::slice::from_ref(target));
-            let item = found.get(target).ok_or_else(|| {
+            let item = aur_batch.get(target).ok_or_else(|| {
                 format!("'{target}' was not found in the sync databases or the AUR.")
             })?;
             if held_by_name(target) {

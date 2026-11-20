@@ -159,6 +159,10 @@ pub fn sanitize_display_text(s: &str) -> String {
                             break;
                         }
                     }
+                } else if matches!(next, '(' | ')' | '*' | '+' | '-' | '.' | '/' | '%') {
+                    // Charset designation sequence (e.g. ESC(B): consumes intermediate byte and final byte
+                    chars.next();
+                    chars.next();
                 } else {
                     // Two-character escape sequence (e.g. ESC M, ESC 7, ESC =)
                     chars.next();
@@ -206,6 +210,78 @@ pub(crate) fn is_package_entry_point(path: &std::path::Path) -> bool {
         || (path.starts_with("usr/lib") || path.starts_with("opt")) && parent.file_name().is_some_and(|name| name == "bin" || name == "sbin")
 }
 
+
+/// Reads up to `max_bytes` from a regular file, rejecting symlinks and special files (FIFOs, sockets, devices)
+/// without blocking or following symlinks.
+pub fn read_regular_bounded(path: &std::path::Path, max_bytes: u64) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+
+    let file = match options.open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("Cannot open {}: {e}", path.display())),
+    };
+
+    let meta = file.metadata().map_err(|e| format!("Cannot inspect {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+
+    let mut buf = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+
+    if buf.len() as u64 > max_bytes {
+        return Err(format!("{} exceeds size limit of {} bytes", path.display(), max_bytes));
+    }
+    Ok(Some(buf))
+}
+
+pub fn read_regular_bounded_string(path: &std::path::Path, max_bytes: u64) -> Result<Option<String>, String> {
+    match read_regular_bounded(path, max_bytes)? {
+        Some(bytes) => {
+            String::from_utf8(bytes).map(Some).map_err(|e| format!("Invalid UTF-8 in {}: {e}", path.display()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Atomically writes data to `path` with 0o600 permissions, ensuring safe tempfile creation
+/// on the same filesystem and atomic rename.
+pub fn write_atomic_private(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let parent = path.parent().ok_or_else(|| format!("Invalid target path: {}", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create directory {}: {e}", parent.display()))?;
+
+    let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("file");
+    let (temp_path, mut file) = crate::download::create_secure_temp_file_with_handle(parent, &format!(".{filename}"), "tmp")?;
+
+    let write_res = (|| -> Result<(), std::io::Error> {
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!("Cannot write {}: {e}", temp_path.display()));
+    }
+
+    if let Err(e) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!("Cannot atomically replace {}: {e}", path.display()));
+    }
+
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -263,6 +339,8 @@ mod tests {
         assert_eq!(sanitize_display_text("\x1b]8;;https://malicious.link\x07Click Here\x1b]8;;\x07"), "Click Here");
         // C0 control chars
         assert_eq!(sanitize_display_text("Bell\x07 and Backspace\x08"), "Bell and Backspace");
+        // 3-byte charset designation sequences (e.g. ESC(B from tput sgr0)
+        assert_eq!(sanitize_display_text("\x1b(BHello\x1b(B World"), "Hello World");
     }
 
     #[test]
@@ -304,5 +382,27 @@ mod tests {
         assert!(!is_safe_pattern("; rm -rf /"));
         assert!(!is_safe_pattern("../foo"));
         assert!(!is_safe_pattern("/etc/*"));
+    }
+
+    #[test]
+    fn test_bounded_and_atomic_io() {
+        let dir = std::env::temp_dir().join(format!("pacpin_io_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file_path = dir.join("test_atomic.txt");
+
+        // Write atomic private
+        write_atomic_private(&file_path, b"hello safe atomic world").expect("atomic write works");
+
+        // Read bounded string
+        let read = read_regular_bounded_string(&file_path, 1024).expect("read works").expect("file found");
+        assert_eq!(read, "hello safe atomic world");
+
+        // Over-limit reading fails
+        assert!(read_regular_bounded(&file_path, 5).is_err());
+
+        // Non-existent file returns None
+        assert!(read_regular_bounded(&dir.join("nonexistent"), 1024).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -70,6 +70,44 @@ pub fn run_tracked_command(command: &mut Command) -> io::Result<std::process::Ex
     }
 }
 
+pub fn is_valid_pid(pid: u32) -> bool {
+    pid > 1 && pid <= i32::MAX as u32
+}
+
+pub fn signal_process(pid: u32, sig: i32) -> io::Result<()> {
+    if !is_valid_pid(pid) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid process ID"));
+    }
+    #[cfg(unix)]
+    {
+        let res = unsafe { libc::kill(pid as i32, sig) };
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(unix))]
+    Ok(())
+}
+
+pub fn signal_process_group(pid: u32, sig: i32) -> io::Result<()> {
+    if !is_valid_pid(pid) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid process group ID"));
+    }
+    #[cfg(unix)]
+    {
+        let res = unsafe { libc::kill(-(pid as i32), sig) };
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(unix))]
+    Ok(())
+}
+
 fn kill_active_children() {
     let children = ACTIVE_CHILDREN.lock().map(|mut lock| std::mem::take(&mut *lock)).unwrap_or_default();
     let groups = ACTIVE_GROUPS.lock().map(|mut lock| std::mem::take(&mut *lock)).unwrap_or_default();
@@ -79,9 +117,15 @@ fn kill_active_children() {
 fn terminate_children(mut children: Vec<u32>, mut groups: Vec<u32>) {
     // Let sudo relay interruption and let pacman release its database lock.
     // An immediate SIGKILL can leave an interrupted download's lock behind.
+    children.retain(|&pid| is_valid_pid(pid));
+    groups.retain(|&pid| is_valid_pid(pid));
+
     for &pid in &children {
-        let target = if groups.contains(&pid) { -(pid as i32) } else { pid as i32 };
-        unsafe { libc::kill(target, libc::SIGINT); }
+        if groups.contains(&pid) {
+            let _ = signal_process_group(pid, libc::SIGINT);
+        } else {
+            let _ = signal_process(pid, libc::SIGINT);
+        }
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while (!children.is_empty() || !groups.is_empty()) && std::time::Instant::now() < deadline {
@@ -98,9 +142,11 @@ fn terminate_children(mut children: Vec<u32>, mut groups: Vec<u32>) {
         if !children.is_empty() || !groups.is_empty() { std::thread::sleep(std::time::Duration::from_millis(20)); }
     }
     for pid in children {
-        unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+        let _ = signal_process(pid, libc::SIGKILL);
     }
-    for pid in groups { unsafe { libc::kill(-(pid as i32), libc::SIGKILL); } }
+    for pid in groups {
+        let _ = signal_process_group(pid, libc::SIGKILL);
+    }
 }
 
 pub fn register_cleanup_target(path: PathBuf) {

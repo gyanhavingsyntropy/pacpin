@@ -103,6 +103,31 @@ fn ignored_names_matches_exact_entries() {
 }
 
 #[test]
+fn ignored_names_skips_option_values_and_double_dash() {
+    let flags = vec![
+        "--logfile".to_string(),
+        "--ignore=sneaky".to_string(),
+        "--".to_string(),
+        "--ignore=after_delimiter".to_string(),
+    ];
+    let got = ignored_names(&flags);
+    assert!(!got.contains("sneaky"));
+    assert!(!got.contains("after_delimiter"));
+}
+
+#[test]
+fn sources_ignored_skips_option_values_and_double_dash() {
+    let flags = vec![
+        "--logfile".to_string(),
+        "--ignore=app".to_string(),
+        "--".to_string(),
+        "--ignore=other".to_string(),
+    ];
+    assert!(!crate::sources::ignored("app", &flags));
+    assert!(!crate::sources::ignored("other", &flags));
+}
+
+#[test]
 fn requested_targets_classify_native_and_fail_closed() {
     use crate::db::test_support::{AlpmFixture, FixturePackage};
     use std::collections::HashMap;
@@ -316,4 +341,25 @@ fn requested_targets_honor_repo_pins() {
     )
     .expect("unpinned request resolves");
     assert_eq!(out.native, vec!["repo-a/dup".to_string()]);
+}
+
+#[test]
+fn test_validate_channel_flags() {
+    use super::validate_channel_flags;
+    assert!(validate_channel_flags(&["--channel".into(), "alpha".into()]).is_ok());
+    assert!(validate_channel_flags(&["--channel=beta".into()]).is_ok());
+    assert!(validate_channel_flags(&["--channel=prerelease".into()]).is_ok());
+    assert!(validate_channel_flags(&["--channel".into(), "stable".into()]).is_ok());
+    assert!(validate_channel_flags(&["--ignore".into(), "pkg".into(), "--channel".into(), "beta".into()]).is_ok());
+
+    // Duplicate channels
+    assert!(validate_channel_flags(&["--channel".into(), "alpha".into(), "--channel".into(), "beta".into()]).is_err());
+    assert!(validate_channel_flags(&["--channel=alpha".into(), "--channel=beta".into()]).is_err());
+
+    // Invalid channel
+    assert!(validate_channel_flags(&["--channel".into(), "invalid".into()]).is_err());
+    assert!(validate_channel_flags(&["--channel=bogus".into()]).is_err());
+
+    // Missing argument
+    assert!(validate_channel_flags(&["--channel".into()]).is_err());
 }

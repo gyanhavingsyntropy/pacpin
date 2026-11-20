@@ -39,7 +39,7 @@ impl Workspace {
 }
 impl Drop for Workspace {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        let _ = crate::execution::remove_owned_tree(&self.path);
         crate::execution::unregister_cleanup_target(&self.path);
     }
 }

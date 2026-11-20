@@ -127,11 +127,24 @@ pub fn remove(config: &mut Config, targets: &[String], flags: &[String]) -> Resu
     // `-n` / `--dry-run` only ever previews here: forwarded to `pacman -R`
     // it would mean `--nosave`, so it is consumed and never forwarded.
     // (Bundled short flags such as `-Rns` keep their pacman meaning.)
-    let dry_run = flags.iter().any(|f| f == "-n" || f == "--dry-run");
+    let dry_run = crate::commands::cli::iter_flags(flags).any(|f| f == "-n" || f == "--dry-run");
     let mut forwarded: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < flags.len() {
         let f = flags[i].as_str();
+        if f == "--" {
+            forwarded.extend(flags[i..].iter().map(String::as_str));
+            break;
+        }
+        if crate::commands::cli::takes_value(f) {
+            forwarded.push(f);
+            if i + 1 < flags.len() {
+                forwarded.push(flags[i + 1].as_str());
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
         if f == "-n" || f == "--dry-run" {
             i += 1;
             continue;
@@ -151,23 +164,36 @@ pub fn remove(config: &mut Config, targets: &[String], flags: &[String]) -> Resu
         i += 1;
     }
 
-    let wait_secs = flags
-        .iter()
-        .enumerate()
-        .find_map(|(idx, f)| {
-            if f.starts_with("--wait=") {
-                f.strip_prefix("--wait=").and_then(|s| s.parse::<u64>().ok())
-            } else if f == "--wait" {
-                if let Some(next) = flags.get(idx + 1) {
-                    if let Ok(secs) = next.parse::<u64>() {
-                        return Some(secs);
-                    }
+    let mut wait_secs = None;
+    let mut i = 0;
+    while i < flags.len() {
+        let f = flags[i].as_str();
+        if f == "--" {
+            break;
+        }
+        if let Some(val) = f.strip_prefix("--wait=") {
+            wait_secs = val.parse::<u64>().ok();
+            i += 1;
+            continue;
+        }
+        if f == "--wait" {
+            if i + 1 < flags.len() {
+                if let Ok(secs) = flags[i + 1].parse::<u64>() {
+                    wait_secs = Some(secs);
+                    i += 2;
+                    continue;
                 }
-                Some(600)
-            } else {
-                None
             }
-        });
+            wait_secs = Some(600);
+            i += 1;
+            continue;
+        }
+        if crate::commands::cli::takes_value(f) {
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
 
     if let Some(secs) = wait_secs {
         if dry_run {
@@ -206,7 +232,7 @@ pub fn remove(config: &mut Config, targets: &[String], flags: &[String]) -> Resu
 
     match status {
         Ok(s) if s.success() => {
-            let noconfirm = flags.iter().any(|f| f == "--noconfirm");
+            let noconfirm = crate::commands::cli::iter_flags(flags).any(|f| f == "--noconfirm");
             crate::check_and_prompt_smart_unpin(config.clone(), targets, noconfirm);
 
             let packages = targets

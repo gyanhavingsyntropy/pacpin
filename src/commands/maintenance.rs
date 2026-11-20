@@ -173,10 +173,15 @@ pub fn cmd_reset(force: bool, noconfirm: bool) {
         }
     }
 
-    // Backup current configuration
+    // Backup current configuration safely without following symlinks
     let now = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let bak_path = path.with_extension(format!("toml.bak.{}", now));
-    if let Err(e) = std::fs::copy(&path, &bak_path) {
+    let backup_res = match crate::utils::read_regular_bounded(&path, 1_048_576) {
+        Ok(Some(bytes)) => crate::utils::write_atomic_private(&bak_path, &bytes),
+        Ok(None) => Err("Configuration file not found".into()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = backup_res {
         eprintln!(
             "{}",
             format!("Warning: Could not create backup file: {}", e).yellow()

@@ -4,7 +4,7 @@ use super::{helper_privilege_args, AlpmManager, Config, InstallOptions};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -139,7 +139,7 @@ impl NativeCheckpoint {
         let mut digest = Sha256::new();
         let mut remaining = 256 * 1024 * 1024u64;
         fingerprint(&paths.db, &mut digest, &mut remaining)?;
-        fingerprint(&paths.log, &mut digest, &mut remaining)?;
+        fingerprint_log_tail(&paths.log, &mut digest)?;
         Ok(Self {
             paths,
             digest: digest.finalize().into(),
@@ -186,6 +186,14 @@ fn fingerprint(path: &Path, digest: &mut Sha256, remaining: &mut u64) -> Result<
             .map_err(|e| e.to_string())?;
         entries.sort();
         for entry in entries {
+            if entry.file_name().is_some_and(|n| n == "sync") && entry.is_dir() {
+                // Sync databases are not updated during package installation/builds; skip
+                continue;
+            }
+            if entry.file_name().is_some_and(|n| n == "files") && entry.is_file() {
+                // Package files lists are large and static per version; desc contains identity
+                continue;
+            }
             fingerprint(&entry, digest, remaining)?;
         }
     } else {
@@ -195,7 +203,20 @@ fn fingerprint(path: &Path, digest: &mut Sha256, remaining: &mut u64) -> Result<
         *remaining = remaining
             .checked_sub(before.len())
             .ok_or("Native state exceeds the bounded safety inspection")?;
-        let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+
+        let mut file = opts.open(path).map_err(|e| e.to_string())?;
+        let fmeta = file.metadata().map_err(|e| e.to_string())?;
+        if !fmeta.is_file() || fmeta.ino() != before.ino() || fmeta.dev() != before.dev() {
+            return Err("Native state changed during safety inspection".into());
+        }
+
         let mut buffer = [0u8; 16_384];
         let mut read_bytes = 0u64;
         loop {
@@ -210,6 +231,65 @@ fn fingerprint(path: &Path, digest: &mut Sha256, remaining: &mut u64) -> Result<
             digest.update(&buffer[..size]);
         }
     }
+    let after = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if (
+        before.ino(),
+        before.len(),
+        before.mtime(),
+        before.mtime_nsec(),
+    ) != (after.ino(), after.len(), after.mtime(), after.mtime_nsec())
+    {
+        return Err("Native state changed during safety inspection".into());
+    }
+    Ok(())
+}
+
+fn fingerprint_log_tail(path: &Path, digest: &mut Sha256) -> Result<(), String> {
+    let before = fs::symlink_metadata(path)
+        .map_err(|e| format!("Cannot inspect {}: {e}", path.display()))?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(format!(
+            "Cannot verify native state at {} (not a regular file)",
+            path.display()
+        ));
+    }
+    digest.update(path.as_os_str().as_encoded_bytes());
+    for field in [
+        before.dev(),
+        before.ino(),
+        before.len(),
+        before.mtime() as u64,
+        before.mtime_nsec() as u64,
+        before.mode() as u64,
+    ] {
+        digest.update(field.to_le_bytes());
+    }
+
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+
+    let mut file = opts.open(path).map_err(|e| e.to_string())?;
+    let fmeta = file.metadata().map_err(|e| e.to_string())?;
+    if !fmeta.is_file() || fmeta.ino() != before.ino() || fmeta.dev() != before.dev() {
+        return Err("Native state changed during safety inspection".into());
+    }
+
+    let file_len = before.len();
+    let tail_size = 65536u64.min(file_len);
+    if tail_size > 0 {
+        file.seek(SeekFrom::End(-(tail_size as i64)))
+            .map_err(|e| e.to_string())?;
+        let mut buffer = Vec::with_capacity(tail_size as usize);
+        file.take(tail_size)
+            .read_to_end(&mut buffer)
+            .map_err(|e| e.to_string())?;
+        digest.update(&buffer);
+    }
+
     let after = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if (
         before.ino(),
@@ -257,24 +337,18 @@ impl AurBuildFailurePermit {
 
 fn validate_installed_dependencies(manager: &AlpmManager) -> Result<(), String> {
     let local = manager.handle().localdb().pkgs();
-    let mut checked = HashSet::new();
-    for package in local {
-        for dependency in package.depends() {
-            let dependency = dependency.to_string();
-            if checked.insert(dependency.clone())
-                && manager
-                    .handle()
-                    .localdb()
-                    .pkgs()
-                    .find_satisfier(dependency.as_str())
-                    .is_none()
-            {
-                return Err(format!(
-                    "Installed dependency mismatch: {} requires {dependency}",
-                    package.name()
-                ));
-            }
-        }
+    let missing = manager.handle().check_deps(
+        std::iter::empty::<&alpm::Pkg>(),
+        std::iter::empty::<&alpm::Pkg>(),
+        local.iter(),
+        false,
+    );
+    if let Some(missing) = missing.first() {
+        return Err(format!(
+            "Installed dependency mismatch: {} requires {}",
+            missing.target(),
+            missing.depend()
+        ));
     }
     Ok(())
 }

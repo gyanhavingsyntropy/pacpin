@@ -39,6 +39,50 @@ fn token(source: &Source) -> Result<Option<String>, String> {
         .transpose()
 }
 
+fn is_private_or_local_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            ipv4.is_loopback()
+                || ipv4.is_private()
+                || ipv4.is_link_local()
+                || ipv4.is_broadcast()
+                || ipv4.is_unspecified()
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            if let Some(v4) = ipv6.to_ipv4_mapped() {
+                return is_private_or_local_ip(std::net::IpAddr::V4(v4));
+            }
+            ipv6.is_loopback()
+                || ipv6.is_unspecified()
+                || (ipv6.segments()[0] & 0xfe00) == 0xfc00 // Unique local (fc00::/7)
+                || (ipv6.segments()[0] & 0xffc0) == 0xfe80 // Link-local (fe80::/10)
+        }
+    }
+}
+
+fn validate_public_destination(url: &Url) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+    let host = url.host_str().ok_or("Destination missing host")?;
+    if host.eq_ignore_ascii_case("localhost") {
+        return Err("Connection to localhost is refused for security".into());
+    }
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("Cannot resolve destination host '{host}': {e}"))?;
+    let mut resolved_any = false;
+    for addr in addrs {
+        resolved_any = true;
+        if is_private_or_local_ip(addr.ip()) {
+            return Err(format!("Connection to private/loopback destination ({}) is refused", addr.ip()));
+        }
+    }
+    if !resolved_any {
+        return Err(format!("Destination host '{host}' resolved to no addresses"));
+    }
+    Ok(())
+}
+
 /// Redirects are handled explicitly: enforce HTTPS on every hop and do not
 /// forward credentials to another origin. Private cross-origin downloads must
 /// use a pre-authorized asset URL rather than ambient tokens.
@@ -52,6 +96,7 @@ pub fn request(url: &str, auth: Option<&str>, origin: &Url) -> Result<ureq::Resp
         .timeout(Duration::from_secs(600))
         .build());
     let mut current = https_url(url)?;
+    validate_public_destination(&current)?;
     for _ in 0..6 {
         let mut req = agent
             .get(current.as_str())
@@ -61,16 +106,40 @@ pub fn request(url: &str, auth: Option<&str>, origin: &Url) -> Result<ureq::Resp
                 req = req.set("Authorization", &format!("Bearer {auth}"));
             }
         }
-        // Do not include URLs or HTTP error text: private query strings may be credentials.
-        let response = req.call().map_err(|e| match e {
-            ureq::Error::Status(status, _) => format!("Source HTTP request failed ({status}); retry later or configure token_env for a private/rate-limited source"),
-            _ => "Source network request failed or timed out".into(),
-        })?;
+        let mut response = None;
+        let mut last_err = String::new();
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(150 * (1 << attempt)));
+            }
+            match req.clone().call() {
+                Ok(resp) => {
+                    response = Some(resp);
+                    break;
+                }
+                Err(ureq::Error::Status(status, _)) if matches!(status, 429 | 500 | 502 | 503 | 504) && attempt < 2 => {
+                    last_err = format!("Source HTTP request failed ({status}); retry later or configure token_env for a private/rate-limited source");
+                    continue;
+                }
+                Err(e) => {
+                    return Err(match e {
+                        ureq::Error::Status(status, _) => format!("Source HTTP request failed ({status}); retry later or configure token_env for a private/rate-limited source"),
+                        _ => "Source network request failed or timed out".into(),
+                    });
+                }
+            }
+        }
+        let response = match response {
+            Some(r) => r,
+            None => return Err(if last_err.is_empty() { "Source request failed".into() } else { last_err }),
+        };
+
         if matches!(response.status(), 301 | 302 | 303 | 307 | 308) {
             let next = response
                 .header("Location")
                 .ok_or("Source redirect has no Location")?;
             current = https_url(current.join(next).map_err(|_| "Invalid redirect")?.as_str())?;
+            validate_public_destination(&current)?;
         } else if response.status() == 200 {
             return Ok(response);
         } else {
@@ -179,12 +248,29 @@ struct GitlabAsset {
     direct_asset_url: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> OneOrMany<T> {
+    fn into_vec(self) -> Vec<T> {
+        match self {
+            OneOrMany::One(item) => vec![item],
+            OneOrMany::Many(vec) => vec,
+        }
+    }
+}
+
 fn parse_releases(kind: &Kind, bytes: &[u8], name: &str) -> Result<Vec<Release>, String> {
     match kind {
         Kind::Github => {
-            let releases: Vec<GithubRelease> = serde_json::from_slice(&api_array(bytes)?)
+            let releases: OneOrMany<GithubRelease> = serde_json::from_slice(bytes)
                 .map_err(|_| "Invalid GitHub releases response")?;
             Ok(releases
+                .into_vec()
                 .into_iter()
                 .filter(|r| !r.draft)
                 .map(|r| Release {
@@ -207,9 +293,10 @@ fn parse_releases(kind: &Kind, bytes: &[u8], name: &str) -> Result<Vec<Release>,
                 .collect())
         }
         Kind::Gitlab => {
-            let releases: Vec<GitlabRelease> = serde_json::from_slice(&api_array(bytes)?)
+            let releases: OneOrMany<GitlabRelease> = serde_json::from_slice(bytes)
                 .map_err(|_| "Invalid GitLab releases response")?;
             Ok(releases
+                .into_vec()
                 .into_iter()
                 .map(|r| Release {
                     tag: r.tag_name,
@@ -241,17 +328,6 @@ fn parse_releases(kind: &Kind, bytes: &[u8], name: &str) -> Result<Vec<Release>,
                 .ok_or_else(|| format!("No releases for package '{name}' in manifest"))
         }
     }
-}
-
-fn api_array(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let value: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|_| "Invalid releases JSON")?;
-    serde_json::to_vec(&if value.is_array() {
-        value
-    } else {
-        serde_json::Value::Array(vec![value])
-    })
-    .map_err(|_| "Invalid releases JSON".to_string())
 }
 
 pub fn releases(source: &Source, name: &str, recipe: &Recipe) -> Result<Vec<Release>, String> {
@@ -571,6 +647,7 @@ pub fn select(
         asset,
         git,
         persist_source: false,
+        no_cache: false,
     })
 }
 
@@ -751,5 +828,26 @@ mod tests {
         let reader = std::io::repeat(b'a').take(big_size);
         let bytes = bounded_bytes(reader, MAX_RELEASE_WINDOW_METADATA).unwrap();
         assert_eq!(bytes.len() as u64, big_size);
+    }
+
+    #[test]
+    fn ssrf_guard_detects_ipv4_mapped_ipv6_and_private_ips() {
+        use std::net::IpAddr;
+        let loopback_v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let loopback_v6: IpAddr = "::1".parse().unwrap();
+        let mapped_loopback: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let mapped_private: IpAddr = "::ffff:192.168.1.1".parse().unwrap();
+        let mapped_public: IpAddr = "::ffff:8.8.8.8".parse().unwrap();
+        let public_v4: IpAddr = "8.8.8.8".parse().unwrap();
+
+        assert!(is_private_or_local_ip(loopback_v4));
+        assert!(is_private_or_local_ip(loopback_v6));
+        assert!(is_private_or_local_ip(mapped_loopback));
+        assert!(is_private_or_local_ip(mapped_private));
+        assert!(!is_private_or_local_ip(mapped_public));
+        assert!(!is_private_or_local_ip(public_v4));
+
+        let local_url = Url::parse("https://localhost:8080/foo").unwrap();
+        assert!(validate_public_destination(&local_url).is_err());
     }
 }

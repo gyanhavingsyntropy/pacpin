@@ -116,6 +116,13 @@ pub(super) fn verify_target_and_dependencies_delay(
         return Ok(());
     }
 
+    let is_aur_repo = repo.is_some_and(|r| r.eq_ignore_ascii_case("aur"));
+    let mut aur_map = if is_aur_repo {
+        aur::query_aur(&[target_pkg.to_string()])
+    } else {
+        HashMap::new()
+    };
+
     // 1. Check target package itself
     check_single_pkg_delay(
         target_pkg,
@@ -127,19 +134,19 @@ pub(super) fn verify_target_and_dependencies_delay(
         manager,
         now_epoch,
         options,
+        Some(&aur_map),
     )?;
 
     // 2. Discover uninstalled direct dependencies and check their delay buffers
     let mut direct_deps = Vec::new();
-    if let Some(r) = repo {
-        if r.eq_ignore_ascii_case("aur") {
-            let aur_map = aur::query_aur(&[target_pkg.to_string()]);
-            if let Some(item) = aur_map.get(target_pkg) {
-                for d in &item.depends {
-                    direct_deps.push(d.to_string());
-                }
+    if is_aur_repo {
+        if let Some(item) = aur_map.get(target_pkg) {
+            for d in &item.depends {
+                direct_deps.push(d.to_string());
             }
-        } else if let Ok(pkg) = crate::db::find_sync_package(manager.handle(), &format!("{r}/{target_pkg}")) {
+        }
+    } else if let Some(r) = repo {
+        if let Ok(pkg) = crate::db::find_sync_package(manager.handle(), &format!("{r}/{target_pkg}")) {
             for d in pkg.depends() {
                 direct_deps.push(d.to_string());
             }
@@ -151,6 +158,7 @@ pub(super) fn verify_target_and_dependencies_delay(
     }
 
     let local_db = manager.handle().localdb();
+    let mut uninstalled_deps = Vec::new();
     let mut checked_deps = HashSet::new();
 
     for dep_name in direct_deps {
@@ -163,6 +171,26 @@ pub(super) fn verify_target_and_dependencies_delay(
             continue;
         }
 
+        uninstalled_deps.push(dep_name);
+    }
+
+    // Batch query AUR for uninstalled dependencies that might have delay rules
+    let mut aur_dep_candidates = Vec::new();
+    for dep in &uninstalled_deps {
+        let clean = aur::clean_dep_name(dep);
+        if ResolverEngine::match_delay_days(clean, &config.delay, glob_delays).is_some()
+            && crate::db::find_sync_package(manager.handle(), dep).is_err()
+            && !aur_map.contains_key(clean)
+        {
+            aur_dep_candidates.push(clean.to_string());
+        }
+    }
+    if !aur_dep_candidates.is_empty() {
+        let fetched = aur::query_aur(&aur_dep_candidates);
+        aur_map.extend(fetched);
+    }
+
+    for dep_name in uninstalled_deps {
         check_single_pkg_delay(
             &dep_name,
             target_pkg,
@@ -173,6 +201,7 @@ pub(super) fn verify_target_and_dependencies_delay(
             manager,
             now_epoch,
             options,
+            Some(&aur_map),
         )?;
     }
 
@@ -191,6 +220,7 @@ fn check_single_pkg_delay(
     manager: &AlpmManager,
     now_epoch: i64,
     options: &InstallOptions,
+    aur_cache: Option<&HashMap<String, aur::AurItem>>,
 ) -> Result<(), String> {
     // If already installed locally or satisfied by virtual provide, skip
     let local_db = manager.handle().localdb();
@@ -206,17 +236,24 @@ fn check_single_pkg_delay(
 
     let build_date: Option<i64> = if let Some(r) = repo {
         if r.eq_ignore_ascii_case("aur") {
-            let aur_map = aur::query_aur(&[package_name.to_string()]);
-            aur_map.get(package_name).and_then(|item| item.last_modified)
+            aur_cache
+                .and_then(|c| c.get(package_name))
+                .and_then(|item| item.last_modified)
+                .or_else(|| {
+                    let aur_map = aur::query_aur(&[package_name.to_string()]);
+                    aur_map.get(package_name).and_then(|item| item.last_modified)
+                })
         } else {
             crate::db::find_sync_package(manager.handle(), &format!("{r}/{pkg}"))
                 .ok()
                 .map(|p| p.build_date())
         }
+    } else if let Ok(p) = crate::db::find_sync_package(manager.handle(), pkg) {
+        Some(p.build_date())
     } else {
-        crate::db::find_sync_package(manager.handle(), pkg)
-            .ok()
-            .map(|p| p.build_date())
+        aur_cache
+            .and_then(|c| c.get(package_name))
+            .and_then(|item| item.last_modified)
     };
 
     if let Some(bdate) = build_date {

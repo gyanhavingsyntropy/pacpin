@@ -1,5 +1,40 @@
 //! Satisfaction for loaded archives, whose Pkg wrapper has no find_satisfier API.
 //! Repository selection still belongs exclusively to find_sync_package.
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveMetadata {
+    pub name: String,
+    pub version: String,
+    pub provides: Vec<(String, Option<String>)>,
+}
+
+pub(crate) fn satisfies_spec(meta: &ArchiveMetadata, dependency: &str) -> bool {
+    let dep = alpm::Depend::new(dependency);
+    let check_ver = |ver: Option<&str>| -> bool {
+        use alpm::DepMod;
+        if dep.depmod() == DepMod::Any {
+            return true;
+        }
+        let (Some(ver), Some(required)) = (ver, dep.version()) else {
+            return false;
+        };
+        let order = alpm::vercmp(ver, required.as_str());
+        match dep.depmod() {
+            DepMod::Any => true,
+            DepMod::Eq => order.is_eq(),
+            DepMod::Ge => !order.is_lt(),
+            DepMod::Le => !order.is_gt(),
+            DepMod::Gt => order.is_gt(),
+            DepMod::Lt => order.is_lt(),
+        }
+    };
+    (meta.name == dep.name() && check_ver(Some(&meta.version)))
+        || meta
+            .provides
+            .iter()
+            .any(|(p_name, p_ver)| p_name == dep.name() && check_ver(p_ver.as_deref()))
+}
+
 pub(crate) fn package_satisfies(package: &alpm::Pkg, dependency: &str) -> bool {
     let dependency = alpm::Depend::new(dependency);
     let matches = |version: Option<&alpm::Ver>| {

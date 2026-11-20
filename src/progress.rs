@@ -420,21 +420,19 @@ pub fn clear_sources() {
 
 /// Also called by the signal handler, which exits without running Drop.
 pub fn restore_terminal() {
-    let saved = TERMINAL.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let view = VIEW.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let saved = TERMINAL.try_lock().ok().and_then(|mut guard| guard.take());
+    let view = VIEW.try_lock().ok().and_then(|mut guard| guard.take());
     let height = saved.as_ref().map(|(_, height)| *height).filter(|height| *height != 0)
         .or_else(|| view.map(|(_, _, height)| height)).unwrap_or(0);
-    if saved.is_some() || height != 0 {
-        let bottom = terminal_size().ws_row.saturating_sub(height).max(1);
-        // SAFETY: saved was returned by tcgetattr for this process's stdin.
-        unsafe {
-            if let Some((saved, _)) = saved { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved); }
-            // Resetting the scroll region homes the cursor. Preserve it so
-            // subsequent source logs cannot overwrite earlier pacman text.
-            // Signal exit skips Footer::drop. Clear its reserved rows here too.
-            let reset = if height == 0 { "\x1b[0m\x1b[?25h".into() } else { format!("\x1b7\x1b[{};1H\x1b[J\x1b[r\x1b8\x1b[0m\x1b[?25h", bottom + 1) };
-            libc::write(libc::STDOUT_FILENO, reset.as_ptr().cast(), reset.len());
-        }
+    let bottom = terminal_size().ws_row.saturating_sub(height).max(1);
+    // SAFETY: saved was returned by tcgetattr for this process's stdin.
+    unsafe {
+        if let Some((saved, _)) = saved { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved); }
+        // Resetting the scroll region homes the cursor. Preserve it so
+        // subsequent source logs cannot overwrite earlier pacman text.
+        // Signal exit skips Footer::drop. Clear its reserved rows here too.
+        let reset = if height == 0 { "\x1b[r\x1b[0m\x1b[?25h".into() } else { format!("\x1b7\x1b[{};1H\x1b[J\x1b[r\x1b8\x1b[0m\x1b[?25h", bottom + 1) };
+        libc::write(libc::STDOUT_FILENO, reset.as_ptr().cast(), reset.len());
     }
 }
 
@@ -902,7 +900,7 @@ impl BackgroundCommand {
     fn kill_group(&mut self) {
         let pid = self.child.0.id();
         // Signal the entire process group so root pacman child under sudo exits and releases db.lck
-        unsafe { let _ = libc::kill(-(pid as i32), libc::SIGTERM); }
+        let _ = crate::execution::signal_process_group(pid, libc::SIGTERM);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         while std::time::Instant::now() < deadline {
             if let Ok(Some(_)) = self.child.0.try_wait() {
@@ -910,7 +908,7 @@ impl BackgroundCommand {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        unsafe { let _ = libc::kill(-(pid as i32), libc::SIGKILL); }
+        let _ = crate::execution::signal_process_group(pid, libc::SIGKILL);
         let _ = self.child.0.kill();
     }
 

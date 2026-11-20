@@ -56,10 +56,9 @@ impl OrphanManager {
     }
 
     fn read_pending(path: &std::path::Path) -> Result<Option<Vec<String>>, String> {
-        let content = match fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("Cannot read pending orphan cleanup: {error}")),
+        let content = match crate::utils::read_regular_bounded_string(path, 1_048_576)? {
+            Some(content) => content,
+            None => return Ok(None),
         };
         let selected: Vec<String> = serde_json::from_str(&content)
             .map_err(|error| format!("Invalid pending orphan cleanup: {error}"))?;
@@ -142,10 +141,7 @@ impl OrphanManager {
 
     pub fn load_known() -> Option<HashMap<String, KnownOrphan>> {
         let path = Self::state_file()?;
-        if !path.exists() {
-            return None;
-        }
-        let content = fs::read_to_string(&path).ok()?;
+        let content = crate::utils::read_regular_bounded_string(&path, 10_485_760).ok().flatten()?;
 
         // 1. Modern detailed format: Map of package name -> KnownOrphan
         if let Ok(map) = serde_json::from_str::<HashMap<String, KnownOrphan>>(&content) {
@@ -177,9 +173,6 @@ impl OrphanManager {
             Some(p) => p,
             None => return,
         };
-        if let Some(dir) = path.parent() {
-            let _ = fs::create_dir_all(dir);
-        }
         let mut map: std::collections::BTreeMap<String, KnownOrphan> = std::collections::BTreeMap::new();
         for o in orphans {
             map.insert(
@@ -191,7 +184,7 @@ impl OrphanManager {
             );
         }
         if let Ok(json) = serde_json::to_string_pretty(&map) {
-            let _ = fs::write(path, json);
+            let _ = crate::utils::write_atomic_private(&path, json.as_bytes());
         }
     }
 

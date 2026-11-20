@@ -10,7 +10,7 @@ pub fn clean_stale_sandboxes() {
                 for entry in entries.flatten() {
                     let p = entry.path();
                     if p.is_dir() && should_clean_stale_sandbox(&p) {
-                        let _ = fs::remove_dir_all(&p);
+                        let _ = crate::execution::remove_owned_tree(&p);
                     }
                 }
             }
@@ -31,7 +31,7 @@ pub fn clean_stale_sandboxes() {
                     && p.is_dir()
                     && should_clean_stale_sandbox(&p)
                 {
-                    let _ = fs::remove_dir_all(&p);
+                    let _ = crate::execution::remove_owned_tree(&p);
                 }
             }
         }

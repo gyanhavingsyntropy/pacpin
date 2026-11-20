@@ -410,36 +410,7 @@ fn package_download_command(url: &str, output: &Path) -> Command {
 
 /// Safely inspects and extracts a package tarball into a destination directory.
 pub fn extract_archive(archive_path: &Path, target_dir: &Path) -> Result<(), String> {
-    crate::archive::extract(archive_path, target_dir, MAX_ARCHIVE_ENTRIES, MAX_UNPACKED_BYTES)?;
-
-    // Verify uncompressed size on disk does not exceed safety limit (decompression bomb protection)
-    fn verify_disk_size(dir: &Path, current_total: &mut u64, limit: u64) -> Result<(), String> {
-        let entries = fs::read_dir(dir).map_err(|e| format!("Cannot verify extracted directory: {e}"))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("Cannot verify extracted entry: {e}"))?;
-            let ft = entry.file_type().map_err(|e| format!("Cannot verify extracted file type: {e}"))?;
-            if ft.is_file() {
-                let sz = entry.metadata().map_err(|e| format!("Cannot verify extracted file size: {e}"))?.len();
-                *current_total = current_total.saturating_add(sz);
-                if *current_total > limit {
-                    return Err(format!(
-                        "Security violation: extracted package size exceeds safety limit of 5 GB ({} bytes). Extraction aborted.",
-                        limit
-                    ));
-                }
-            } else if ft.is_dir() {
-                verify_disk_size(&entry.path(), current_total, limit)?;
-            }
-        }
-        Ok(())
-    }
-
-    let mut disk_size = 0u64;
-    verify_disk_size(target_dir, &mut disk_size, MAX_UNPACKED_BYTES)?;
-
-    validate_symlink_traversal(target_dir, 32)?;
-
-    Ok(())
+    crate::archive::extract(archive_path, target_dir, MAX_ARCHIVE_ENTRIES, MAX_UNPACKED_BYTES)
 }
 
 /// Traverses all symlinks in the extracted root to verify they do not escape the sandbox

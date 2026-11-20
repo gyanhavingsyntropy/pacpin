@@ -213,6 +213,16 @@ fn parse_requested_aur_response(body: &str, requested: &[String]) -> Result<Vec<
     Ok(items)
 }
 
+fn aur_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(6))
+            .user_agent(concat!("pacpin/", env!("CARGO_PKG_VERSION"), " (GPLv3)"))
+            .build()
+    })
+}
+
 pub fn query_aur(pkg_names: &[String]) -> HashMap<String, AurItem> {
     query_aur_checked(pkg_names).unwrap_or_default()
 }
@@ -222,15 +232,10 @@ pub fn query_aur_checked(pkg_names: &[String]) -> Result<HashMap<String, AurItem
         return Ok(HashMap::new());
     }
 
-    let agent = std::sync::Arc::new(
-        ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(6))
-            .user_agent(concat!("pacpin/", env!("CARGO_PKG_VERSION"), " (GPLv3)"))
-            .build(),
-    );
+    let agent = aur_agent();
 
     if pkg_names.len() <= 50 {
-        return query_aur_chunk(&agent, pkg_names);
+        return query_aur_chunk(agent, pkg_names);
     }
 
     // Query 50-package chunks concurrently with bounded worker concurrency (max 4 parallel connections)
@@ -242,8 +247,7 @@ pub fn query_aur_checked(pkg_names: &[String]) -> Result<HashMap<String, AurItem
         let mut handles = Vec::new();
         for chunk in chunk_batch {
             let chunk = chunk.clone();
-            let ag = std::sync::Arc::clone(&agent);
-            handles.push(std::thread::spawn(move || query_aur_chunk(&ag, &chunk)));
+            handles.push(std::thread::spawn(move || query_aur_chunk(aur_agent(), &chunk)));
         }
         let mut first_error = None;
         for h in handles {

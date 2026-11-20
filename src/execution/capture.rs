@@ -44,30 +44,58 @@ pub(crate) fn capture_output_observed(command: &mut Command, limit: usize, timeo
     let output = std::thread::spawn(move || read_bounded(stdout, limit, out_overflow, false, out_observe));
     let errors = std::thread::spawn(move || read_bounded(stderr, limit, err_overflow, true, observe));
     let start = std::time::Instant::now();
+    let pid = child.0.id();
+    let mut backoff_ms = 1u64;
     let status = loop {
         if overflow.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = super::signal_process_group(pid, libc::SIGKILL);
+            let _ = child.0.kill();
+            let _ = child.0.wait();
             break Err(io::Error::other("Command output exceeds metadata limit"));
         }
         if start.elapsed() >= timeout {
+            let _ = super::signal_process_group(pid, libc::SIGKILL);
+            let _ = child.0.kill();
+            let _ = child.0.wait();
             break Err(io::Error::new(io::ErrorKind::TimedOut, "Metadata command timed out"));
         }
         if is_terminating() {
+            let _ = super::signal_process_group(pid, libc::SIGKILL);
+            let _ = child.0.kill();
+            let _ = child.0.wait();
             break Err(io::Error::new(io::ErrorKind::Interrupted, "pacpin is terminating"));
         }
-        match child.0.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
-            Err(error) => break Err(error),
+        #[cfg(unix)]
+        {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let (exited, _error) = unsafe {
+                let res = libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                );
+                (res == 0 && info.si_pid() != 0, res != 0)
+            };
+            if exited {
+                // Signal process group before reaping leader to avoid PID-reuse hazard
+                let _ = super::signal_process_group(pid, libc::SIGKILL);
+                break child.0.wait();
+            }
         }
+        #[cfg(not(unix))]
+        {
+            if let Ok(Some(status)) = child.0.try_wait() {
+                break Ok(status);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+        backoff_ms = (backoff_ms.saturating_mul(2)).min(20);
     };
-    let pgid = child.0.id() as i32;
     if status.is_err() {
-        unsafe { libc::kill(-pgid, libc::SIGKILL); }
+        let _ = super::signal_process_group(pid, libc::SIGKILL);
         let _ = child.0.kill();
         let _ = child.0.wait();
-    } else {
-        // Metadata scripts must not leave descendants holding capture pipes open.
-        unsafe { libc::kill(-pgid, libc::SIGKILL); }
     }
     let stdout = output.join().map_err(|_| io::Error::other("Output reader failed"))??;
     let stderr = errors.join().map_err(|_| io::Error::other("Error reader failed"))??;

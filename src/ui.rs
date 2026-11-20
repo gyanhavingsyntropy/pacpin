@@ -149,22 +149,8 @@ pub fn char_width(ch: char) -> usize {
 }
 
 pub fn str_width(s: &str) -> usize {
-    let mut w = 0;
-    let mut in_escape = false;
-    for ch in s.chars() {
-        if ch == '\x1b' {
-            in_escape = true;
-            continue;
-        }
-        if in_escape {
-            if ch == 'm' {
-                in_escape = false;
-            }
-            continue;
-        }
-        w += char_width(ch);
-    }
-    w
+    let clean = crate::utils::sanitize_display_text(s);
+    clean.chars().map(char_width).sum()
 }
 
 pub fn format_size(bytes_val: i64) -> String {

@@ -16,7 +16,7 @@ pub(crate) struct PackageRoot<'a> {
     config: &'a Config,
     options: &'a Options,
     guard: SandboxGuard,
-    archives: Vec<PathBuf>,
+    archives: Vec<(PathBuf, crate::db::ArchiveMetadata)>,
     names: HashSet<String>,
     building: HashSet<String>,
     resolving: HashSet<String>,
@@ -113,19 +113,10 @@ impl<'a> PackageRoot<'a> {
         if dependency.contains('\0') {
             return Err("Invalid dependency".into());
         }
-        let packages = self
+        if self
             .archives
             .iter()
-            .map(|path| {
-                self.manager
-                    .handle()
-                    .pkg_load(path.to_string_lossy().as_ref(), true, alpm::SigLevel::NONE)
-                    .map_err(|e| e.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if packages
-            .iter()
-            .any(|package| crate::db::package_satisfies(package, dependency))
+            .any(|(_, meta)| crate::db::satisfies_spec(meta, dependency))
         {
             return Ok(true);
         }
@@ -192,17 +183,8 @@ impl<'a> PackageRoot<'a> {
     }
 
     pub fn build_aur(&mut self, pkg: &str) -> Result<PathBuf, String> {
-        for archive in &self.archives {
-            let package = self
-                .manager
-                .handle()
-                .pkg_load(
-                    archive.as_os_str().as_encoded_bytes().to_vec(),
-                    true,
-                    alpm::SigLevel::NONE,
-                )
-                .map_err(|e| e.to_string())?;
-            if package.name() == pkg {
+        for (archive, meta) in &self.archives {
+            if meta.name == pkg {
                 return Ok(archive.clone());
             }
         }
@@ -310,6 +292,15 @@ impl<'a> PackageRoot<'a> {
             .into_iter()
             .map(|dep| dep.to_string())
             .collect();
+        let meta = crate::db::ArchiveMetadata {
+            name: package.name().to_string(),
+            version: package.version().as_str().to_string(),
+            provides: package
+                .provides()
+                .into_iter()
+                .map(|p| (p.name().to_string(), p.version().map(|v| v.as_str().to_string())))
+                .collect(),
+        };
         if package.has_scriptlet() {
             println!(":: {expected}: installation scripts/hooks are not executed by try/run; apps needing system integration may not work temporarily.");
         }
@@ -325,7 +316,7 @@ impl<'a> PackageRoot<'a> {
             "Extracting temporary package",
             || crate::archive::extract_package(archive, &self.root),
         )?;
-        self.archives.push(archive.into());
+        self.archives.push((archive.into(), meta));
         self.names.insert(expected.into());
         Ok(())
     }
@@ -336,7 +327,7 @@ impl<'a> PackageRoot<'a> {
         let packages = self
             .archives
             .iter()
-            .map(|path| {
+            .map(|(path, _)| {
                 self.manager
                     .handle()
                     .pkg_load(path.to_string_lossy().as_ref(), true, alpm::SigLevel::NONE)
@@ -371,7 +362,8 @@ impl<'a> PackageRoot<'a> {
     /// Build-only archives never cross the installation boundary.
     pub fn installation_archives(&self, targets: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
         self.validate_runtime()?;
-        select_installation_archives(&self.manager, &self.archives, targets)
+        let paths: Vec<PathBuf> = self.archives.iter().map(|(p, _)| p.clone()).collect();
+        select_installation_archives(&self.manager, &paths, targets)
     }
 }
 
@@ -555,5 +547,10 @@ mod tests {
         // When manager has x86_64_v3 configured, add_archive succeeds:
         root.manager.set_architectures_for_test(vec!["x86_64".into(), "x86_64_v3".into()]);
         assert!(root.add_archive(&pkg_v3, "v3pkg").is_ok());
+
+        assert_eq!(root.archives.len(), 1);
+        assert_eq!(root.archives[0].0, pkg_v3);
+        assert_eq!(root.archives[0].1.name, "v3pkg");
+        assert!(root.satisfied("v3pkg").unwrap());
     }
 }

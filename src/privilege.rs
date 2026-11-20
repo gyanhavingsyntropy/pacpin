@@ -17,7 +17,25 @@ pub fn initialize(tool: &str, args: &[String]) {
 }
 
 fn fresh_session(tool: &str, terminal: bool, args: &[String]) -> bool {
-    tool == "sudo" && terminal && !args.iter().any(|arg| arg == "--dry-run" || arg == "-n")
+    if tool != "sudo" || !terminal {
+        return false;
+    }
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            break;
+        }
+        if arg == "--dry-run" || arg == "-n" {
+            return false;
+        }
+        if crate::commands::cli::takes_value(arg) {
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Called only when an approved privileged operation or AUR install will run.
@@ -46,7 +64,15 @@ pub fn prepare(tool: &str) -> io::Result<()> {
             let _ = std::thread::Builder::new()
                 .name("sudo-session".into())
                 .spawn(|| loop {
-                    std::thread::sleep(Duration::from_secs(60));
+                    for _ in 0..60 {
+                        std::thread::sleep(Duration::from_secs(1));
+                        if crate::execution::is_terminating() {
+                            return;
+                        }
+                    }
+                    if crate::execution::is_terminating() {
+                        return;
+                    }
                     let _ = crate::execution::run_tracked_command(
                         renewal_command()
                             // Keep the same input tty for sudo's timestamp lookup.

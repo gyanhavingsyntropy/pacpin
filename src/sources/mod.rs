@@ -151,6 +151,7 @@ pub struct Plan {
     pub git: Option<GitRevision>,
     /// A direct target is retained only after its verified transaction succeeds.
     pub persist_source: bool,
+    pub no_cache: bool,
 }
 
 pub fn safe_relative(value: &str) -> bool {
@@ -313,24 +314,47 @@ pub fn plan(config: &Config, target: &str) -> Result<Plan, String> {
         .get(name)
         .ok_or_else(|| format!("No recipe for '{target}'"))?;
     let releases = catalog::releases(source, name, recipe)?;
-    catalog::select(alias, name, source, recipe, releases)
+    let mut plan = catalog::select(alias, name, source, recipe, releases)?;
+    plan.no_cache = config.options.no_cache;
+    Ok(plan)
 }
 
 pub fn ignored(name: &str, flags: &[String]) -> bool {
-    flags
-        .iter()
-        .enumerate()
-        .filter_map(|(index, flag)| {
-            flag.strip_prefix("--ignore=").or_else(|| {
-                if flag == "--ignore" {
-                    flags.get(index + 1).map(String::as_str)
-                } else {
-                    None
-                }
-            })
-        })
-        .flat_map(|value| value.split(','))
-        .any(|pattern| glob::Pattern::new(pattern).is_ok_and(|p| p.matches(name)))
+    let mut patterns = Vec::new();
+    let mut i = 0;
+    while i < flags.len() {
+        let flag = &flags[i];
+        if flag == "--" {
+            break;
+        }
+        if let Some(list) = flag.strip_prefix("--ignore=") {
+            patterns.extend(list.split(','));
+            i += 1;
+            continue;
+        }
+        if flag == "--ignore" {
+            if i + 1 < flags.len() {
+                patterns.extend(flags[i + 1].split(','));
+                i += 2;
+                continue;
+            } else {
+                i += 1;
+                continue;
+            }
+        }
+        if crate::commands::cli::takes_value(flag)
+            || (flag == "--wait"
+                && i + 1 < flags.len()
+                && flags[i + 1].parse::<u64>().is_ok())
+        {
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    patterns.into_iter().any(|pattern| {
+        glob::Pattern::new(pattern).is_ok_and(|p| p.matches(name))
+    })
 }
 
 pub fn is_direct_syntax(value: &str) -> bool {
@@ -346,10 +370,13 @@ pub fn install_targets(
     if !options.forwarded_flags.is_empty() || options.refresh || options.sysupgrade {
         return Err("Source installs do not accept native transaction flags; run 'pin -Syu' separately, then 'pin -S alias/package'".into());
     }
-    let plans: Vec<_> = targets
+    let mut plans: Vec<_> = targets
         .iter()
         .map(|target| plan(config, target))
         .collect::<Result<_, _>>()?;
+    for plan in &mut plans {
+        plan.no_cache = plan.no_cache || options.no_cache;
+    }
     for plan in &plans {
         println!(
             ":: Source: {}/{} -> {} ({}, {})",
@@ -414,6 +441,7 @@ pub fn install_direct(
     let releases = catalog::releases(&source, &name, &recipe)?;
     let mut plan = catalog::select(&alias, &name, &source, &recipe, releases)?;
     plan.persist_source = !config.sources.contains_key(&alias);
+    plan.no_cache = config.options.no_cache || options.no_cache;
     println!(
         ":: Direct source: {target} -> {}/{} (version {}, tag {})",
         plan.alias, plan.name, plan.version, plan.tag
@@ -575,5 +603,21 @@ mod tests {
         let result = crate::resolver::ResolverEngine::new(&fixture.manager).resolve_all(&config);
         assert!(result.updates.is_empty());
         assert_eq!(result.unresolved_pins, [("company-private-app".into(), "company-repo".into())]);
+    }
+
+    #[test]
+    fn plan_inherits_no_cache_from_config() {
+        let dir = std::env::temp_dir().join(format!("pacpin-nocache-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cat_path = dir.join("cat.json");
+        std::fs::write(dir.join("app.tar"), b"fixture").unwrap();
+        std::fs::write(&cat_path, r#"{"version":1,"packages":{"app":[{"tag":"1.0.0","assets":[{"name":"app","url":"app.tar","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}]}}"#).unwrap();
+        let config: Config = toml::from_str(&format!(
+            "[options]\nno_cache=true\n[sources.company]\nkind='local'\nurl='{}'\n[sources.company.packages.app]\nasset='app'\nformat='binary'\n[sources.company.packages.app.binaries]\napp='artifact'\n",
+            cat_path.display()
+        )).unwrap();
+        let p = plan(&config, "company/app").unwrap();
+        assert!(p.no_cache);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

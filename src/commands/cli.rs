@@ -99,6 +99,10 @@ pub fn iter_flags(flags_list: &[String]) -> impl Iterator<Item = &String> {
         fn next(&mut self) -> Option<Self::Item> {
             if self.idx < self.slice.len() {
                 let item = &self.slice[self.idx];
+                if item == "--" {
+                    self.idx = self.slice.len();
+                    return None;
+                }
                 if takes_value(item)
                     || (item == "--wait"
                         && self.idx + 1 < self.slice.len()

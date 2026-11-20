@@ -29,6 +29,7 @@ fn plan(path: &Path) -> Plan {
         },
         git: None,
         persist_source: false,
+        no_cache: false,
     }
 }
 

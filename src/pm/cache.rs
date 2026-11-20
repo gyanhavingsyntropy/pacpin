@@ -42,49 +42,95 @@ pub fn clean_scoped(
         prune_source_cache(config, full)?;
     }
     let helper = &config.options.helper;
-    let use_helper = !force_native_only && crate::is_command_available(helper);
+    let use_helper = !force_native_only && cache_scope(extra_args)? != CacheScope::Native && crate::is_command_available(helper);
     let flag = if full { "-Scc" } else { "-Sc" };
-    let mut cmd = build_clean_command(config, full, extra_args, use_helper)?;
-    if use_helper {
-        if is_aur_only {
-            println!(
-                "{} Cleaning AUR build cache via {} {} --aur...",
-                "::".cyan(),
-                helper,
-                flag
-            );
-        } else {
-            println!(
-                "{} Cleaning package cache via {} {}...",
-                "::".cyan(),
-                helper,
-                flag
-            );
-        }
-    } else {
+
+    if use_helper && !is_aur_only && full {
+        // Stage 1: Clean native cache via pacman -Scc
         println!(
             "{} Cleaning native package cache via {} pacman {}...",
             "::".cyan(), config.options.privilege_tool, flag
         );
-    }
-    // `pacman -Scc --noconfirm` answers its destructive [y/N] prompt with No.
-    // Answer only the known cache-clean questions after pacpin's own approval.
-    let input = if full {
-        // Queue the bounded answers before spawning. Writing to a child's
-        // pipe after it fails early could terminate pacpin with SIGPIPE,
-        // hiding the actual cleanup status and skipping restart advice.
-        let input = cache_input(&cache_answers(TransactionJournal::get_cache_dirs().len(), is_aur_only))
+        let mut native_cmd = build_clean_command(config, full, &[], false)?;
+        let native_input = cache_input(&cache_answers(TransactionJournal::get_cache_dirs().len(), false))
             .map_err(|error| format!("Could not prepare cache-clean answers: {error}"))?;
-        Stdio::from(std::os::fd::OwnedFd::from(input))
-    } else { Stdio::inherit() };
-    let label = if is_aur_only { "Cleaning AUR build cache" } else if force_native_only || cache_scope(extra_args)? == CacheScope::Native { "Cleaning native package cache" } else { "Cleaning package caches" };
-    let status = crate::progress::run_with_stdin(&mut cmd, crate::progress::Manager::Cache, label, input);
-    match status {
-        Ok(s) => {
-            if s.success() { crate::progress::completed(crate::progress::Manager::Cache); }
-            Ok(s.code().unwrap_or(1))
+        let status = crate::progress::run_with_stdin(
+            &mut native_cmd,
+            crate::progress::Manager::Cache,
+            "Cleaning native package cache",
+            Stdio::from(std::os::fd::OwnedFd::from(native_input)),
+        );
+        match status {
+            Ok(s) if !s.success() => return Ok(s.code().unwrap_or(1)),
+            Err(e) => return Err(format!("Clean execution failed: {e}")),
+            _ => {}
         }
-        Err(e) => Err(format!("Clean execution failed: {}", e)),
+
+        // Stage 2: Clean AUR cache via helper -Scc --aur
+        println!(
+            "{} Cleaning AUR build cache via {} {} --aur...",
+            "::".cyan(), helper, flag
+        );
+        let aur_args = vec!["--aur".to_string()];
+        let mut aur_cmd = build_clean_command(config, full, &aur_args, true)?;
+        let aur_input = cache_input(&cache_answers(0, true))
+            .map_err(|error| format!("Could not prepare cache-clean answers: {error}"))?;
+        let status = crate::progress::run_with_stdin(
+            &mut aur_cmd,
+            crate::progress::Manager::Cache,
+            "Cleaning AUR build cache",
+            Stdio::from(std::os::fd::OwnedFd::from(aur_input)),
+        );
+        match status {
+            Ok(s) => {
+                if s.success() { crate::progress::completed(crate::progress::Manager::Cache); }
+                Ok(s.code().unwrap_or(1))
+            }
+            Err(e) => Err(format!("Clean execution failed: {e}")),
+        }
+    } else {
+        let mut cmd = build_clean_command(config, full, extra_args, use_helper)?;
+        if use_helper {
+            if is_aur_only {
+                println!(
+                    "{} Cleaning AUR build cache via {} {} --aur...",
+                    "::".cyan(),
+                    helper,
+                    flag
+                );
+            } else {
+                println!(
+                    "{} Cleaning package cache via {} {}...",
+                    "::".cyan(),
+                    helper,
+                    flag
+                );
+            }
+        } else {
+            println!(
+                "{} Cleaning native package cache via {} pacman {}...",
+                "::".cyan(), config.options.privilege_tool, flag
+            );
+        }
+        // `pacman -Scc --noconfirm` answers its destructive [y/N] prompt with No.
+        // Answer only the known cache-clean questions after pacpin's own approval.
+        let input = if full {
+            // Queue the bounded answers before spawning. Writing to a child's
+            // pipe after it fails early could terminate pacpin with SIGPIPE,
+            // hiding the actual cleanup status and skipping restart advice.
+            let input = cache_input(&cache_answers(if is_aur_only { 0 } else { TransactionJournal::get_cache_dirs().len() }, is_aur_only))
+                .map_err(|error| format!("Could not prepare cache-clean answers: {error}"))?;
+            Stdio::from(std::os::fd::OwnedFd::from(input))
+        } else { Stdio::inherit() };
+        let label = if is_aur_only { "Cleaning AUR build cache" } else if force_native_only || cache_scope(extra_args)? == CacheScope::Native { "Cleaning native package cache" } else { "Cleaning package caches" };
+        let status = crate::progress::run_with_stdin(&mut cmd, crate::progress::Manager::Cache, label, input);
+        match status {
+            Ok(s) => {
+                if s.success() { crate::progress::completed(crate::progress::Manager::Cache); }
+                Ok(s.code().unwrap_or(1))
+            }
+            Err(e) => Err(format!("Clean execution failed: {}", e)),
+        }
     }
 }
 
@@ -97,7 +143,6 @@ fn cache_answers(native_dirs: usize, aur_only: bool) -> Vec<u8> {
     let mut answers = b"y\n".repeat(native_dirs);
     // Cache cleanup must not also remove sync databases.
     answers.extend_from_slice(b"n\n");
-    answers.extend_from_slice(&b"y\n".repeat(64));
     answers
 }
 
@@ -259,7 +304,7 @@ fn prune_source_cache(config: &Config, full: bool) -> Result<(), String> {
         if let Ok(opt_entries) = std::fs::read_dir("/opt") {
             for entry in opt_entries.flatten() {
                 let receipt_path = entry.path().join(".pacpin-source.json");
-                if let Ok(data) = std::fs::read_to_string(&receipt_path) {
+                if let Ok(Some(data)) = crate::utils::read_regular_bounded_string(&receipt_path, 1_048_576) {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
                         if let Some(sha) = parsed.get("sha256").and_then(|v| v.as_str()) {
                             if let Some(valid) = crate::sources::valid_sha256_key(sha) {
@@ -274,7 +319,7 @@ fn prune_source_cache(config: &Config, full: bool) -> Result<(), String> {
             for entry in sidecar_entries.flatten() {
                 let path = entry.path();
                 if path.extension().is_some_and(|ext| ext == "json") {
-                    if let Ok(data) = std::fs::read_to_string(&path) {
+                    if let Ok(Some(data)) = crate::utils::read_regular_bounded_string(&path, 1_048_576) {
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
                             if let (Some(pkg), Some(sha)) = (
                                 parsed.get("package").and_then(|v| v.as_str()),

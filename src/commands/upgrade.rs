@@ -186,8 +186,7 @@ pub fn cmd_upgrade(
     // here with guidance: they are already tracked by `pin -Syu`, and forcing
     // one uses `pin -S`.
     if !requested.is_empty()
-        && extra_flags
-            .iter()
+        && crate::commands::cli::iter_flags(extra_flags)
             .any(|flag| flag == "--channel" || flag.starts_with("--channel="))
     {
         eprintln!(
@@ -209,7 +208,7 @@ pub fn cmd_upgrade(
         eprintln!("Error: requested targets do not belong to the selected upgrade scope"); exit(2);
     }
     let no_cache = config.options.no_cache
-        || extra_flags.iter().any(|flag| flag == "--no-cache" || flag == "--clean-cache");
+        || crate::commands::cli::iter_flags(extra_flags).any(|flag| flag == "--no-cache" || flag == "--clean-cache");
     let manager_flags = crate::runtime::upgrade_manager_flags(extra_flags);
     let actionable = !res.updates.is_empty() || !external_updates.is_empty()
         || requested_targets.items.iter().any(|item| item.status != RequestedStatus::AlreadyCurrent);
@@ -988,20 +987,36 @@ fn revalidate_orphan_selection(
 }
 
 pub fn parse_install_flags(flags: &[String]) -> pm::InstallOptions {
-    let wait = flags.iter().enumerate().find_map(|(idx, f)| {
-        if f.starts_with("--wait=") {
-            f.strip_prefix("--wait=").and_then(|s| s.parse::<u64>().ok())
-        } else if f == "--wait" {
-            if let Some(next) = flags.get(idx + 1) {
-                if let Ok(secs) = next.parse::<u64>() {
-                    return Some(secs);
+    let mut wait = None;
+    let mut i = 0;
+    while i < flags.len() {
+        let f = &flags[i];
+        if f == "--" {
+            break;
+        }
+        if let Some(val) = f.strip_prefix("--wait=") {
+            wait = val.parse::<u64>().ok();
+            i += 1;
+            continue;
+        }
+        if f == "--wait" {
+            if i + 1 < flags.len() {
+                if let Ok(secs) = flags[i + 1].parse::<u64>() {
+                    wait = Some(secs);
+                    i += 2;
+                    continue;
                 }
             }
-            Some(600)
-        } else {
-            None
+            wait = Some(600);
+            i += 1;
+            continue;
         }
-    });
+        if crate::commands::cli::takes_value(f) {
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
     let manager_flags = crate::runtime::manager_flags(flags);
     let flags = manager_flags.as_slice();
     let mut channel = None;
@@ -1024,6 +1039,11 @@ pub fn parse_install_flags(flags: &[String]) -> pm::InstallOptions {
     while i < flags.len() {
         let f = &flags[i];
         let s = f.as_str();
+
+        if s == "--" {
+            forwarded_flags.extend(flags[i..].iter().cloned());
+            break;
+        }
 
         if s == "--channel" {
             if let Some(val) = flags.get(i + 1) {
@@ -1141,10 +1161,6 @@ fn validate_channel_flags(flags: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < flags.len() {
         let flag = &flags[i];
-        if crate::commands::cli::takes_value(flag) {
-            i += 2;
-            continue;
-        }
         if let Some(value) = flag.strip_prefix("--channel=") {
             values.push(value);
             i += 1;
@@ -1158,6 +1174,10 @@ fn validate_channel_flags(flags: &[String]) -> Result<(), String> {
             } else {
                 return Err("--channel requires stable, alpha, beta, or prerelease".into());
             }
+        }
+        if crate::commands::cli::takes_value(flag) {
+            i += 2;
+            continue;
         }
         i += 1;
     }

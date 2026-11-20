@@ -229,7 +229,7 @@ mod action_tests {
             source: Source { kind: Kind::Local, url: "/tmp/fixture-catalog.json".into(), token_env: None, packages: BTreeMap::new() },
             recipe, tag: "v2".into(), version: "2-1".into(),
             asset: Asset { name: "app.tar".into(), url: "app.tar".into(), sha256: Some("a".repeat(64)) },
-            git: None, persist_source: false,
+            git: None, persist_source: false, no_cache: false,
         });
         let mut update = ExternalUpdate { runner: "Sources".into(), id: "upstream/app".into(), version: "2-1".into(), ..Default::default() };
         let actions = provider.upgrade_actions(std::slice::from_ref(&update)).unwrap();

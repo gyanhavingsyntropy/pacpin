@@ -183,24 +183,38 @@ pub fn install(
     }
 
     let wait_secs = options.wait.or_else(|| {
-        options
-            .forwarded_flags
-            .iter()
-            .enumerate()
-            .find_map(|(idx, f)| {
-                if f.starts_with("--wait=") {
-                    f.strip_prefix("--wait=").and_then(|s| s.parse::<u64>().ok())
-                } else if f == "--wait" {
-                    if let Some(next) = options.forwarded_flags.get(idx + 1) {
-                        if let Ok(secs) = next.parse::<u64>() {
-                            return Some(secs);
-                        }
+        let mut wait = None;
+        let mut i = 0;
+        let flags = &options.forwarded_flags;
+        while i < flags.len() {
+            let f = &flags[i];
+            if f == "--" {
+                break;
+            }
+            if let Some(val) = f.strip_prefix("--wait=") {
+                wait = val.parse::<u64>().ok();
+                i += 1;
+                continue;
+            }
+            if f == "--wait" {
+                if i + 1 < flags.len() {
+                    if let Ok(secs) = flags[i + 1].parse::<u64>() {
+                        wait = Some(secs);
+                        i += 2;
+                        continue;
                     }
-                    Some(600)
-                } else {
-                    None
                 }
-            })
+                wait = Some(600);
+                i += 1;
+                continue;
+            }
+            if crate::commands::cli::takes_value(f) {
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
+        wait
     });
 
     if let Some(secs) = wait_secs {
@@ -320,6 +334,17 @@ pub fn install(
         .unwrap_or_default()
         .as_secs() as i64;
 
+    let aur_fallbacks: Vec<String> = targets
+        .iter()
+        .filter(|t| !t.contains('/') && !manager.has_repository_target(t))
+        .cloned()
+        .collect();
+    let aur_fallback_map = if !aur_fallbacks.is_empty() {
+        aur::query_aur(&aur_fallbacks)
+    } else {
+        std::collections::HashMap::new()
+    };
+
     for target in targets {
         if target.contains('/') {
             let parts: Vec<&str> = target.splitn(2, '/').collect();
@@ -405,24 +430,19 @@ pub fn install(
                     options,
                 )?;
                 pacman_targets.push(target.clone());
+            } else if aur_fallback_map.contains_key(target) {
+                verify_target_and_dependencies_delay(
+                    target,
+                    Some("aur"),
+                    config,
+                    &glob_delays,
+                    &manager,
+                    now_epoch,
+                    options,
+                )?;
+                aur_targets.push(target.clone());
             } else {
-                // Query AUR fallback
-                let aur_query = vec![target.clone()];
-                let aur_map = aur::query_aur(&aur_query);
-                if aur_map.contains_key(target) {
-                    verify_target_and_dependencies_delay(
-                        target,
-                        Some("aur"),
-                        config,
-                        &glob_delays,
-                        &manager,
-                        now_epoch,
-                        options,
-                    )?;
-                    aur_targets.push(target.clone());
-                } else {
-                    pacman_targets.push(target.clone());
-                }
+                pacman_targets.push(target.clone());
             }
         }
     }

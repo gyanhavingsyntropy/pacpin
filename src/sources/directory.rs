@@ -302,6 +302,7 @@ pub(crate) fn adopt(
         },
         git: None,
         persist_source: false,
+        no_cache: config.options.no_cache,
     };
     verify_payload(&plan, &from)?;
     println!(":: Reference existing {target} {version} from {} using {}/current. Upstream integrity is not established by adoption; original files will be preserved.", from.display(), path.display());

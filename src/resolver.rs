@@ -240,11 +240,51 @@ impl<'a> ResolverEngine<'a> {
                 if pat == pkg_name {
                     return true;
                 }
-                if Pattern::new(pat)
-                    .map(|p| p.matches(pkg_name))
-                    .unwrap_or(false)
+                if (pat.contains('*') || pat.contains('?') || pat.contains('['))
+                    && Pattern::new(pat).is_ok_and(|p| p.matches(pkg_name))
                 {
                     return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn compile_excludes(
+        excludes: &BTreeMap<String, Vec<String>>,
+    ) -> HashMap<String, Vec<(String, Option<Pattern>)>> {
+        let mut map = HashMap::new();
+        for (repo, patterns) in excludes {
+            let compiled: Vec<(String, Option<Pattern>)> = patterns
+                .iter()
+                .map(|pat| {
+                    let glob = if pat.contains('*') || pat.contains('?') || pat.contains('[') {
+                        Pattern::new(pat).ok()
+                    } else {
+                        None
+                    };
+                    (pat.clone(), glob)
+                })
+                .collect();
+            map.insert(repo.clone(), compiled);
+        }
+        map
+    }
+
+    pub fn is_excluded_compiled(
+        pkg_name: &str,
+        repo: &str,
+        compiled: &HashMap<String, Vec<(String, Option<Pattern>)>>,
+    ) -> bool {
+        if let Some(patterns) = compiled.get(repo) {
+            for (pat, glob) in patterns {
+                if pat == pkg_name {
+                    return true;
+                }
+                if let Some(p) = glob {
+                    if p.matches(pkg_name) {
+                        return true;
+                    }
                 }
             }
         }
@@ -297,6 +337,7 @@ impl<'a> ResolverEngine<'a> {
             BTreeMap::new()
         };
         let glob_pins = Self::compile_glob_pins(&pins);
+        let compiled_excludes = Self::compile_excludes(&config.exclude);
         let alpm = self.manager.handle();
         let syncdbs: Vec<&alpm::Db> = alpm.syncdbs().into_iter().collect();
         let mut foreign_pkgs_set = HashSet::new();
@@ -318,34 +359,45 @@ impl<'a> ResolverEngine<'a> {
                     }
                 }
             }
-            for (pattern, repo) in &pins {
-                if !repo.eq_ignore_ascii_case("aur") {
-                    continue;
-                }
-                if let Ok(glob) = Pattern::new(pattern) {
-                    for pkg in alpm.localdb().pkgs() {
-                        if crate::sources::owner(config, pkg.name()).is_some() {
-                            continue;
-                        }
-                        if Self::match_pinned_package(pkg.name(), &pins, &glob_pins)
-                            .is_some_and(|repo| repo != "aur")
-                        {
-                            continue;
-                        }
-                        if glob.matches(pkg.name()) {
-                            let name = pkg.name().to_string();
-                            if foreign_pkgs_set.insert(name.clone()) {
-                                foreign_pkgs.push(name);
-                            }
+            let aur_globs: Vec<_> = pins
+                .iter()
+                .filter(|(_, repo)| repo.eq_ignore_ascii_case("aur"))
+                .filter_map(|(pattern, _)| {
+                    if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+                        Pattern::new(pattern).ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let exact_aur_pins: HashSet<&str> = pins
+                .iter()
+                .filter(|(pat, repo)| {
+                    repo.eq_ignore_ascii_case("aur")
+                        && !pat.contains('*')
+                        && !pat.contains('?')
+                        && !pat.contains('[')
+                })
+                .map(|(pat, _)| pat.as_str())
+                .collect();
+
+            if !aur_globs.is_empty() || !exact_aur_pins.is_empty() {
+                for pkg in alpm.localdb().pkgs() {
+                    let pkg_name = pkg.name();
+                    if crate::sources::owner(config, pkg_name).is_some() {
+                        continue;
+                    }
+                    if Self::match_pinned_package(pkg_name, &pins, &glob_pins)
+                        .is_some_and(|repo| repo != "aur")
+                    {
+                        continue;
+                    }
+                    if exact_aur_pins.contains(pkg_name) || aur_globs.iter().any(|glob| glob.matches(pkg_name)) {
+                        let name = pkg_name.to_string();
+                        if foreign_pkgs_set.insert(name.clone()) {
+                            foreign_pkgs.push(name);
                         }
                     }
-                }
-                if !pattern.contains('*')
-                    && !pattern.contains('?')
-                    && !pattern.contains('[')
-                    && foreign_pkgs_set.insert(pattern.clone())
-                {
-                    foreign_pkgs.push(pattern.clone());
                 }
             }
         }
@@ -491,7 +543,7 @@ impl<'a> ResolverEngine<'a> {
                 if config.features.vendor_stickiness
                     && !installed_db.is_empty()
                     && !(config.features.pinning
-                        && Self::is_excluded(pkg_name, &installed_db, &config.exclude))
+                        && Self::is_excluded_compiled(pkg_name, &installed_db, &compiled_excludes))
                 {
                     for r in repos {
                         if let Some(&db) = syncdb_map.get(r.as_str()) {
@@ -551,7 +603,7 @@ impl<'a> ResolverEngine<'a> {
                                     natural_top_repo = Some(r.clone());
                                 }
                                 let is_excl = config.features.pinning
-                                    && Self::is_excluded(pkg_name, r, &config.exclude);
+                                    && Self::is_excluded_compiled(pkg_name, r, &compiled_excludes);
                                 if !is_excl && candidate.is_none() {
                                     let is_needed = state == "custom"
                                         || vercmp(p.version().as_str(), inst_ver)
@@ -760,21 +812,53 @@ impl<'a> ResolverEngine<'a> {
         }
 
         // Cascade holds to downstream reverse dependents (transitive BFS)
-        let mut queue: VecDeque<String> = held_parents.keys().cloned().collect();
-        let mut visited: HashSet<String> = held_parents.keys().cloned().collect();
+        if !held_parents.is_empty() {
+            let mut dep_to_local_dependents: HashMap<String, Vec<String>> = HashMap::new();
+            for pkg in self.manager.handle().localdb().pkgs() {
+                let pkg_name = pkg.name().to_string();
+                for dep in pkg.depends() {
+                    dep_to_local_dependents
+                        .entry(dep.name().to_string())
+                        .or_default()
+                        .push(pkg_name.clone());
+                }
+            }
 
-        while let Some(current_held) = queue.pop_front() {
-            let dependents = self.manager.get_dependents(&current_held);
-            for dep_name in dependents {
-                if let Some(dep_item) = resolved.get_mut(&dep_name) {
-                    if dep_item.needs_update && !dep_item.held {
-                        dep_item.held = true;
-                        dep_item.hold_reason =
-                            format!("Cascade hold: depends on held {}", current_held);
+            let mut queue: VecDeque<String> = held_parents.keys().cloned().collect();
+            let mut visited: HashSet<String> = held_parents.keys().cloned().collect();
+
+            while let Some(current_held) = queue.pop_front() {
+                let mut target_names = HashSet::new();
+                target_names.insert(current_held.clone());
+
+                if let Ok(pkg) = self.manager.handle().localdb().pkg(current_held.as_str()) {
+                    for prov in pkg.provides() {
+                        target_names.insert(prov.name().to_string());
                     }
                 }
-                if visited.insert(dep_name.clone()) {
-                    queue.push_back(dep_name);
+                for db in self.manager.handle().syncdbs() {
+                    if let Ok(pkg) = db.pkg(current_held.as_str()) {
+                        for prov in pkg.provides() {
+                            target_names.insert(prov.name().to_string());
+                        }
+                    }
+                }
+
+                for target_name in target_names {
+                    if let Some(dependents) = dep_to_local_dependents.get(&target_name) {
+                        for dep_name in dependents {
+                            if let Some(dep_item) = resolved.get_mut(dep_name) {
+                                if dep_item.needs_update && !dep_item.held {
+                                    dep_item.held = true;
+                                    dep_item.hold_reason =
+                                        format!("Cascade hold: depends on held {}", current_held);
+                                }
+                            }
+                            if visited.insert(dep_name.clone()) {
+                                queue.push_back(dep_name.clone());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -946,6 +1030,16 @@ mod tests {
         assert!(ResolverEngine::is_excluded("systemd", "cachyos", &excludes));
         assert!(!ResolverEngine::is_excluded("linux", "cachyos", &excludes));
         assert!(!ResolverEngine::is_excluded("systemd", "core", &excludes));
+
+        let compiled = ResolverEngine::compile_excludes(&excludes);
+        assert!(ResolverEngine::is_excluded_compiled(
+            "linux-firmware-intel",
+            "cachyos",
+            &compiled
+        ));
+        assert!(ResolverEngine::is_excluded_compiled("systemd", "cachyos", &compiled));
+        assert!(!ResolverEngine::is_excluded_compiled("linux", "cachyos", &compiled));
+        assert!(!ResolverEngine::is_excluded_compiled("systemd", "core", &compiled));
     }
 
     #[test]

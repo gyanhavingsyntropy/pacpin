@@ -343,10 +343,10 @@ pub(super) fn persist_verified_to_cache(plan: &Plan, artifact: &Path, sha256_hex
                 "url": plan.asset.url,
                 "sha256": key,
             });
-            let sidecar_tmp = cache_dir.join(format!(".tmp.{pid}.{nanos}.{key}.json"));
-            if fs::write(&sidecar_tmp, sidecar.to_string()).is_ok() {
-                let _ = fs::rename(&sidecar_tmp, cache_dir.join(format!("{key}.json")));
-            }
+            let _ = crate::utils::write_atomic_private(
+                &cache_dir.join(format!("{key}.json")),
+                sidecar.to_string().as_bytes(),
+            );
         } else {
             let _ = fs::remove_file(&tmp_path);
         }
@@ -357,7 +357,7 @@ pub(super) fn persist_verified_to_cache(plan: &Plan, artifact: &Path, sha256_hex
 
 fn download(plan: &Plan, work: &mut Workdir) -> Result<PathBuf, String> {
     if let Some(revision) = &plan.git { return super::git::fetch(plan, revision, &work.0); }
-    if !crate::cleanup::cache() && !crate::config::load_config().options.no_cache {
+    if !crate::cleanup::cache() && !plan.no_cache {
         if let Some(key) = plan.asset.sha256.as_deref().and_then(valid_sha256_key) {
             if let Some(cache_dir) = source_cache_dir() {
                 let cached = cache_dir.join(&key);
@@ -505,7 +505,7 @@ fn download_inner(plan: &Plan, work: &mut Workdir) -> Result<PathBuf, String> {
         plan.asset.name,
         &digest[..digest.len().min(12)]
     ));
-    if !crate::cleanup::cache() && !crate::config::load_config().options.no_cache {
+    if !crate::cleanup::cache() && !plan.no_cache {
         persist_verified_to_cache(plan, &path, &digest);
     }
     Ok(path)
@@ -545,14 +545,23 @@ pub(super) fn pkgbuild(plan: &Plan, payload: &Path) -> String {
         .into_iter()
         .next()
         .unwrap_or_else(|| std::env::consts::ARCH.to_string());
-    let mut text = format!("pkgname={}\npkgver={}\npkgrel=1\narch=({})\nlicense=('custom')\noptions=('!strip' '!debug')\ndepends=({depends})\npackage() {{\n  install -dm755 \"$pkgdir/opt\" \"$pkgdir/usr/bin\"\n  mv -T -- {} \"$pkgdir/opt/{}\"\n  chmod 755 \"$pkgdir/opt/{}\"\n", quote(&plan.name), quote(pkgver), quote(&primary_arch), quote(&payload.to_string_lossy()), plan.name, plan.name);
+    let safe_opt_dest = format!("\"$pkgdir\"/opt/{}", quote(&plan.name));
+    let mut text = format!(
+        "pkgname={}\npkgver={}\npkgrel=1\narch=({})\nlicense=('custom')\noptions=('!strip' '!debug')\ndepends=({depends})\npackage() {{\n  install -dm755 \"$pkgdir\"/opt \"$pkgdir\"/usr/bin\n  mv -T -- {} {}\n  chmod 755 {}\n",
+        quote(&plan.name),
+        quote(pkgver),
+        quote(&primary_arch),
+        quote(&payload.to_string_lossy()),
+        safe_opt_dest,
+        safe_opt_dest
+    );
     for (binary, relative) in &plan.recipe.binaries {
         text.push_str(&format!(
-            "  chmod 755 -- \"$pkgdir/opt/{}/{}\"\n  ln -s -- {} \"$pkgdir/usr/bin/{}\"\n",
-            plan.name,
-            relative,
+            "  chmod 755 -- \"$pkgdir\"/opt/{}/{}\n  ln -s -- {} \"$pkgdir\"/usr/bin/{}\n",
+            quote(&plan.name),
+            quote(relative),
             quote(&format!("../../opt/{}/{relative}", plan.name)),
-            binary
+            quote(binary)
         ));
     }
     text.push_str("}\n");
@@ -844,7 +853,7 @@ fn build_with_view(plan: &Plan, work: &Path, artifact: &Path, view: Option<&crat
         for directory in ["pkg", "src", "payload"] {
             let path = work.join(directory);
             if path.exists() {
-                fs::remove_dir_all(&path).map_err(|e| format!("Cannot release source build tree {}: {e}", path.display()))?;
+                crate::execution::remove_owned_tree(&path).map_err(|e| format!("Cannot release source build tree {}: {e}", path.display()))?;
             }
         }
         Ok(())
@@ -1109,6 +1118,7 @@ mod tests {
             },
             git: None,
             persist_source: false,
+            no_cache: false,
         }
     }
 

@@ -102,18 +102,22 @@ impl AliasManager {
 
         // 1. ~/.bashrc
         let bashrc = home_path.join(".bashrc");
-        if bashrc.exists() {
-            if let Ok(content) = fs::read_to_string(&bashrc) {
-                if !has_pin_alias(&content, false) {
-                    if let Ok(mut file) = OpenOptions::new().append(true).open(&bashrc) {
-                        let prefix = if content.ends_with('\n') { "" } else { "\n" };
-                        let snippet = format!(
-                            "{}# Added by pacpin\nalias pin=\"pacpin\"\n",
-                            prefix
-                        );
-                        if file.write_all(snippet.as_bytes()).is_ok() {
-                            modified.push("~/.bashrc".to_string());
-                        }
+        if let Ok(Some(content)) = crate::utils::read_regular_bounded_string(&bashrc, 1_048_576) {
+            if !has_pin_alias(&content, false) {
+                #[cfg(unix)]
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut opts = OpenOptions::new();
+                opts.append(true);
+                #[cfg(unix)]
+                opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                if let Ok(mut file) = opts.open(&bashrc) {
+                    let prefix = if content.ends_with('\n') { "" } else { "\n" };
+                    let snippet = format!(
+                        "{}# Added by pacpin\nalias pin=\"pacpin\"\n",
+                        prefix
+                    );
+                    if file.write_all(snippet.as_bytes()).is_ok() {
+                        modified.push("~/.bashrc".to_string());
                     }
                 }
             }
@@ -121,18 +125,22 @@ impl AliasManager {
 
         // 2. ~/.zshrc
         let zshrc = home_path.join(".zshrc");
-        if zshrc.exists() {
-            if let Ok(content) = fs::read_to_string(&zshrc) {
-                if !has_pin_alias(&content, false) {
-                    if let Ok(mut file) = OpenOptions::new().append(true).open(&zshrc) {
-                        let prefix = if content.ends_with('\n') { "" } else { "\n" };
-                        let snippet = format!(
-                            "{}# Added by pacpin\nalias pin=\"pacpin\"\n",
-                            prefix
-                        );
-                        if file.write_all(snippet.as_bytes()).is_ok() {
-                            modified.push("~/.zshrc".to_string());
-                        }
+        if let Ok(Some(content)) = crate::utils::read_regular_bounded_string(&zshrc, 1_048_576) {
+            if !has_pin_alias(&content, false) {
+                #[cfg(unix)]
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut opts = OpenOptions::new();
+                opts.append(true);
+                #[cfg(unix)]
+                opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                if let Ok(mut file) = opts.open(&zshrc) {
+                    let prefix = if content.ends_with('\n') { "" } else { "\n" };
+                    let snippet = format!(
+                        "{}# Added by pacpin\nalias pin=\"pacpin\"\n",
+                        prefix
+                    );
+                    if file.write_all(snippet.as_bytes()).is_ok() {
+                        modified.push("~/.zshrc".to_string());
                     }
                 }
             }
@@ -140,18 +148,22 @@ impl AliasManager {
 
         // 3. ~/.config/fish/config.fish
         let fish_conf = home_path.join(".config").join("fish").join("config.fish");
-        if fish_conf.exists() {
-            if let Ok(content) = fs::read_to_string(&fish_conf) {
-                if !has_pin_alias(&content, true) {
-                    if let Ok(mut file) = OpenOptions::new().append(true).open(&fish_conf) {
-                        let prefix = if content.ends_with('\n') { "" } else { "\n" };
-                        let snippet = format!(
-                            "{}# Added by pacpin\nalias pin \"pacpin\"\n",
-                            prefix
-                        );
-                        if file.write_all(snippet.as_bytes()).is_ok() {
-                            modified.push("~/.config/fish/config.fish".to_string());
-                        }
+        if let Ok(Some(content)) = crate::utils::read_regular_bounded_string(&fish_conf, 1_048_576) {
+            if !has_pin_alias(&content, true) {
+                #[cfg(unix)]
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut opts = OpenOptions::new();
+                opts.append(true);
+                #[cfg(unix)]
+                opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                if let Ok(mut file) = opts.open(&fish_conf) {
+                    let prefix = if content.ends_with('\n') { "" } else { "\n" };
+                    let snippet = format!(
+                        "{}# Added by pacpin\nalias pin \"pacpin\"\n",
+                        prefix
+                    );
+                    if file.write_all(snippet.as_bytes()).is_ok() {
+                        modified.push("~/.config/fish/config.fish".to_string());
                     }
                 }
             }
@@ -164,17 +176,8 @@ impl AliasManager {
             let local_bin = home_path.join(".local").join("bin");
             let pacpin_bin = local_bin.join("pacpin");
             let pin_bin = local_bin.join("pin");
-            if pacpin_bin.exists() && !pin_bin.exists() {
+            if pacpin_bin.is_file() && !pin_bin.exists() {
                 let _ = symlink("pacpin", &pin_bin);
-            }
-
-            if let Ok(exe) = env::current_exe() {
-                if let Some(parent) = exe.parent() {
-                    let pin_in_parent = parent.join("pin");
-                    if !pin_in_parent.exists() {
-                        let _ = symlink("pacpin", &pin_in_parent);
-                    }
-                }
             }
         }
 

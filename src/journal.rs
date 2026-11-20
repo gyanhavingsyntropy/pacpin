@@ -16,7 +16,6 @@
 
 use chrono::Local;
 use colored::Colorize;
-use glob::glob;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -137,24 +136,27 @@ impl TransactionJournal {
             vec![ver_no_epoch]
         };
 
+        let valid_extensions = [".pkg.tar.zst", ".pkg.tar.xz", ".pkg.tar.gz", ".pkg.tar.bz2"];
+
         for c_dir in &cache_dirs {
-            if !c_dir.exists() {
-                continue;
-            }
+            let Ok(entries) = fs::read_dir(c_dir) else { continue };
             let c_dir_canon = c_dir.canonicalize().unwrap_or_else(|_| c_dir.clone());
-            for v in &versions_to_check {
-                for ext in &["zst", "xz", "gz"] {
-                    let pattern_str =
-                        format!("{}/{}-{}-*.pkg.tar.{}", c_dir.display(), pkg_name, v, ext);
-                    if let Ok(paths) = glob(&pattern_str) {
-                        for entry in paths.flatten() {
-                            let name_str = entry.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                            if !name_str.ends_with(".sig") {
-                                if let Ok(canon) = entry.canonicalize() {
-                                    if canon.starts_with(&c_dir_canon) {
-                                        return Some(entry);
-                                    }
-                                }
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name_str) = name.to_str() else { continue };
+                if name_str.ends_with(".sig") {
+                    continue;
+                }
+                if !valid_extensions.iter().any(|ext| name_str.ends_with(ext)) {
+                    continue;
+                }
+                for v in &versions_to_check {
+                    let expected_prefix = format!("{}-{}-", pkg_name, v);
+                    if name_str.starts_with(&expected_prefix) {
+                        let path = entry.path();
+                        if let Ok(canon) = path.canonicalize() {
+                            if canon.starts_with(&c_dir_canon) {
+                                return Some(path);
                             }
                         }
                     }
@@ -279,7 +281,19 @@ impl TransactionJournal {
             return Vec::new();
         }
 
-        fs::File::open(&history_file).and_then(|file| recent_records(file, limit)).unwrap_or_default()
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+
+        if let Ok(file) = options.open(&history_file) {
+            if file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+                return recent_records(file, limit).unwrap_or_default();
+            }
+        }
+        Vec::new()
     }
 
     pub fn get_transaction(tx_id: usize) -> Option<TransactionRecord> {
@@ -291,12 +305,33 @@ impl TransactionJournal {
             return None;
         }
 
-        if let Ok(file) = fs::File::open(&history_file) {
-            let reader = BufReader::new(file);
-            for line in reader.lines().map_while(Result::ok) {
-                if let Ok(record) = serde_json::from_str::<TransactionRecord>(&line) {
-                    if record.id == tx_id {
-                        return Some(record);
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+
+        if let Ok(file) = options.open(&history_file) {
+            if file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+                use std::io::Read;
+                let mut reader = BufReader::new(file);
+                let mut line = String::new();
+                let mut lines_read = 0;
+                while lines_read < 100_000 {
+                    line.clear();
+                    let bytes = match (&mut reader).take(2 * 1024 * 1024).read_line(&mut line) {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    };
+                    if bytes == 0 {
+                        break;
+                    }
+                    lines_read += 1;
+                    if let Ok(record) = serde_json::from_str::<TransactionRecord>(&line) {
+                        if record.id == tx_id {
+                            return Some(record);
+                        }
                     }
                 }
             }

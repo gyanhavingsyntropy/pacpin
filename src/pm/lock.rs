@@ -56,6 +56,7 @@ pub(super) fn get_lock_info_at(lock_path: std::path::PathBuf) -> Option<LockInfo
         // On Linux, scan /proc for active package manager processes.
         let mut active_pm_found = None;
         let my_pid = std::process::id() as i32;
+        let hidepid_active = std::fs::read_to_string("/proc/1/comm").is_err();
 
         if let Ok(entries) = std::fs::read_dir("/proc") {
             for entry in entries.flatten() {
@@ -66,17 +67,16 @@ pub(super) fn get_lock_info_at(lock_path: std::path::PathBuf) -> Option<LockInfo
                         }
                         if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
                             let trimmed = comm.trim();
-                            if matches!(
+                            let is_pm = matches!(
                                 trimmed,
                                 "pacman"
-                                    | "paru"
-                                    | "yay"
                                     | "pamac-daemon"
                                     | "packagekitd"
                                     | "pamac"
                                     | "pacpin"
                                     | "pin"
-                            ) {
+                            ) || crate::config::SAFE_AUR_HELPERS.contains(&trimmed);
+                            if is_pm {
                                 active_pm_found = Some((pid, trimmed.to_string()));
                                 break;
                             }
@@ -89,9 +89,13 @@ pub(super) fn get_lock_info_at(lock_path: std::path::PathBuf) -> Option<LockInfo
         if let Some((pid, name)) = active_pm_found {
             pid_opt = Some(pid);
             (true, Some(name))
+        } else if hidepid_active {
+            // Under hidepid=2 or PID restrictions, unprivileged processes cannot see
+            // root package managers. Conservatively assume the lock is held by a live process
+            // so we wait instead of declaring it definitively stale and corrupting the database.
+            (true, Some("pacman (inferred via db.lck under restricted /proc)".to_string()))
         } else {
-            // db.lck exists, but no package manager process is running on the system!
-            // It is definitively a stale lock.
+            // Unrestricted /proc confirmed no active PM process exists.
             (false, None)
         }
     };

@@ -19,7 +19,7 @@ use glob::Pattern;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 mod dependencies;
-pub(crate) use dependencies::package_satisfies;
+pub(crate) use dependencies::{package_satisfies, satisfies_spec, ArchiveMetadata};
 
 /// Resolve native repository targets in configured priority order. ALPM checks
 /// exact names across all eligible repositories before considering providers.
@@ -642,7 +642,7 @@ pub(crate) mod test_support {
 
     impl Drop for AlpmFixture {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
+            let _ = crate::execution::remove_owned_tree(&self.path);
         }
     }
 }
