@@ -78,7 +78,71 @@ fn parse_args(args: &[String], mode: Mode) -> (Option<String>, Vec<String>, TryO
     (target, pass_through, options)
 }
 
+fn write_mode_help(mode: Mode, out: &mut impl std::io::Write) {
+    match mode {
+        Mode::Run => {
+            let _ = writeln!(out, "Usage: pacpin run [options] [repo/]package [arguments...]");
+            let _ = writeln!(out, "Runs native/installed, aur/pkg, source-alias/pkg, custom exports, Flatpak, Nix or Pipx targets.");
+            let _ = writeln!(out);
+            let _ = writeln!(out, "Options:");
+            let _ = writeln!(out, "  --dry-run              Preview without downloading or starting the application");
+            let _ = writeln!(out, "  --noconfirm, -y        Bypass AUR/Sources build approval prompts");
+            let _ = writeln!(out, "  --no-cache             Bypass native archive reuse; build/export caches stay private; Pipx disables reuse");
+            let _ = writeln!(out, "  --cleanup=POLICY       temporary, cache, or temporary,cache");
+            let _ = writeln!(out, "  --use-ram/--use-storage Keep owned downloads/builds/package trees in RAM/on disk");
+            let _ = writeln!(out, "  --installed            Run the installed native package instead of a repository download");
+            let _ = writeln!(
+                out,
+                "  --sandbox              Run in Bubblewrap container (unsandboxed by default)"
+            );
+            let _ = writeln!(out, "  --bin <name>           Specify exact executable binary name if package provides multiple");
+            let _ = writeln!(out, "  --allow-unverified     Proceed even if repository metadata lacks a SHA256 checksum");
+            let _ = writeln!(out, "  --sudo | --pkexec      Override configured privilege escalation tool for this run");
+            let _ = writeln!(out, "  --                     Pass remaining arguments unchanged to the application");
+            let _ = writeln!(out);
+            let _ = writeln!(out, "Examples:");
+            let _ = writeln!(out, "  pacpin run fastfetch");
+            let _ = writeln!(out, "  pacpin run yt-dlp 'https://youtube.com/watch?v=...'");
+            let _ = writeln!(out, "  pacpin run ffmpeg -i screencast.mkv output.mp4");
+            let _ = writeln!(out, "  pacpin run jq . package.json");
+        }
+        Mode::Try => {
+            let _ = writeln!(out, "Usage: pacpin try [options] [repo/]package [arguments...]");
+            let _ = writeln!(out, "Runs native, aur/pkg, source-alias/pkg or declared exports in Bubblewrap; Flatpak owns its sandbox.");
+            let _ = writeln!(out);
+            let _ = writeln!(out, "Options:");
+            let _ = writeln!(out, "  --dry-run              Preview without downloading or starting the application");
+            let _ = writeln!(out, "  --noconfirm, -y        Bypass AUR/Sources build approval prompts");
+            let _ = writeln!(out, "  --no-cache             Bypass native archive reuse; build/export caches stay private; Pipx disables reuse");
+            let _ = writeln!(out, "  --cleanup=POLICY       temporary, cache, or temporary,cache");
+            let _ = writeln!(out, "  --use-ram/--use-storage Keep owned downloads/builds/package trees in RAM/on disk");
+            let _ = writeln!(out, "  --installed            Test the installed native package with Bubblewrap isolation");
+            let _ = writeln!(out, "  --no-sandbox, --bare   Bypass Bubblewrap containerization and run directly on host");
+            let _ = writeln!(out, "  --net, --network       Share host network access (unshared by default)");
+            let _ = writeln!(out, "  --rw, --write-cwd      Mount current working directory read-write (read-only by default)");
+            let _ = writeln!(out, "  --gui                  Grant X11/Wayland and DRI access for graphical applications");
+            let _ = writeln!(out, "  --audio                Grant /dev/snd access for audio playback");
+            let _ = writeln!(out, "  --bin <name>           Specify exact executable binary name if package provides multiple");
+            let _ = writeln!(out, "  --allow-unverified     Proceed even if repository metadata lacks a SHA256 checksum");
+            let _ = writeln!(out, "  --sudo | --pkexec      Override configured privilege escalation tool for this run");
+            let _ = writeln!(out, "  --                     Pass remaining arguments unchanged to the application");
+            let _ = writeln!(out);
+            let _ = writeln!(out, "Examples:");
+            let _ = writeln!(out, "  pacpin try jq . foo.json");
+            let _ = writeln!(out, "  pacpin try --gui flatpak/org.gnome.Calculator");
+            let _ = writeln!(out, "  pacpin run nix/ripgrep -i 'foo'  # Nix executes on the host");
+        }
+    }
+}
+
+pub(crate) fn print_mode_help(run_mode: bool) {
+    let mode = if run_mode { Mode::Run } else { Mode::Try };
+    let mut out = std::io::stdout().lock();
+    write_mode_help(mode, &mut out);
+}
+
 fn print_missing_target(mode: Mode) {
+    let mut err = std::io::stderr().lock();
     match mode {
         Mode::Run => {
             eprintln!(
@@ -87,25 +151,6 @@ fn print_missing_target(mode: Mode) {
                     .red()
                     .bold()
             );
-            eprintln!("Usage: pacpin run [options] [repo/]package [arguments...]");
-            eprintln!("Runs native/installed, aur/pkg, source-alias/pkg, custom exports, Flatpak, Nix or Pipx targets.");
-            eprintln!();
-            eprintln!("Options:");
-            eprintln!("  --dry-run              Preview without downloading or starting the application");
-            eprintln!("  --no-cache             Bypass native archive reuse; build/export caches stay private; Pipx disables reuse");
-            eprintln!("  --use-ram/--use-storage Keep owned downloads/builds/package trees in RAM/on disk");
-            eprintln!("  --installed            Run the installed native package instead of a repository download");
-            eprintln!(
-                "  --sandbox              Run in Bubblewrap container (unsandboxed by default)"
-            );
-            eprintln!("  --bin <name>           Specify exact executable binary name if package provides multiple");
-            eprintln!("  --allow-unverified     Proceed even if repository metadata lacks a SHA256 checksum");
-            eprintln!();
-            eprintln!("Examples:");
-            eprintln!("  pacpin run fastfetch");
-            eprintln!("  pacpin run yt-dlp 'https://youtube.com/watch?v=...'");
-            eprintln!("  pacpin run ffmpeg -i screencast.mkv output.mp4");
-            eprintln!("  pacpin run jq . package.json");
         }
         Mode::Try => {
             eprintln!(
@@ -114,28 +159,9 @@ fn print_missing_target(mode: Mode) {
                     .red()
                     .bold()
             );
-            eprintln!("Usage: pacpin try [options] [repo/]package [arguments...]");
-            eprintln!("Runs native, aur/pkg, source-alias/pkg or declared exports in Bubblewrap; Flatpak owns its sandbox.");
-            eprintln!();
-            eprintln!("Options:");
-            eprintln!("  --dry-run              Preview without downloading or starting the application");
-            eprintln!("  --no-cache             Bypass native archive reuse; build/export caches stay private; Pipx disables reuse");
-            eprintln!("  --use-ram/--use-storage Keep owned downloads/builds/package trees in RAM/on disk");
-            eprintln!("  --installed            Test the installed native package with Bubblewrap isolation");
-            eprintln!("  --no-sandbox, --bare   Bypass Bubblewrap containerization and run directly on host");
-            eprintln!("  --net, --network       Share host network access (unshared by default)");
-            eprintln!("  --rw, --write-cwd      Mount current working directory read-write (read-only by default)");
-            eprintln!("  --gui                  Grant X11/Wayland and DRI access for graphical applications");
-            eprintln!("  --audio                Grant /dev/snd access for audio playback");
-            eprintln!("  --bin <name>           Specify exact executable binary name if package provides multiple");
-            eprintln!("  --allow-unverified     Proceed even if repository metadata lacks a SHA256 checksum");
-            eprintln!();
-            eprintln!("Examples:");
-            eprintln!("  pacpin try jq . foo.json");
-            eprintln!("  pacpin try --gui flatpak/org.gnome.Calculator");
-            eprintln!("  pacpin run nix/ripgrep -i 'foo'  # Nix executes on the host");
         }
     }
+    write_mode_help(mode, &mut err);
 }
 
 fn execute(config: &Config, args: &[String], mode: Mode) {

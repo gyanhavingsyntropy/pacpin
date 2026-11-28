@@ -84,16 +84,6 @@ pub(crate) fn run() {
         Err(error) => { eprintln!("Error: {error}"); exit(2); }
     };
 
-    match runtime::parse(&mut args) {
-        Ok(policy) => scratch::initialize(policy),
-        Err(error) => { eprintln!("Error: {error}"); exit(2); }
-    }
-
-    match crate::cleanup::parse(&mut args) {
-        Ok(policy) => crate::cleanup::initialize(policy),
-        Err(error) => { eprintln!("Error: {error}"); exit(2); }
-    }
-
     if args
         .first()
         .map(|s| s == "-v" || s == "-V" || s == "--version")
@@ -103,13 +93,18 @@ pub(crate) fn run() {
         exit(0);
     }
 
-    if args
-        .first()
-        .map(|s| s == "-h" || s == "--help" || s == "help")
-        .unwrap_or(false)
-    {
-        print_help();
+    if help::maybe_handle_help(&args) {
         exit(0);
+    }
+
+    match runtime::parse(&mut args) {
+        Ok(policy) => scratch::initialize(policy),
+        Err(error) => { eprintln!("Error: {error}"); exit(2); }
+    }
+
+    match crate::cleanup::parse(&mut args) {
+        Ok(policy) => crate::cleanup::initialize(policy),
+        Err(error) => { eprintln!("Error: {error}"); exit(2); }
     }
 
     if unsafe { libc::geteuid() } == 0 {

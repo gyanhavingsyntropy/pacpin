@@ -374,3 +374,49 @@ use crate::{find_matching_pin, parse_install_flags};
         assert!(crate::commands::cli::is_check_invocation(&to_vec(&["check", "--sources-only"])));
         assert!(!crate::commands::cli::is_check_invocation(&to_vec(&["--aur-only", "install", "foo"])));
     }
+
+    #[test]
+    fn subcommand_help_detection_and_general_docs() {
+        let to_vec = |slice: &[&str]| slice.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        use super::help::{HelpTopic, detect_help_topic, render_topic_help, write_general_help};
+
+        // Top-level & -S/install help forms
+        assert_eq!(detect_help_topic(&to_vec(&["--help"])), Some(HelpTopic::General));
+        assert_eq!(detect_help_topic(&to_vec(&["-S", "--help"])), Some(HelpTopic::Install));
+        assert_eq!(detect_help_topic(&to_vec(&["-S", "-h"])), Some(HelpTopic::Install));
+        assert_eq!(detect_help_topic(&to_vec(&["-Sh"])), Some(HelpTopic::Install));
+        assert_eq!(detect_help_topic(&to_vec(&["install", "--help"])), Some(HelpTopic::Install));
+        assert_eq!(detect_help_topic(&to_vec(&["help", "-S"])), Some(HelpTopic::Install));
+
+        // Option values and arguments after `--` must not trigger help
+        assert_eq!(detect_help_topic(&to_vec(&["-S", "--", "--help"])), None);
+        assert_eq!(detect_help_topic(&to_vec(&["-S", "--ignore", "--help", "pkg"])), None);
+        assert_eq!(detect_help_topic(&to_vec(&["-S", "pkg"])), None);
+
+        // Other pacpin subcommands vs forwarded pacman flags
+        assert_eq!(detect_help_topic(&to_vec(&["-Syu", "--help"])), Some(HelpTopic::Upgrade));
+        assert_eq!(detect_help_topic(&to_vec(&["check", "-r", "--help"])), Some(HelpTopic::Check));
+        assert_eq!(detect_help_topic(&to_vec(&["-R", "--help"])), Some(HelpTopic::Remove));
+        assert_eq!(detect_help_topic(&to_vec(&["clean", "--help"])), Some(HelpTopic::Clean));
+        assert_eq!(detect_help_topic(&to_vec(&["-Qi", "--help"])), None);
+
+        // `run` / `try` intercept help before target, and pass through after target or `--`
+        assert_eq!(detect_help_topic(&to_vec(&["run", "--help"])), Some(HelpTopic::Run));
+        assert_eq!(detect_help_topic(&to_vec(&["try", "-h"])), Some(HelpTopic::Try));
+        assert_eq!(detect_help_topic(&to_vec(&["run", "--dry-run", "--help"])), Some(HelpTopic::Run));
+        assert_eq!(detect_help_topic(&to_vec(&["run", "fastfetch", "--help"])), None);
+        assert_eq!(detect_help_topic(&to_vec(&["run", "--bin", "--help"])), None);
+        assert_eq!(detect_help_topic(&to_vec(&["run", "fastfetch", "--", "--help"])), None);
+
+        let install_help = render_topic_help(HelpTopic::Install);
+        for expected in ["--noconfirm", "--channel", "--no-cache", "--wait", "--pkexec", "--sudo"] {
+            assert!(install_help.contains(expected), "install help missing {expected}");
+        }
+
+        let mut general = Vec::new();
+        write_general_help(&mut general);
+        let general_text = String::from_utf8(general).unwrap();
+        for expected in ["--pkexec", "--sudo", "--noconfirm", "--wait", "pacpin -S --help"] {
+            assert!(general_text.contains(expected), "general help missing {expected}");
+        }
+    }

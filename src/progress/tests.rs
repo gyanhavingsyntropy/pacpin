@@ -538,3 +538,52 @@ fn partial_source_checks_preserve_live_and_completed_source_rows() {
     super::annotate_source_checks(&mut history, &mut [], 0);
     assert_eq!(history, previous);
 }
+
+#[test]
+fn session_exit_never_emits_bare_scroll_reset_that_homes_cursor() {
+    const CHILD: &str = "PACPIN_SESSION_EXIT_CURSOR_TEST";
+    if std::env::var_os(CHILD).is_some() {
+        let view = session_view();
+        operation(Manager::Checks, "Checking package updates", || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        });
+        println!("No updates found in the checked scope.");
+        drop(view);
+        restore_terminal();
+        return;
+    }
+    let (mut master, mut slave) = (-1, -1);
+    let size = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+    assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &size) }, 0);
+    let mut master = unsafe { File::from_raw_fd(master) };
+    let slave = unsafe { File::from_raw_fd(slave) };
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "progress::tests::session_exit_never_emits_bare_scroll_reset_that_homes_cursor", "--nocapture"])
+        .env(CHILD, "1")
+        .env("TERM", "xterm-256color")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave));
+    let mut child = ChildGuard(command.spawn().unwrap());
+    command.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    let mut output = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match master.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => output.extend_from_slice(&buf[..n]),
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+            Err(error) => panic!("PTY read failed: {error}"),
+        }
+    }
+    assert!(child.0.wait().unwrap().success());
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("No updates found in the checked scope."), "{text:?}");
+    let mut stripped = text.to_string();
+    while let Some(start) = stripped.find("\x1b7") {
+        let Some(end) = stripped[start..].find("\x1b8") else { break; };
+        stripped.replace_range(start..start + end + 2, "");
+    }
+    assert!(!stripped.contains("\x1b[r"), "bare \\x1b[r homes cursor to (1,1): {text:?}");
+}

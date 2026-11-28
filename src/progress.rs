@@ -71,6 +71,7 @@ static TERMINAL: Mutex<Option<(libc::termios, u16)>> = Mutex::new(None);
 static VIEW: Mutex<Option<(u16, u16, u16)>> = Mutex::new(None);
 static SESSION_VIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ATEXIT_REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TERMINAL_MODIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Keep one output region across an invocation's successive footer phases.
 pub struct SessionView;
@@ -237,7 +238,11 @@ pub fn operation_dynamic<T>(manager: Manager, label: impl Fn() -> String + Send 
 
 pub fn register_input_restore(saved: libc::termios) -> bool {
     let mut terminal = TERMINAL.lock().unwrap_or_else(|e| e.into_inner());
-    if terminal.is_none() { *terminal = Some((saved, 0)); true } else { false }
+    if terminal.is_none() {
+        *terminal = Some((saved, 0));
+        TERMINAL_MODIFIED.store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    } else { false }
 }
 pub fn unregister_input_restore() {
     let mut terminal = TERMINAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -422,17 +427,27 @@ pub fn clear_sources() {
 pub fn restore_terminal() {
     let saved = TERMINAL.try_lock().ok().and_then(|mut guard| guard.take());
     let view = VIEW.try_lock().ok().and_then(|mut guard| guard.take());
+    let modified = TERMINAL_MODIFIED.swap(false, std::sync::atomic::Ordering::SeqCst);
+    if saved.is_none() && view.is_none() && !modified {
+        return;
+    }
     let height = saved.as_ref().map(|(_, height)| *height).filter(|height| *height != 0)
         .or_else(|| view.map(|(_, _, height)| height)).unwrap_or(0);
     let bottom = terminal_size().ws_row.saturating_sub(height).max(1);
     // SAFETY: saved was returned by tcgetattr for this process's stdin.
     unsafe {
         if let Some((saved, _)) = saved { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved); }
-        // Resetting the scroll region homes the cursor. Preserve it so
-        // subsequent source logs cannot overwrite earlier pacman text.
-        // Signal exit skips Footer::drop. Clear its reserved rows here too.
-        let reset = if height == 0 { "\x1b[r\x1b[0m\x1b[?25h".into() } else { format!("\x1b7\x1b[{};1H\x1b[J\x1b[r\x1b8\x1b[0m\x1b[?25h", bottom + 1) };
-        libc::write(libc::STDOUT_FILENO, reset.as_ptr().cast(), reset.len());
+        if libc::isatty(libc::STDOUT_FILENO) == 1 {
+            // Resetting the scroll region homes the cursor. Preserve it even
+            // when height == 0 so exiting never sends the cursor to (1, 1),
+            // where shell prompt clear-to-end-of-screen sequences wipe output.
+            let reset = if height == 0 {
+                "\x1b7\x1b[r\x1b8\x1b[0m\x1b[?25h".into()
+            } else {
+                format!("\x1b7\x1b[{};1H\x1b[J\x1b[r\x1b8\x1b[0m\x1b[?25h", bottom + 1)
+            };
+            libc::write(libc::STDOUT_FILENO, reset.as_ptr().cast(), reset.len());
+        }
     }
 }
 
@@ -467,6 +482,7 @@ impl Footer {
         if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        TERMINAL_MODIFIED.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut footer = Self {
             rows: 0,
             cols: 0,
